@@ -6892,6 +6892,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 const tcPath = String(args.path ?? args.file_path ?? args.command ?? args.query ?? args.url ?? '') || undefined;
                 this._toolCallsThisRun.push({ name, path: tcPath });
                 this._consecutiveAborts = 0; // model made a real tool call -- abort streak is over
+                // Also decay autoRetryCount on successful tool calls so long autonomous runs
+                // don't exhaust the budget across multiple phases from a single user message.
+                if (this.autoRetryCount > 0) { this.autoRetryCount = Math.max(0, this.autoRetryCount - 1); }
 
                 // Detect repeated identical tool calls
                 const toolSig = `${name}_${JSON.stringify(args)}`;
