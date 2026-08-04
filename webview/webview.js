@@ -1,0 +1,3772 @@
+// @ts-check
+'use strict';
+
+const vscode = acquireVsCodeApi();
+
+// ── Debug: catch and report any JS errors back to the extension ───────────────
+window.onerror = function(msg, src, line, col, err) {
+    const detail = `[webview error] ${msg} at line ${line}:${col}\n${err?.stack || ''}`;
+    try { vscode.postMessage({ command: 'webviewError', text: detail }); } catch(_) {}
+    const el = document.getElementById('status-text');
+    if (el) { el.textContent = 'JS Error — check Output panel'; el.style.color = '#f44747'; }
+    console.error(detail);
+};
+window.onunhandledrejection = function(event) {
+    const reason = event.reason;
+    const detail = `[webview unhandled rejection] ${reason?.message || reason}\n${reason?.stack || ''}`;
+    try { vscode.postMessage({ command: 'webviewError', text: detail }); } catch(_) {}
+    console.error(detail);
+};
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const messagesEl       = /** @type {HTMLDivElement}     */ (document.getElementById('messages'));
+const welcomeEl        = /** @type {HTMLDivElement}     */ (document.getElementById('welcome'));
+const promptEl         = /** @type {HTMLTextAreaElement} */ (document.getElementById('prompt'));
+const sendBtn          = /** @type {HTMLButtonElement}  */ (document.getElementById('send-btn'));
+const stopBtn          = /** @type {HTMLButtonElement}  */ (document.getElementById('stop-btn'));
+const newChatBtn       = /** @type {HTMLButtonElement}  */ (document.getElementById('new-chat-btn'));
+const presetSelect     = /** @type {HTMLSelectElement}  */ (document.getElementById('preset-select'));
+const modelSelect      = /** @type {HTMLSelectElement}  */ (document.getElementById('model-select'));
+const trustSelect      = /** @type {HTMLSelectElement}  */ (document.getElementById('trust-select'));
+const statusDot        = /** @type {HTMLSpanElement}    */ (document.getElementById('status-dot'));
+const statusText       = /** @type {HTMLSpanElement}    */ (document.getElementById('status-text'));
+const scrollBtn        = /** @type {HTMLButtonElement}  */ (document.getElementById('scroll-btn'));
+const contextBar       = /** @type {HTMLDivElement}     */ (document.getElementById('context-bar'));
+const historyBtn       = /** @type {HTMLButtonElement}  */ (document.getElementById('history-btn'));
+const historyPanel     = /** @type {HTMLDivElement}     */ (document.getElementById('history-panel'));
+const historyList      = /** @type {HTMLDivElement}     */ (document.getElementById('history-list'));
+const historyCloseBtn  = /** @type {HTMLButtonElement}  */ (document.getElementById('history-close-btn'));
+const historyClearBtn  = /** @type {HTMLButtonElement}  */ (document.getElementById('history-clear-btn'));
+const mentionDropdown  = /** @type {HTMLDivElement}     */ (document.getElementById('mention-dropdown'));
+const tokenIndicator   = /** @type {HTMLSpanElement}    */ (document.getElementById('token-indicator'));
+const templateBar      = /** @type {HTMLDivElement}     */ (document.getElementById('template-bar'));
+const templateSelect   = /** @type {HTMLSelectElement}  */ (document.getElementById('template-select'));
+const templateToggleBtn = /** @type {HTMLButtonElement} */ (document.getElementById('template-toggle-btn'));
+const smartContextToggle = /** @type {HTMLInputElement} */ (document.getElementById('smart-context-toggle'));
+const searchBtn        = /** @type {HTMLButtonElement} */ (document.getElementById('search-btn'));
+const searchPanel      = /** @type {HTMLDivElement}    */ (document.getElementById('search-panel'));
+const searchInput      = /** @type {HTMLInputElement}  */ (document.getElementById('search-input'));
+const searchResults    = /** @type {HTMLSpanElement}   */ (document.getElementById('search-results'));
+const searchPrevBtn    = /** @type {HTMLButtonElement} */ (document.getElementById('search-prev'));
+const searchNextBtn    = /** @type {HTMLButtonElement} */ (document.getElementById('search-next'));
+const searchClearBtn   = /** @type {HTMLButtonElement} */ (document.getElementById('search-clear'));
+const contextUsageEl   = /** @type {HTMLSpanElement}   */ (document.getElementById('context-usage'));
+const compactBtnFooter = /** @type {HTMLButtonElement}  */ (document.getElementById('compact-btn-footer'));
+const settingsBtn      = /** @type {HTMLButtonElement}  */ (document.getElementById('settings-btn'));
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+/** @type {HTMLDivElement | null} */
+let currentMsgEl = null;
+/** @type {string} */
+let currentRaw = '';
+let streaming = false;
+/** True when the user has manually scrolled away from the bottom. */
+let userScrolledUp = false;
+/** Tracks whether we're currently inside a thinking block while streaming. */
+let inThinkingBlock = false;
+let thinkingBuf = '';
+/** Last agentStatus turn info — used to restore status bar after toolCall overlay. */
+let lastAgentTurn = /** @type {{ turn: number, maxTurns: number } | null} */ (null);
+
+/** Model presets configuration */
+const MODEL_PRESETS = {
+    fast: { model: 'qwen2.5-coder:1.5b', temperature: 0.5 },
+    balanced: { model: 'qwen2.5-coder:7b', temperature: 0.7 },
+    quality: { model: 'llama3.1:8b', temperature: 0.8 }
+};
+
+/** Current preset selection ('' = custom) */
+let currentPreset = 'balanced';
+
+/** Flags to prevent circular preset/model updates */
+let updatingFromPreset = false;
+let updatingFromModel = false;
+
+/** Context state received from the extension. */
+const ctx = {
+    /** @type {string | null} */
+    file: null,
+    fileLines: 0,
+    language: '',
+    selectionLines: 0,
+    includeFile: false,
+    includeSelection: true,
+};
+
+// ── @mention state ────────────────────────────────────────────────────────────
+
+/** Files the user has explicitly mentioned via @. [{rel, display, ext}] */
+/** @type {Array<{rel: string, display: string, ext: string}>} */
+let mentionedFiles = [];
+let mentionedSymbols = [];
+/** Position in textarea where the current @ query started (-1 = not active). */
+let mentionAtStart = -1;
+/** Current autocomplete query (text after @). */
+let mentionQuery = '';
+/** Currently highlighted dropdown item index. */
+let mentionSelectedIdx = 0;
+/** File results from the last searchFiles response. */
+/** @type {Array<{rel: string, display: string, ext: string}>} */
+let mentionResults = [];
+
+/** Debounce timer for searchFiles — avoids a message per keystroke */
+let mentionSearchTimer = null;
+/** When true, next mention selection pins the file instead of @mentioning it */
+let pinModeActive = false;
+
+// ── Template state ────────────────────────────────────────────────────────────
+
+/** Available templates (built-in + custom). */
+/** @type {Array<{name: string, prompt: string, variables: string[], builtin?: boolean}>} */
+let templates = [];
+/** Whether template bar is visible. */
+let templateBarVisible = false;
+
+// ── Smart context state ────────────────────────────────────────────────────────────
+
+/** Smart context files included in last message. */
+/** @type {string[]} */
+let smartContextFiles = [];
+
+/** @type {Array<{rel: string, display: string, ext: string}>} Pinned files (always-in-context) */
+let pinnedFiles = [];
+
+// ── Search state ──────────────────────────────────────────────────────────────
+
+/** Current search query. */
+let searchQuery = '';
+/** Array of message elements that match search. */
+/** @type {HTMLElement[]} */
+let searchMatches = [];
+/** Current match index. */
+let searchCurrentIndex = -1;
+
+// ── Pin state ─────────────────────────────────────────────────────────────────
+let pinnedIds = new Set();
+let msgIdCounter = 0;
+const pinnedSection = document.getElementById('pinned-section');
+const pinnedList = document.getElementById('pinned-list');
+
+// ── Token estimation state ────────────────────────────────────────────────────
+
+/** Approximate context window sizes (tokens) for known model families. */
+const MODEL_CONTEXT_WINDOWS = {
+    'llama2':           4096,
+    'llama3':           8192,
+    'llama3.1':         8192,
+    'llama3.2':         8192,
+    'llama3.3':         8192,
+    'qwen2.5':          8192,
+    'qwen2.5-coder':   32768,
+    'qwen3':           32768,
+    'phi3':             4096,
+    'phi3.5':           8192,
+    'phi4':            16384,
+    'codellama':       16384,
+    'mistral':          8192,
+    'mixtral':         32768,
+    'gemma2':           8192,
+    'gemma3':          32768,
+    'gemma4':          131072,
+    'deepseek-coder':  16384,
+    'deepseek-r1':     32768,
+    'starcoder2':      16384,
+    'granite-code':     8192,
+};
+
+/** Estimate token count using the 4-chars-per-token heuristic. */
+function estimateTokens(text) {
+    return Math.ceil(text.length / 4);
+}
+
+/** Find the approximate context window for the selected model. */
+function getContextWindow() {
+    const model = modelSelect.value.toLowerCase();
+    for (const [prefix, size] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
+        if (model.startsWith(prefix)) { return size; }
+    }
+    return 8192; // safe default
+}
+
+/** Update the token indicator in the footer. */
+function updateTokenIndicator() {
+    if (!tokenIndicator) { return; }
+    const promptText = promptEl.value;
+    if (!promptText.trim()) {
+        tokenIndicator.textContent = '';
+        tokenIndicator.className = '';
+        return;
+    }
+
+    // Estimate: prompt + any mentioned file content (rough chars / 4)
+    let totalChars = promptText.length;
+    // Add rough estimate for each mentioned file (we don't have content here,
+    // use a conservative 500 tokens per mention as placeholder)
+    totalChars += mentionedFiles.length * 2000;
+    totalChars += pinnedFiles.length * 2000;
+    if (ctx.includeFile && ctx.fileLines) { totalChars += ctx.fileLines * 40; }
+
+    const estimated = estimateTokens(totalChars);
+    const window = getContextWindow();
+    const pct = estimated / window;
+
+    if (pct >= 0.95) {
+        tokenIndicator.textContent = `~${estimated.toLocaleString()} / ${window.toLocaleString()} tokens ⚠`;
+        tokenIndicator.className = 'over';
+    } else if (pct >= 0.75) {
+        tokenIndicator.textContent = `~${estimated.toLocaleString()} tokens`;
+        tokenIndicator.className = 'warn';
+    } else if (estimated > 50) {
+        tokenIndicator.textContent = `~${estimated.toLocaleString()} tokens`;
+        tokenIndicator.className = '';
+    } else {
+        tokenIndicator.textContent = '';
+        tokenIndicator.className = '';
+    }
+}
+
+// ── Status helpers ────────────────────────────────────────────────────────────
+
+/** @param {'connected'|'disconnected'|'checking'} state @param {string} text */
+function setStatus(state, text) {
+    statusDot.className = state;
+    statusText.textContent = text;
+}
+
+// ── Model list ────────────────────────────────────────────────────────────────
+
+/**
+ * @param {string[]} models
+ * @param {boolean} connected
+ */
+/** @type {string} Configured default model from settings */
+let defaultModel = '';
+
+function populateModels(models, connected, configuredModel) {
+    modelSelect.innerHTML = '';
+    if (configuredModel) { defaultModel = configuredModel; }
+    if (!connected || !models.length) {
+        setStatus('disconnected', 'Ollama not running — run: ollama serve');
+        const o = document.createElement('option');
+        o.textContent = 'No models';
+        o.disabled = true;
+        o.selected = true;
+        modelSelect.appendChild(o);
+        sendBtn.disabled = true;
+        return;
+    }
+    models.forEach((name, i) => {
+        const o = document.createElement('option');
+        o.value = name;
+        o.textContent = name;
+        if (i === 0) { o.selected = true; }
+        modelSelect.appendChild(o);
+    });
+    
+    // Apply default model from settings if available
+    if (defaultModel && models.includes(defaultModel)) {
+        modelSelect.value = defaultModel;
+        // If settings model doesn't match the active preset, switch to custom
+        if (currentPreset && MODEL_PRESETS[currentPreset] && MODEL_PRESETS[currentPreset].model !== defaultModel) {
+            currentPreset = '';
+            presetSelect.value = '';
+        }
+    } else if (currentPreset && MODEL_PRESETS[currentPreset]) {
+        // Only apply preset when settings didn't specify a different model
+        const config = MODEL_PRESETS[currentPreset];
+        if (models.includes(config.model)) {
+            modelSelect.value = config.model;
+        }
+    }
+    
+    setStatus('connected', `${models.length} model${models.length > 1 ? 's' : ''} available`);
+    sendBtn.disabled = false;
+    promptEl.focus();
+    updateTokenIndicator();
+}
+
+// Update token indicator when model changes (context window changes)
+modelSelect.addEventListener('change', () => {
+    updateTokenIndicator();
+    // Skip if this change was triggered by a preset selection
+    if (updatingFromPreset) { return; }
+    // If user manually changes model, detect matching preset or set Custom
+    updatingFromModel = true;
+    const preset = findPresetForModel(modelSelect.value);
+    if (preset) {
+        currentPreset = preset;
+        presetSelect.value = preset;
+    } else {
+        currentPreset = '';
+        presetSelect.value = '';
+    }
+    vscode.postMessage({ command: 'setPreset', preset: currentPreset });
+    updatingFromModel = false;
+});
+
+// Handle preset selection
+presetSelect.addEventListener('change', () => {
+    // Skip if this change was triggered by model selection
+    if (updatingFromModel) { return; }
+    
+    const preset = presetSelect.value;
+    currentPreset = preset;
+    
+    if (preset && MODEL_PRESETS[preset]) {
+        const config = MODEL_PRESETS[preset];
+        // Set flag to prevent modelSelect change handler from firing
+        updatingFromPreset = true;
+        modelSelect.value = config.model;
+        updatingFromPreset = false;
+        vscode.postMessage({ 
+            command: 'setPreset', 
+            preset,
+            model: config.model,
+            temperature: config.temperature
+        });
+    } else {
+        vscode.postMessage({ command: 'setPreset', preset: '' });
+    }
+    
+    updateTokenIndicator();
+});
+
+// Handle trust level selection
+trustSelect.addEventListener('change', () => {
+    const level = trustSelect.value;
+    trustSelect.className = level === 'yolo' ? 'trust-yolo' : level === 'trust' ? 'trust-trust' : '';
+    vscode.postMessage({ command: 'setTrustLevel', level });
+});
+
+/** Find preset name for a given model, or null if custom */
+function findPresetForModel(model) {
+    for (const [name, config] of Object.entries(MODEL_PRESETS)) {
+        if (config.model === model) { return name; }
+    }
+    return null;
+}
+
+// ── Markdown renderer ─────────────────────────────────────────────────────────
+
+/** @param {string} s */
+function escHtml(s) {
+    return s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/** @param {string} text */
+function renderMarkdown(text) {
+    // 0. Collapse double-newlines between short lines (list items, file names, etc.)
+    //    Keeps \n\n between prose paragraphs (lines > 80 chars) intact.
+    const parts = text.split('\n\n');
+    if (parts.length > 1) {
+        let collapsed = parts[0];
+        for (let i = 1; i < parts.length; i++) {
+            const prev = (i === 1 ? parts[0] : parts[i - 1]);
+            const prevLastLine = prev.split('\n').pop() || '';
+            const nextFirstLine = parts[i].split('\n')[0] || '';
+            // If both surrounding lines are short, collapse to single newline
+            if (prevLastLine.length < 80 && nextFirstLine.length < 80
+                && prevLastLine.trim() && nextFirstLine.trim()) {
+                collapsed += '\n' + parts[i];
+            } else {
+                collapsed += '\n\n' + parts[i];
+            }
+        }
+        text = collapsed;
+    }
+
+    // 1. Extract fenced code blocks → placeholders
+    /** @type {{lang:string, code:string}[]} */
+    const codeBlocks = [];
+    text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+        const id = `\x01CB${codeBlocks.length}\x01`;
+        codeBlocks.push({ lang: lang || '', code: code.replace(/\n$/, '') });
+        return id;
+    });
+
+    // 2. Extract inline code → placeholders
+    /** @type {string[]} */
+    const inlines = [];
+    text = text.replace(/`([^`\n]+)`/g, (_, code) => {
+        const id = `\x01IC${inlines.length}\x01`;
+        inlines.push(code);
+        return id;
+    });
+
+    // 3. Extract <think> and <scratch_pad> blocks → placeholders
+    // <think> is used by Qwen3/DeepSeek/Hermes4; <scratch_pad> is Hermes 3 GOAP reasoning.
+    // Both are routed into the collapsible "Thought process" details block.
+    /** @type {string[]} */
+    const thinks = [];
+    text = text.replace(/<think>([\s\S]*?)<\/think>/gi, (_, content) => {
+        const id = `\x01TH${thinks.length}\x01`;
+        thinks.push(content.trim());
+        return id;
+    });
+    text = text.replace(/<scratch_pad>([\s\S]*?)<\/scratch_pad>/gi, (_, content) => {
+        const id = `\x01TH${thinks.length}\x01`;
+        thinks.push(content.trim());
+        return id;
+    });
+
+    // 4. Escape remaining HTML
+    text = escHtml(text);
+
+    // 4b. Collapse blank lines between consecutive list items
+    text = text.replace(/^(\s*[-*\d].*)\n\n(?=\s*[-*\d])/gm, '$1\n');
+
+    // 5. Block-level markdown
+    text = text.replace(/^#{4} (.+)$/gm, '<h4>$1</h4>');
+    text = text.replace(/^#{3} (.+)$/gm, '<h3>$1</h3>');
+    text = text.replace(/^#{2} (.+)$/gm, '<h3>$1</h3>');
+    text = text.replace(/^# (.+)$/gm,    '<h2>$1</h2>');
+    text = text.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+    text = text.replace(/^---+$/gm,      '<hr>');
+    text = text.replace(/^\s*[-*] (.+)$/gm, '<li>$1</li>');
+    text = text.replace(/(<li>.*<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`);
+    text = text.replace(/^\s*\d+\. (.+)$/gm, '<li>$1</li>');
+
+    // 6. Inline markdown
+    text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/__([^_\n]+)__/g,      '<strong>$1</strong>');
+    text = text.replace(/\*([^*\n]+)\*/g,      '<em>$1</em>');
+    text = text.replace(/_([^_\n]+)_/g,        '<em>$1</em>');
+    text = text.replace(/~~([^~\n]+)~~/g,      '<s>$1</s>');
+
+    // 7. Paragraphs (skip lines that are already block elements)
+    text = text.split('\n\n').map((p) => {
+        p = p.trim();
+        if (!p) { return ''; }
+        if (/^<(h[2-4]|ul|ol|li|blockquote|hr|details|div)/.test(p)) { return p; }
+        return `<p>${p.replace(/\n/g, '<br>')}</p>`;
+    }).join('');
+
+    // 8. Restore code blocks with optional syntax highlighting
+    codeBlocks.forEach(({ lang, code }, i) => {
+        let highlighted = escHtml(code);
+
+        // Use highlight.js if available and the language is known
+        if (typeof window.hljs !== 'undefined' && lang) {
+            try {
+                const validLang = window.hljs.getLanguage(lang);
+                if (validLang) {
+                    highlighted = window.hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+                } else {
+                    // Try auto-detection as fallback for unknown language tags
+                    const auto = window.hljs.highlightAuto(code, ['javascript','typescript','python','rust','go','java','bash','json']);
+                    if (auto.relevance > 5) { highlighted = auto.value; }
+                }
+            } catch { highlighted = escHtml(code); }
+        }
+
+        const header = `<div class="code-header">` +
+            `<span class="code-lang-label">${escHtml(lang || 'code')}</span>` +
+            `<div style="display:flex;gap:6px;">` +
+            `<button class="apply-btn" data-apply-idx="${i}">Apply</button>` +
+            `<button class="copy-btn" data-copy-idx="${i}">Copy</button>` +
+            `</div>` +
+            `</div>`;
+        text = text.replace(
+            `\x01CB${i}\x01`,
+            `<div class="code-block" data-block-idx="${i}">${header}<pre class="hljs">${highlighted}</pre></div>`
+        );
+    });
+
+    // 9. Restore inline codes — and linkify file paths inside them
+    inlines.forEach((code, i) => {
+        const isFilePath = /^[./\\]/.test(code) || /\.[a-z]{1,6}$/i.test(code) && /[/\\]/.test(code);
+        const inner = isFilePath
+            ? `<a class="file-link" data-file="${escHtml(code)}" href="#" title="Open in VS Code">${escHtml(code)}</a>`
+            : escHtml(code);
+        text = text.replace(
+            `\x01IC${i}\x01`,
+            `<code class="inline">${inner}</code>`
+        );
+    });
+
+    // 9b. Linkify bare file paths in prose (e.g. "docs/foo.md", "src/agent.ts")
+    // Match relative paths that contain a slash and a file extension.
+    // Must come after inline-code restore so we don't double-wrap.
+    text = text.replace(
+        /(?<![">\/\\])(\b(?:[a-zA-Z0-9_\-]+\/)+[a-zA-Z0-9_\-]+\.[a-zA-Z]{1,6}\b)/g,
+        (match) => `<a class="file-link" data-file="${escHtml(match)}" href="#" title="Open in VS Code">${escHtml(match)}</a>`
+    );
+
+    // 10. Restore think blocks
+    thinks.forEach((content, i) => {
+        const inner = escHtml(content).replace(/\n/g, '<br>');
+        text = text.replace(
+            `\x01TH${i}\x01`,
+            `<details class="think-block"><summary>Reasoning (click to expand)</summary><div class="think-content">${inner}</div></details>`
+        );
+    });
+
+    return text || '&nbsp;';
+}
+
+// ── Copy code — event delegation (CSP-safe, no onclick attributes) ────────────
+
+messagesEl.addEventListener('click', (e) => {
+    const btn = /** @type {HTMLElement} */ (e.target);
+
+    // Copy button
+    if (btn.classList.contains('copy-btn')) {
+        const block = btn.closest('.code-block');
+        if (!block) { return; }
+        const pre = block.querySelector('pre');
+        if (!pre) { return; }
+        navigator.clipboard?.writeText(pre.textContent ?? '').then(() => {
+            btn.textContent = 'Copied!';
+            setTimeout(() => (btn.textContent = 'Copy'), 1500);
+        }).catch(() => {
+            btn.textContent = 'Copy';
+        });
+        return;
+    }
+
+    // Open file link
+    if (btn.classList.contains('file-link') || btn.closest('a.file-link')) {
+        const link = /** @type {HTMLElement} */ (btn.classList.contains('file-link') ? btn : btn.closest('a.file-link'));
+        e.preventDefault();
+        const filePath = link?.dataset?.file ?? '';
+        if (filePath) { vscode.postMessage({ command: 'openFile', path: filePath }); }
+        return;
+    }
+
+    // Apply button
+    if (btn.classList.contains('apply-btn')) {
+        const block = btn.closest('.code-block');
+        if (!block) { return; }
+        const pre = block.querySelector('pre');
+        if (!pre) { return; }
+        const lang = block.querySelector('.code-lang-label')?.textContent ?? '';
+        vscode.postMessage({ command: 'applyCodeBlock', code: pre.textContent ?? '', lang });
+        btn.textContent = 'Applying…';
+        btn.disabled = true;
+        setTimeout(() => { btn.textContent = 'Apply'; btn.disabled = false; }, 2000);
+        return;
+    }
+});
+
+// ── Scroll helpers ────────────────────────────────────────────────────────────
+
+/** Whether the agent loop is actively running (broader than streaming — covers tool execution gaps) */
+let agentActive = false;
+
+function scrollBottom(force = false) {
+    if (force || (!userScrolledUp && (streaming || agentActive))) {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+}
+
+messagesEl.addEventListener('scroll', () => {
+    const distFromBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+    userScrolledUp = distFromBottom > 60;
+    scrollBtn.classList.toggle('visible', userScrolledUp && (streaming || agentActive));
+});
+
+scrollBtn.addEventListener('click', () => {
+    userScrolledUp = false;
+    scrollBtn.classList.remove('visible');
+    scrollBottom(true);
+});
+
+// ── Tool icons ────────────────────────────────────────────────────────────────
+
+const TOOL_ICONS = {
+    workspace_summary: '🗂️',
+    read_file:         '📄',
+    list_files:        '📁',
+    find_files:        '🔎',
+    search_files:      '🔍',
+    create_file:       '🆕',
+    edit_file:         '✏️',
+    write_file:        '💾',
+    append_to_file:    '📝',
+    rename_file:       '🔄',
+    delete_file:       '🗑️',
+    shell_read:        '🐚',
+    run_command:       '⚡',
+    memory_search:     '🧠',
+    memory_list:       '🧠',
+    memory_write:      '💾',
+    memory_tier_write: '💾',
+    memory_delete:     '🗑️',
+    get_diagnostics:   '💡',
+    read_terminal:     '🖥️',
+    web_search:        '🌐',
+    web_fetch:         '🌍',
+};
+
+// ── Time helper ───────────────────────────────────────────────────────────────
+
+function getTimeStr() {
+    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/** Format a timestamp as relative time ("just now", "2m ago", "1h ago", "yesterday"). */
+function relativeTimeStr(ts) {
+    if (!ts) return '';
+    const diff = Date.now() - ts;
+    if (diff < 60_000) return 'just now';
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+    if (diff < 172_800_000) return 'yesterday';
+    return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+// Update relative timestamps every 60s
+setInterval(() => {
+    document.querySelectorAll('time.msg-time[data-ts]').forEach(el => {
+        el.textContent = relativeTimeStr(Number(el.dataset.ts));
+    });
+}, 60_000);
+
+// ── Chat helpers ──────────────────────────────────────────────────────────────
+
+function hideWelcome() {
+    if (welcomeEl && welcomeEl.parentNode === messagesEl) {
+        messagesEl.removeChild(welcomeEl);
+    }
+}
+
+// ── Pin helpers ──────────────────────────────────────────────────────────────
+function assignMsgId(el) {
+    const id = 'msg-' + (++msgIdCounter);
+    el.dataset.msgId = id;
+    return id;
+}
+
+function createPinBtn(msgEl) {
+    const btn = document.createElement('button');
+    btn.className = 'pin-btn';
+    btn.title = 'Pin message';
+    btn.textContent = '\u{1F4CC}';
+    btn.addEventListener('click', () => togglePin(msgEl));
+    return btn;
+}
+
+function togglePin(msgEl) {
+    const id = msgEl.dataset.msgId;
+    if (!id) return;
+    if (pinnedIds.has(id)) {
+        pinnedIds.delete(id);
+        msgEl.querySelector('.pin-btn')?.classList.remove('pinned');
+    } else {
+        pinnedIds.add(id);
+        msgEl.querySelector('.pin-btn')?.classList.add('pinned');
+    }
+    renderPinnedSection();
+    vscode.postMessage({ command: 'updatePins', pins: [...pinnedIds] });
+}
+
+function renderPinnedSection() {
+    pinnedList.innerHTML = '';
+    const msgs = messagesEl.querySelectorAll('.message[data-msg-id]');
+    let count = 0;
+    msgs.forEach(m => {
+        if (!pinnedIds.has(m.dataset.msgId)) return;
+        count++;
+        const clone = m.cloneNode(true);
+        clone.querySelectorAll('.pin-btn').forEach(b => b.remove());
+        clone.querySelectorAll('.retry-btn').forEach(b => b.remove());
+        const unpin = document.createElement('button');
+        unpin.className = 'pin-btn pinned';
+        unpin.textContent = '\u{1F4CC}';
+        unpin.title = 'Unpin';
+        const origId = m.dataset.msgId;
+        unpin.addEventListener('click', () => {
+            pinnedIds.delete(origId);
+            m.querySelector('.pin-btn')?.classList.remove('pinned');
+            renderPinnedSection();
+            vscode.postMessage({ command: 'updatePins', pins: [...pinnedIds] });
+        });
+        clone.querySelector('.msg-header')?.appendChild(unpin);
+        pinnedList.appendChild(clone);
+    });
+    pinnedSection.classList.toggle('has-pins', count > 0);
+}
+
+// addUserMessage is defined later in the History section with optional timestamp support
+
+function startAssistantMessage() {
+    hideWelcome();
+    const div = document.createElement('div');
+    div.className = 'message assistant';
+    const now = Date.now();
+    div.innerHTML =
+        `<div class="msg-header">` +
+            `<span class="msg-role">Agent <span class="dots"><span></span><span></span><span></span></span></span>` +
+            `<time class="msg-time" data-ts="${now}" title="${new Date(now).toLocaleString()}">${relativeTimeStr(now)}</time>` +
+        `</div>` +
+        `<div class="msg-content"></div>`;
+    messagesEl.insertBefore(div, scrollBtn);
+    assignMsgId(div);
+    div.querySelector('.msg-header').appendChild(createPinBtn(div));
+    currentMsgEl = div;
+    currentRaw = '';
+    inThinkingBlock = false;
+    thinkingBuf = '';
+    scrollBottom();
+    return div;
+}
+
+/** @param {string} token */
+function appendToken(token) {
+    if (!currentMsgEl) { return; }
+
+    // Handle thinking sentinels — sentinels may arrive concatenated with content,
+    // so split on them rather than using strict equality.
+    if (token.includes('\x01THINK_START\x01') || token.includes('\x01THINK_END\x01')) {
+        const parts = token.split(/(\x01THINK_(?:START|END)\x01)/);
+        for (const part of parts) {
+            if (part === '\x01THINK_START\x01') {
+                inThinkingBlock = true;
+                thinkingBuf = '';
+                const content = currentMsgEl.querySelector('.msg-content');
+                if (content && !currentMsgEl.querySelector('.thinking-block')) {
+                    const details = document.createElement('details');
+                    details.className = 'thinking-block';
+                    const summary = document.createElement('summary');
+                    summary.textContent = '💭 Thinking…';
+                    const pre = document.createElement('pre');
+                    pre.className = 'thinking-content';
+                    pre.style.cssText = 'font-size:0.78em;opacity:0.6;white-space:pre-wrap;margin:4px 0 0;';
+                    details.appendChild(summary);
+                    details.appendChild(pre);
+                    content.before(details);
+                }
+            } else if (part === '\x01THINK_END\x01') {
+                inThinkingBlock = false;
+                const details = currentMsgEl?.querySelector('.thinking-block');
+                if (details) {
+                    const summary = details.querySelector('summary');
+                    if (summary) { summary.textContent = '💭 Thought process'; }
+                }
+                scrollBottom();
+            } else if (part) {
+                appendToken(part); // recurse with clean segment
+            }
+        }
+        return;
+    }
+    if (inThinkingBlock) {
+        thinkingBuf += token;
+        const pre = currentMsgEl?.querySelector('.thinking-content');
+        if (pre) { pre.textContent = thinkingBuf; scrollBottom(); }
+        return;
+    }
+
+    currentRaw += token;
+    const content = currentMsgEl.querySelector('.msg-content');
+    if (content) {
+        // During streaming: strip complete <tool>...</tool> blocks, then hide any
+        // in-progress (unclosed) tool block at the tail so partial JSON doesn't show.
+        let display = stripToolBlocksClient(currentRaw);
+        // Strip bare remnants of split tool tags (e.g. "tool>" when "<" was emitted separately)
+        display = display.replace(/\btool>\s*/gi, '').replace(/<\/tool>/gi, '');
+
+        // Strip inline <think>...</think>, <scratch_pad>...</scratch_pad>, and
+        // <antThinking>...</antThinking> blocks.
+        // Qwen3 embeds <think> in content; Hermes 3 uses <scratch_pad> for GOAP reasoning;
+        // some models trained on Claude data emit <antThinking> self-talk blocks.
+        // Completed blocks: extract content into the collapsible thinking block.
+        // In-progress (unclosed) block: hide everything from the open tag to end of string.
+        const thinkRe = /<think>([\s\S]*?)<\/think>/gi;
+        const scratchRe = /<scratch_pad>([\s\S]*?)<\/scratch_pad>/gi;
+        const antThinkRe = /<antThinking>([\s\S]*?)<\/antThinking>/gi;
+        let thinkMatch;
+        let hasCompletedThink = false;
+        let collectedThinking = '';
+        while ((thinkMatch = thinkRe.exec(display)) !== null) {
+            collectedThinking += thinkMatch[1];
+            hasCompletedThink = true;
+        }
+        while ((thinkMatch = scratchRe.exec(display)) !== null) {
+            collectedThinking += (collectedThinking ? '\n\n' : '') + thinkMatch[1];
+            hasCompletedThink = true;
+        }
+        while ((thinkMatch = antThinkRe.exec(display)) !== null) {
+            collectedThinking += (collectedThinking ? '\n\n' : '') + thinkMatch[1];
+            hasCompletedThink = true;
+        }
+        display = display.replace(/<think>[\s\S]*?<\/think>/gi, '');
+        display = display.replace(/<scratch_pad>[\s\S]*?<\/scratch_pad>/gi, '');
+        display = display.replace(/<antThinking>[\s\S]*?<\/antThinking>/gi, '');
+        // Strip Claude-format tool XML blocks that leak into visible content
+        // (models trained on Claude API data emit these as raw text)
+        display = display.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, '');
+        display = display.replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/gi, '');
+        display = display.replace(/<parameter name="[\s\S]*?<\/antml:parameter>/gi, '');
+        // Strip bare opening/closing tags that arrive without a matching pair
+        display = display.replace(/<\/?antThinking>/gi, '');
+        display = display.replace(/<\/think>/gi, '').replace(/<\/scratch_pad>/gi, '');
+        display = display.replace(/<\/?function_calls>/gi, '').replace(/<invoke(?:\s[^>]*)?>/gi, '').replace(/<\/invoke>/gi, '');
+        display = display.replace(/<\/?antml:parameter\b[^>]*>/gi, '');
+
+        // Render collected thinking into the collapsed details block
+        if (hasCompletedThink && collectedThinking.trim()) {
+            let thinkEl = currentMsgEl.querySelector('.thinking-block');
+            if (!thinkEl) {
+                thinkEl = document.createElement('details');
+                thinkEl.className = 'thinking-block';
+                const summary = document.createElement('summary');
+                summary.textContent = '💭 Thought process';
+                const pre = document.createElement('pre');
+                pre.className = 'thinking-content';
+                pre.style.cssText = 'font-size:0.78em;opacity:0.6;white-space:pre-wrap;margin:4px 0 0;';
+                thinkEl.appendChild(summary);
+                thinkEl.appendChild(pre);
+                content.before(thinkEl);
+            }
+            const pre = thinkEl.querySelector('.thinking-content');
+            if (pre) { pre.textContent = collectedThinking.trim(); }
+        }
+
+        // Hide any in-progress (unclosed) <think>, <scratch_pad>, or <antThinking> block at the tail
+        const openThinkIdx = display.toLowerCase().lastIndexOf('<think>');
+        if (openThinkIdx !== -1 && display.toLowerCase().indexOf('</think>', openThinkIdx) === -1) {
+            display = display.slice(0, openThinkIdx);
+        }
+        const openScratchIdx = display.toLowerCase().lastIndexOf('<scratch_pad>');
+        if (openScratchIdx !== -1 && display.toLowerCase().indexOf('</scratch_pad>', openScratchIdx) === -1) {
+            display = display.slice(0, openScratchIdx);
+        }
+        const openAntThinkIdx = display.toLowerCase().lastIndexOf('<antthinking>');
+        if (openAntThinkIdx !== -1 && display.toLowerCase().indexOf('</antthinking>', openAntThinkIdx) === -1) {
+            display = display.slice(0, openAntThinkIdx);
+        }
+        const openFnCallsIdx = display.toLowerCase().lastIndexOf('<function_calls>');
+        if (openFnCallsIdx !== -1 && display.toLowerCase().indexOf('</function_calls>', openFnCallsIdx) === -1) {
+            display = display.slice(0, openFnCallsIdx);
+        }
+        // Find last <invoke> or <invoke name="..."> that isn't closed
+        const openInvokeMatch = /<invoke(?:\s[^>]*)?>/gi;
+        let openInvokeIdx = -1;
+        let m;
+        while ((m = openInvokeMatch.exec(display)) !== null) { openInvokeIdx = m.index; }
+        if (openInvokeIdx !== -1 && display.toLowerCase().indexOf('</invoke>', openInvokeIdx) === -1) {
+            display = display.slice(0, openInvokeIdx);
+        }
+
+        // If an unclosed <tool*> variant is still open at the end, hide everything from it onward
+        // Covers: <tool>, <tool{, <tool_edit>, <tool_read>, <tooltoolname>, <tooledit>, etc.
+        const openToolIdx = display.search(/<tool[\w_{>]/i);
+        if (openToolIdx !== -1) {
+            // Only hide if there's no matching closing tag after it
+            const afterOpen = display.slice(openToolIdx);
+            if (!/<\/tool[\w_]*>/i.test(afterOpen)) {
+                display = display.slice(0, openToolIdx);
+            }
+        }
+
+        // Hide text-mode tool call blocks that leak during streaming.
+        // These appear as: 🔧\n"tool_name"\nkey="value"\n... (no XML wrapper)
+        // The pattern: a line containing only a quoted known tool name, preceded by optional 🔧.
+        const TEXT_TOOL_RE = /(?:^|\n)(?:🔧\s*\n)?\s*"(?:edit_file|write_file|read_file|shell_read|run_command|search_files|find_files|list_files|web_search|web_fetch|memory_write|memory_search|delegate_task)[^\n]*(?:\n(?:[a-z_]+=[\s\S]*?))*$/;
+        const textToolMatch = TEXT_TOOL_RE.exec(display);
+        if (textToolMatch) {
+            display = display.slice(0, textToolMatch.index);
+        }
+        // Do NOT run extractModelSelfTalk during streaming — the "Final Answer:" splitter
+        // causes visible content to jump/disappear as the model emits headings mid-stream.
+        // Self-talk extraction runs once at finalizeMessage() on the complete response.
+
+        // Streaming oscillation guard: if visible content is clearly self-talk/reasoning
+        // (oscillating "I'll X. Wait. Actually Y." pattern with no tool calls yet), route
+        // it into the collapsed thinking block and show a spinner in main content.
+        // Counts lines starting with "Wait," / "Actually," / "I'll " / "I will " — if 4+
+        // of those appear in the visible text it's internal monologue, not a real answer.
+        const selfTalkLines = display.split('\n').filter(l => {
+            const t = l.trim();
+            return /^(?:wait[,.]|actually[,.]|i(?:'ll |'m | will | should | need | can )|let me |i'll )/i.test(t) && t.length < 200;
+        });
+        const isOscillating = selfTalkLines.length >= 4
+            && !display.includes('```')
+            && display.split('\n').filter(l => l.trim()).length > 0
+            // Only suppress if the MAJORITY of lines are self-talk (not a real answer with some hedging)
+            && selfTalkLines.length / Math.max(1, display.split('\n').filter(l => l.trim()).length) > 0.5;
+        if (isOscillating) {
+            // Route self-talk into the thinking block so it's not lost
+            let thinkEl = currentMsgEl.querySelector('.thinking-block');
+            if (!thinkEl) {
+                thinkEl = document.createElement('details');
+                thinkEl.className = 'thinking-block';
+                const summary = document.createElement('summary');
+                summary.textContent = '💭 Thought process';
+                const pre = document.createElement('pre');
+                pre.className = 'thinking-content';
+                pre.style.cssText = 'font-size:0.78em;opacity:0.6;white-space:pre-wrap;margin:4px 0 0;';
+                thinkEl.appendChild(summary);
+                thinkEl.appendChild(pre);
+                content.before(thinkEl);
+            }
+            const thinkPre = thinkEl.querySelector('.thinking-content');
+            if (thinkPre) { thinkPre.textContent = display.trim(); }
+            content.textContent = '⏳ Reasoning…';
+        } else {
+            content.textContent = display.trim();
+        }
+        scrollBottom();
+    }
+}
+
+/**
+ * Extract model self-talk from visible output, returning both the clean answer
+ * and the extracted monologue (to be placed in the collapsed thinking block).
+ *
+ * Gemma4 and similar models emit reasoning narration then duplicate the answer
+ * after "Final Answer:". This function captures that preamble rather than discarding it.
+ *
+ * @param {string} text
+ * @returns {{ visible: string, selfTalk: string }}
+ */
+function extractModelSelfTalk(text) {
+    if (!text) { return { visible: text, selfTalk: '' }; }
+
+    // 1. "Final Answer:" splitter — keep only what follows the last marker.
+    const finalAnswerRe = /(?:^|\n)\s*(?:\*{0,2}#{0,3}\s*)?final\s+answer[:\s*]*/gi;
+    let lastMatch = null, m;
+    while ((m = finalAnswerRe.exec(text)) !== null) { lastMatch = m; }
+    if (lastMatch) {
+        const afterMarker = text.slice(lastMatch.index + lastMatch[0].length).trim();
+        const before = text.slice(0, lastMatch.index).trim();
+        if (afterMarker.length > 0) {
+            return { visible: afterMarker, selfTalk: before };
+        }
+    }
+
+    // 2. Strip leading self-talk paragraphs only (stop at first non-self-talk paragraph).
+    const selfTalkPrefixes = [
+        /^the user (?:is asking|asked|wants|needs)\b/i,
+        /^(?:from|based on) the (?:previous|earlier|above|context)\b/i,
+        /^i (?:have|already have|now have|can see|know|found)\b/i,
+        /^i (?:don['']t|do not) need to (?:call|use|run|check)\b/i,
+        /^(?:looking at|checking|reviewing) the (?:previous|earlier|above)\b/i,
+        /^(?:since|as) (?:the|i|we) (?:previous|already|can see)\b/i,
+        /^note[:\s]/i,
+    ];
+    const paragraphs = text.split(/\n\n+/);
+    let startIdx = 0;
+    for (let i = 0; i < paragraphs.length; i++) {
+        const para = paragraphs[i].trim();
+        // Never classify as self-talk if: contains a question (user-facing), or is long
+        // (substantive findings report), or contains code backticks (technical output).
+        const isUserFacing = para.includes('?') || para.length > 160 || para.includes('`');
+        if (!isUserFacing && selfTalkPrefixes.some(re => re.test(para))) { startIdx = i + 1; }
+        else { break; }
+    }
+    if (startIdx > 0) {
+        return {
+            visible: paragraphs.slice(startIdx).join('\n\n').trim(),
+            selfTalk: paragraphs.slice(0, startIdx).join('\n\n').trim(),
+        };
+    }
+    return { visible: text, selfTalk: '' };
+}
+
+/** Strip <tool>...</tool> blocks and raw JSON tool calls from text (client-side).
+ *  Uses brace-counting to handle nested JSON (e.g. {"arguments":{}}).
+ */
+function stripToolBlocksClient(text) {
+    let result = text;
+
+    // Remove <tool>{...}</tool> and malformed <tool{...} using brace counting for nested JSON
+    let pos = 0;
+    while (pos < result.length) {
+        const lower = result.toLowerCase();
+        const idxA = lower.indexOf('<tool>', pos);
+        const idxB = lower.indexOf('<tool{', pos);
+        const idx = idxA === -1 ? idxB : idxB === -1 ? idxA : Math.min(idxA, idxB);
+        if (idx === -1) break;
+        // For malformed <tool{ the brace starts at offset 5, for <tool> at offset 6
+        const isMalformed = result[idx + 5] === '{';
+        const scanStart = idx + (isMalformed ? 5 : 6);
+        // Find the balanced closing brace
+        let depth = 0, jsonEnd = -1;
+        for (let i = scanStart; i < result.length; i++) {
+            if (result[i] === '{') { depth++; }
+            else if (result[i] === '}') { depth--; if (depth === 0) { jsonEnd = i + 1; break; } }
+        }
+        if (jsonEnd === -1) { // unclosed — strip from <tool> to end
+            result = result.slice(0, idx);
+            break;
+        }
+        // Find optional </tool> after the JSON
+        let endPos = jsonEnd;
+        const afterJson = result.slice(jsonEnd).match(/^\s*<\/tool>/i);
+        if (afterJson) endPos = jsonEnd + afterJson[0].length;
+        result = result.slice(0, idx) + result.slice(endPos);
+        pos = idx; // re-scan from same position
+    }
+
+    // Strip <tool_edit>{...}</tool>, <tool_read>{...}</tool>, <tool_edit>{...}</tool_edit>, etc.
+    // Models emit opening tags like <tool_edit> or <tooledit> but close with </tool> or </tool_edit>
+    // Pattern 1: <tool_*> or <tool*> closed by any </tool*> variant
+    result = result.replace(/<tool[\w_]+>[\s\S]*?<\/tool[\w_]*>/gi, '');
+    // Pattern 2: unclosed <tool_*> — strip to end of string
+    result = result.replace(/<tool[\w_]+>[\s\S]*/gi, '');
+
+    // Strip <tooltoolname>...</tooltoolname><toolarguments>...</toolarguments> format
+    result = result.replace(/<tooltoolname>[\s\S]*?<\/tooltoolname>\s*<toolarguments>[\s\S]*?<\/toolarguments>/gi, '');
+    result = result.replace(/<tooltoolname>[\s\S]*/gi, ''); // unclosed
+    result = result.replace(/<toolarguments>[\s\S]*?<\/toolarguments>/gi, ''); // closed
+    result = result.replace(/<toolarguments>[\s\S]*/gi, ''); // unclosed
+
+    // Strip Claude-format <function_calls>/<invoke> blocks (models trained on Claude API data)
+    result = result.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, '');
+    result = result.replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/gi, '');
+    // Remove orphaned closing tags (no matching opening tag)
+    result = result.replace(/<\/tool>/gi, '');
+    result = result.replace(/<\/invoke>/gi, '');
+    result = result.replace(/<\/function_calls>/gi, '');
+    result = result.replace(/<invoke(?:\s[^>]*)?>/gi, '');
+    // Remove markdown code blocks containing tool calls
+    result = result.replace(/```(?:json)?\s*\n?\s*\{[\s\S]*?"name"[\s\S]*?\}\s*\n?```/gi, '');
+    // Remove [TOOL RESULT: ...] blocks injected as context
+    result = result.replace(/\[TOOL RESULT:.*?\][\s\S]*?\[END TOOL RESULT\]/g, '');
+    // Remove [wait for result] hints
+    result = result.replace(/\[wait for result[^\]]*\]/gi, '');
+    // Strip JSON tail fragments that leak when a tool call is split mid-stream:
+    // patterns like `\n```", "path": "..."}}`  or lone `}}` at start of content
+    result = result.replace(/^\s*(?:```[^`]*)?,?\s*"[^"]+"\s*:\s*"[^"]*"\s*\}\}?\s*$/gm, '');
+    result = result.replace(/^\s*\}\}?\s*$/gm, '');
+    // Strip text-mode tool call blocks (no XML wrapper): 🔧 + "tool_name" + key=value lines
+    result = result.replace(/(?:^|\n)(?:🔧\s*\n)?\s*"(?:edit_file|write_file|read_file|shell_read|run_command|search_files|find_files|list_files|web_search|web_fetch|memory_write|memory_search|delegate_task)"[\s\S]*/g, '');
+    // Collapse excessive newlines — double newlines become single
+    return result.replace(/\n{2,}/g, '\n').trim();
+}
+
+/** Show a transient system note in the chat (e.g. "message queued"). Auto-fades after 4s. */
+function appendSystemNote(text) {
+    const div = document.createElement('div');
+    div.className = 'msg system-note';
+    div.style.cssText = 'opacity:0.7;font-size:0.85em;padding:4px 12px;color:var(--vscode-descriptionForeground);transition:opacity 3s ease 1s;';
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    // Fade out and remove
+    requestAnimationFrame(() => { div.style.opacity = '0'; });
+    setTimeout(() => div.remove(), 4500);
+}
+
+/**
+ * Show a persistent resume banner at the top of the restored chat.
+ * If the summary contains "⏸ Paused:" (set when pendingContinuation is present),
+ * shows a ▶ Resume button that sends "continue" on click.
+ * Otherwise shows a passive informational banner.
+ */
+function showResumeBanner(summary) {
+    document.getElementById('resume-banner')?.remove();
+    const isPaused = summary.includes('⏸ Paused:');
+    const div = document.createElement('div');
+    div.id = 'resume-banner';
+    div.style.cssText = `font-size:0.82em;padding:5px 12px;display:flex;align-items:center;gap:8px;` +
+        `color:var(--vscode-descriptionForeground);` +
+        `background:var(--vscode-editor-inactiveSelectionBackground);` +
+        `border-left:3px solid ${isPaused ? 'var(--vscode-notificationsWarningIcon-foreground,#cca700)' : 'var(--vscode-activityBarBadge-background)'};` +
+        `margin-bottom:8px;border-radius:0 4px 4px 0;`;
+    const label = document.createElement('span');
+    label.style.flex = '1';
+    label.textContent = isPaused ? summary : `↩ Restored: ${summary}`;
+    div.appendChild(label);
+    if (isPaused) {
+        const btn = document.createElement('button');
+        btn.textContent = '▶ Resume';
+        btn.style.cssText = 'font-size:0.85em;padding:2px 8px;cursor:pointer;border:1px solid var(--vscode-button-border,transparent);' +
+            'background:var(--vscode-button-background);color:var(--vscode-button-foreground);border-radius:3px;white-space:nowrap;';
+        btn.addEventListener('click', () => {
+            div.remove();
+            promptEl.value = 'continue';
+            promptEl.dispatchEvent(new Event('input'));
+            sendBtn.click();
+        });
+        div.appendChild(btn);
+    }
+    const firstMsg = messagesEl.querySelector('.message');
+    if (firstMsg) {
+        messagesEl.insertBefore(div, firstMsg);
+    } else {
+        messagesEl.appendChild(div);
+    }
+}
+
+function finalizeMessage() {
+    if (!currentMsgEl) { return; }
+
+    // If the bubble has no content at all (pure tool-call turn with no final text),
+    // remove it — empty agent bubbles clutter the history with blank entries.
+    if (!currentRaw) {
+        const hasThinking = !!currentMsgEl.querySelector('.thinking-block');
+        if (!hasThinking) {
+            currentMsgEl.remove();
+            currentMsgEl = null;
+            currentRaw = '';
+            return;
+        }
+    }
+
+    // Remove loading dots from role label
+    const roleEl = currentMsgEl.querySelector('.msg-role');
+    if (roleEl) { roleEl.innerHTML = 'Agent'; }
+
+    // Strip tool blocks before rendering (text-mode tool calls leak into streamed content)
+    let cleanRaw = stripToolBlocksClient(currentRaw);
+    // Strip bare remnants of split/partial tool tags that slipped past the block stripper
+    // (e.g. "tool>" when "<" was consumed separately, or stray "</tool>")
+    cleanRaw = cleanRaw.replace(/\btool>\s*/gi, '').replace(/<\/tool>/gi, '').trim();
+
+    // Strip inline <think>...</think> and <antThinking>...</antThinking> blocks and move
+    // them into the collapsed details element.
+    const thinkReFinal = /<think>([\s\S]*?)<\/think>/gi;
+    const antThinkReFinal = /<antThinking>([\s\S]*?)<\/antThinking>/gi;
+    let thinkMatchFinal;
+    let finalThinking = '';
+    while ((thinkMatchFinal = thinkReFinal.exec(cleanRaw)) !== null) {
+        finalThinking += thinkMatchFinal[1];
+    }
+    while ((thinkMatchFinal = antThinkReFinal.exec(cleanRaw)) !== null) {
+        finalThinking += (finalThinking ? '\n\n' : '') + thinkMatchFinal[1];
+    }
+    cleanRaw = cleanRaw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    cleanRaw = cleanRaw.replace(/<antThinking>[\s\S]*?<\/antThinking>/gi, '').trim();
+    // Strip Claude-format tool XML blocks (including invoke with attributes like <invoke name="...">)
+    cleanRaw = cleanRaw.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, '').trim();
+    cleanRaw = cleanRaw.replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/gi, '').trim();
+    // Strip bare stray tags (no matching pair)
+    cleanRaw = cleanRaw.replace(/<\/?antThinking>/gi, '').replace(/<\/think>/gi, '').trim();
+    cleanRaw = cleanRaw.replace(/<\/?function_calls>/gi, '').replace(/<invoke(?:\s[^>]*)?>/gi, '').replace(/<\/invoke>/gi, '').trim();
+    cleanRaw = cleanRaw.replace(/<\/?antml:parameter\b[^>]*>/gi, '').trim();
+
+    // Extract model self-talk (Gemma4-style monologue / "Final Answer:" prefix).
+    // Merge it into finalThinking so it ends up in the collapsed thinking block.
+    const { visible: cleanVisible, selfTalk } = extractModelSelfTalk(cleanRaw);
+    cleanRaw = cleanVisible;
+    if (selfTalk) { finalThinking = selfTalk + (finalThinking ? '\n\n---\n\n' + finalThinking : ''); }
+
+    if (finalThinking.trim()) {
+        let thinkEl = currentMsgEl.querySelector('.thinking-block');
+        if (!thinkEl) {
+            const content2 = currentMsgEl.querySelector('.msg-content');
+            thinkEl = document.createElement('details');
+            thinkEl.className = 'thinking-block';
+            const summary = document.createElement('summary');
+            summary.textContent = '💭 Thought process';
+            const pre = document.createElement('pre');
+            pre.className = 'thinking-content';
+            pre.style.cssText = 'font-size:0.78em;opacity:0.6;white-space:pre-wrap;margin:4px 0 0;';
+            thinkEl.appendChild(summary);
+            thinkEl.appendChild(pre);
+            if (content2) { content2.before(thinkEl); }
+        }
+        const pre = thinkEl.querySelector('.thinking-content');
+        if (pre) { pre.textContent = finalThinking.trim(); }
+    }
+
+    // If cleaning reduced the content to nothing and there's no thinking block, remove the bubble
+    if (!cleanRaw.trim() && !finalThinking.trim()) {
+        currentMsgEl.remove();
+        currentMsgEl = null;
+        currentRaw = '';
+        return;
+    }
+
+    // Render full markdown
+    const content = currentMsgEl.querySelector('.msg-content');
+    if (content) { content.innerHTML = renderMarkdown(cleanRaw); }
+
+    // Add retry + feedback buttons to completed assistant messages
+    const header = currentMsgEl.querySelector('.msg-header');
+    if (header && currentRaw) {
+        const actions = document.createElement('div');
+        actions.className = 'msg-actions';
+        const retryBtn = document.createElement('button');
+        retryBtn.className = 'msg-action-btn retry-btn';
+        retryBtn.title = 'Retry this response';
+        retryBtn.textContent = '↺ Retry';
+        actions.appendChild(retryBtn);
+        const thumbsUpBtn = document.createElement('button');
+        thumbsUpBtn.className = 'msg-action-btn thumbsup-btn';
+        thumbsUpBtn.title = 'This response was helpful';
+        thumbsUpBtn.textContent = '👍';
+        thumbsUpBtn.dataset.msgText = cleanRaw.slice(0, 800);
+        actions.appendChild(thumbsUpBtn);
+        const feedbackBtn = document.createElement('button');
+        feedbackBtn.className = 'msg-action-btn feedback-btn';
+        feedbackBtn.title = 'Report issue with this response';
+        feedbackBtn.textContent = '👎';
+        feedbackBtn.dataset.msgText = cleanRaw.slice(0, 800);
+        actions.appendChild(feedbackBtn);
+        header.appendChild(actions);
+    }
+
+    currentMsgEl = null;
+    currentRaw = '';
+    scrollBottom();
+}
+
+/** Remove the last assistant message element from the DOM (used for retry). */
+function removeLastAssistantMsg() {
+    // Walk backwards from scrollBtn (our fixed last child)
+    let node = scrollBtn.previousSibling;
+    while (node) {
+        const el = /** @type {HTMLElement} */ (node);
+        if (el.classList && el.classList.contains('message') && el.classList.contains('assistant')) {
+            el.remove();
+            return;
+        }
+        node = node.previousSibling;
+    }
+}
+
+/**
+ * @param {string} id
+ * @param {string} name
+ * @param {Record<string, unknown>} args
+ */
+function addToolCard(id, name, args) {
+    const icon = TOOL_ICONS[name] || '🔧';
+    let argsStr;
+    if (name === 'memory_search') {
+        argsStr = `query="${args.query ?? ''}"`;
+    } else if (name === 'memory_tier_write' || name === 'memory_write') {
+        const tier = args.tier !== undefined ? `Tier ${args.tier} — ` : '';
+        const content = String(args.content ?? '').slice(0, 60);
+        argsStr = `${tier}"${content}${content.length >= 60 ? '…' : ''}"`;
+    } else if (name === 'web_search') {
+        argsStr = `"${String(args.query ?? '').slice(0, 80)}"`;
+    } else if (name === 'web_fetch') {
+        argsStr = String(args.url ?? '').slice(0, 80);
+    } else if (name === 'run_command' || name === 'shell_read') {
+        // Show the command itself without the key name prefix
+        argsStr = String(args.command ?? '');
+    } else {
+        argsStr = Object.entries(args)
+            .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+            .join(' ');
+    }
+    const div = document.createElement('div');
+    div.className = 'tool-card';
+    div.id = `tool-${id}`;
+    div.innerHTML =
+        `<div class="tool-header" title="Click to expand/collapse">` +
+            `<div class="tool-icon">${icon}</div>` +
+            `<div class="tool-info">` +
+                `<div class="tool-name">${escHtml(name)}</div>` +
+                `<div class="tool-args">${escHtml(argsStr)}</div>` +
+            `</div>` +
+            `<div class="dots"><span></span><span></span><span></span></div>` +
+        `</div>`;
+    messagesEl.insertBefore(div, scrollBtn);
+    scrollBottom();
+}
+
+/**
+ * @param {string} id
+ * @param {boolean} success
+ * @param {string} preview
+ */
+function updateToolCard(id, success, preview, fullResult) {
+    const card = document.getElementById(`tool-${id}`);
+    if (!card) { return; }
+    card.classList.add(success ? 'success' : 'error');
+    const dots = card.querySelector('.dots');
+    if (dots) { dots.remove(); }
+
+    // Build summary line for collapsed view
+    const toolName = card.querySelector('.tool-name')?.textContent || '';
+    const output = fullResult || preview;
+    let summary = success ? '✓' : '✗';
+    if (output) {
+        const lines = output.split('\n').filter(l => l.trim());
+        if (toolName === 'read_file') {
+            summary += ` ${lines.length} lines`;
+        } else if (toolName === 'search_files') {
+            const m = output.match(/(\d+)\)/);
+            summary += m ? ` ${m[1]} matches` : ` ${lines.length} lines`;
+        } else if (toolName === 'list_files') {
+            summary += ` ${lines.length} entries`;
+        } else if (toolName === 'memory_search') {
+            const foundM = output.match(/\((\d+) found\)/);
+            const queryM = output.match(/for "([^"]{1,40})"/);
+            if (!success || output.includes('No relevant memories')) {
+                summary += ` no memories found`;
+            } else if (foundM && queryM) {
+                summary += ` ${foundM[1]} memories — "${queryM[1]}"`;
+            } else {
+                summary += ` ${lines.length} results`;
+            }
+        } else if (toolName === 'memory_tier_write' || toolName === 'memory_write') {
+            if (/^Error:|^Filtered:|^Duplicate:|content is required|too short/i.test(output)) {
+                summary += ` — ${output.slice(0, 80)}`;
+            } else {
+                const tierM = output.match(/Tier (\d+)/);
+                const snip = output.replace(/Note saved.*?\./i, '').trim().slice(0, 50);
+                summary += tierM ? ` saved to Tier ${tierM[1]}` : ` saved`;
+                if (snip) { summary += ` — ${snip}`; }
+            }
+        } else if (toolName === 'web_search') {
+            const countM = output.match(/(\d+) results?/i);
+            if (!success || output.startsWith('(web_search unavailable')) {
+                summary += ` unavailable`;
+            } else if (countM) {
+                summary += ` ${countM[1]} results`;
+            } else {
+                summary += ` ${lines.length} lines`;
+            }
+        } else if (toolName === 'web_fetch') {
+            if (!success) {
+                summary += ` failed`;
+            } else {
+                const chars = output.length;
+                summary += ` ${chars > 1000 ? Math.round(chars / 1000) + 'k' : chars} chars`;
+            }
+        } else {
+            summary += ` ${lines.length} lines`;
+        }
+    }
+
+    // Add summary badge
+    const header = card.querySelector('.tool-header');
+    if (header) {
+        const badge = document.createElement('span');
+        badge.className = 'tool-summary';
+        badge.textContent = summary;
+        header.appendChild(badge);
+    }
+
+    // Add collapsible output body (collapsed by default)
+    if (output) {
+        const body = document.createElement('div');
+        body.className = 'tool-body collapsed';
+        const outputDiv = document.createElement('div');
+        outputDiv.className = 'tool-output';
+        outputDiv.textContent = output;
+        body.appendChild(outputDiv);
+        card.appendChild(body);
+
+        // Toggle collapse on header click
+        if (header) {
+            header.style.cursor = 'pointer';
+            header.addEventListener('click', () => {
+                body.classList.toggle('collapsed');
+                card.classList.toggle('expanded');
+            });
+        }
+    }
+    scrollBottom();
+}
+
+/** @param {string} text */
+/** Map raw error strings to user-friendly messages with actions. */
+function friendlyErrorMsg(raw) {
+    if (/ECONNREFUSED|connect ECONNREFUSED/i.test(raw))
+        return '🔌 Ollama isn\'t running. Start it with: <code class="inline">ollama serve</code>';
+    if (/timed out/i.test(raw))
+        return '⏱ Request timed out. The model may still be loading — try again in a moment.';
+    if (/model.*not found|404/i.test(raw))
+        return '📦 Model not found. Install it with: <code class="inline">ollama pull &lt;model-name&gt;</code>';
+    if (/context length|too long/i.test(raw))
+        return '📏 Message exceeds the model\'s context window. Try compacting the conversation or starting a new chat.';
+    if (/does not support tools/i.test(raw))
+        return '⚙️ This model doesn\'t support native tool calling — text-mode will be used automatically.';
+    return `⚠ ${escHtml(raw)}`;
+}
+
+/** Returns true if the error text represents a transient network drop (retryable). */
+function isNetworkError(text) {
+    return /ECONNRESET|ECONNABORTED|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|network\s*(error|drop|lost)|connection\s*(lost|dropped|reset|refused|closed)/i.test(text);
+}
+
+function addErrorMessage(text) {
+    finalizeMessage();
+    const div = document.createElement('div');
+
+    if (isNetworkError(text)) {
+        // Soft connection-issue card with retry button
+        div.className = 'message conn-warn-msg';
+        div.innerHTML =
+            `<div class="conn-warn-body">` +
+                `<span class="conn-warn-icon">⚡</span>` +
+                `<div class="conn-warn-text">` +
+                    `<strong>Connection hiccup</strong>` +
+                    `<span>Lost contact with the model — this is usually temporary.</span>` +
+                `</div>` +
+                `<button class="conn-warn-retry">Retry</button>` +
+            `</div>`;
+        messagesEl.insertBefore(div, scrollBtn);
+        div.querySelector('.conn-warn-retry').addEventListener('click', () => {
+            div.remove();
+            setStreaming(true);
+            vscode.postMessage({ command: 'retryLast', model: modelSelect.value });
+        });
+    } else {
+        div.className = 'message error-msg';
+        div.innerHTML =
+            `<div class="msg-header">` +
+                `<span class="msg-role" style="color:var(--vscode-errorForeground,#f48771);opacity:0.9">Error</span>` +
+                `<time class="msg-time">${getTimeStr()}</time>` +
+            `</div>` +
+            `<div class="msg-content" style="color:var(--vscode-errorForeground,#f48771)">${friendlyErrorMsg(text)}</div>`;
+        messagesEl.insertBefore(div, scrollBtn);
+    }
+    scrollBottom(true);
+}
+
+function addTimeoutRetryCard(attempt, delayS) {
+    finalizeMessage();
+    const div = document.createElement('div');
+    div.className = 'message timeout-retry-msg';
+    div.innerHTML =
+        `<div class="tr-body">` +
+            `<span class="tr-icon">⏱</span>` +
+            `<span class="tr-text">Model is loading — retrying in <span class="tr-countdown">${delayS}</span>s&hellip; <span class="tr-attempt">(attempt ${attempt}/3)</span></span>` +
+        `</div>`;
+    messagesEl.insertBefore(div, scrollBtn);
+    scrollBottom();
+    // Countdown timer
+    const countdownEl = div.querySelector('.tr-countdown');
+    let remaining = delayS;
+    const tick = setInterval(() => {
+        remaining--;
+        if (countdownEl) { countdownEl.textContent = String(Math.max(0, remaining)); }
+        if (remaining <= 0) { clearInterval(tick); }
+    }, 1000);
+}
+
+function addTurnLimitCard(text, canAutoContinue, longSession) {
+    finalizeMessage();
+    const div = document.createElement('div');
+    div.className = 'message turn-limit-msg';
+
+    // Parse the summary text into sections for display
+    const lines = text.split('\n').filter(l => l.trim());
+    const doneLines = lines.filter(l => /^\*\*Done:\*\*|^\s+\[ok\]/.test(l));
+    const hintLine = lines.find(l => /^\*\*Last file|^\*\*Still open/.test(l)) || '';
+    const newChatHint = longSession
+        ? `<span class="tl-hint">Long session — consider starting a new chat if the agent seems slow.</span>`
+        : '';
+
+    let doneHtml = '';
+    if (doneLines.length > 0) {
+        const items = doneLines.map(l => `<span>${escHtml(l.replace(/^\s+\[ok\]\s*/, '').replace(/\*\*/g, ''))}</span>`).join('');
+        doneHtml = `<div class="tl-done">${items}</div>`;
+    }
+
+    const actionHtml = canAutoContinue
+        ? `<span class="tl-status tl-continuing">Continuing…</span>`
+        : `<button class="tl-keep-going">Keep going</button>`;
+
+    div.innerHTML =
+        `<div class="tl-body">` +
+            `<div class="tl-left">` +
+                `<span class="tl-icon">⏸</span>` +
+                `<div class="tl-text">` +
+                    `<strong>Turn limit reached</strong>` +
+                    (hintLine ? `<span>${escHtml(hintLine.replace(/\*\*/g, ''))}</span>` : '') +
+                    doneHtml +
+                    newChatHint +
+                `</div>` +
+            `</div>` +
+            `<div class="tl-action">${actionHtml}</div>` +
+        `</div>`;
+
+    messagesEl.insertBefore(div, scrollBtn);
+
+    const keepGoingBtn = div.querySelector('.tl-keep-going');
+    if (keepGoingBtn) {
+        keepGoingBtn.addEventListener('click', () => {
+            keepGoingBtn.disabled = true;
+            keepGoingBtn.textContent = 'Continuing…';
+            setStreaming(true);
+            vscode.postMessage({ command: 'chat', text: 'keep going', model: modelSelect.value });
+        });
+    }
+
+    scrollBottom(true);
+}
+
+function addReasoningCard(msg) {
+    const container = document.getElementById('chat-messages');
+    if (!container) return;
+    const card = document.createElement('div');
+    card.className = 'reasoning-card';
+    const warnings = msg.warnings && msg.warnings.length > 0
+        ? `<div class="rc-warnings">${msg.warnings.map(w => `<span class="rc-warn">⚠ ${escHtml(w)}</span>`).join('')}</div>`
+        : '';
+    card.innerHTML = `
+        <div class="rc-header" onclick="this.parentElement.classList.toggle('rc-open')">
+            <span class="rc-icon">🔍</span>
+            <span class="rc-title">Research: <code>${escHtml(msg.targetFile)}</code></span>
+            <span class="rc-toggle">▸</span>
+        </div>
+        <div class="rc-body">
+            <div class="rc-row"><span class="rc-label">Routes found</span><span class="rc-value">${msg.routes ? msg.routes.length : 0}</span></div>
+            <div class="rc-row"><span class="rc-label">Functions found</span><span class="rc-value">${msg.functions ? msg.functions.length : 0}</span></div>
+            <div class="rc-row"><span class="rc-label">Models available</span><span class="rc-value">${msg.modelCount || 0}</span></div>
+            <div class="rc-row"><span class="rc-label">Pattern found</span><span class="rc-value">${msg.hasPattern ? '✓' : '—'}</span></div>
+            <div class="rc-row"><span class="rc-label">Task type</span><span class="rc-value">${msg.isSweep ? 'sweep' : 'single edit'}</span></div>
+            ${warnings}
+        </div>`;
+    container.appendChild(card);
+    scrollBottom();
+}
+
+function addPlanCard(msg) {
+    const container = document.getElementById('chat-messages');
+    if (!container) return;
+    const card = document.createElement('div');
+    card.className = 'plan-card';
+    const rows = (msg.plan || []).map(p =>
+        `<div class="pc-row">
+            <span class="pc-action ${p.action}">${p.action === 'create' ? '✚' : '~'}</span>
+            <code class="pc-path">${escHtml(p.relPath)}</code>
+            <span class="pc-desc">${escHtml(p.description)}</span>
+        </div>`
+    ).join('');
+    card.innerHTML = `
+        <div class="pc-header"><span class="pc-icon">📋</span><span class="pc-title">Multi-file plan</span></div>
+        <div class="pc-body">${rows}</div>`;
+    container.appendChild(card);
+    scrollBottom();
+}
+
+function addPlanProgress(msg) {
+    const container = document.getElementById('chat-messages');
+    if (!container) return;
+    const step = msg.step || {};
+    const remaining = msg.remaining ?? 0;
+    const el = document.createElement('div');
+    el.className = 'plan-progress';
+    el.innerHTML = `<span class="pp-icon">${step.action === 'create' ? '✚' : '~'}</span>` +
+        `<code class="pp-path">${escHtml(step.relPath || '')}</code>` +
+        `<span class="pp-desc">${escHtml(step.description || '')}</span>` +
+        (remaining > 0 ? `<span class="pp-remaining">(${remaining} more)</span>` : '');
+    container.appendChild(el);
+    scrollBottom();
+}
+
+function addPlanComplete() {
+    const container = document.getElementById('chat-messages');
+    if (!container) return;
+    const el = document.createElement('div');
+    el.className = 'plan-complete';
+    el.textContent = '✓ Multi-file plan complete';
+    container.appendChild(el);
+    scrollBottom();
+}
+
+function clearChat() {
+    // Always reset the sticky confirm bar — leftover bars from prior sessions show as a brown stripe
+    const pendingBar = document.getElementById('pending-confirm-bar');
+    if (pendingBar) { pendingBar.style.display = 'none'; pendingBar.innerHTML = ''; }
+    document.getElementById('resume-banner')?.remove();
+
+    // Remove all message / tool-card children but keep #welcome, #scroll-btn, #pinned-section
+    Array.from(messagesEl.childNodes).forEach((node) => {
+        const el = /** @type {HTMLElement} */ (node);
+        if (el.id === 'scroll-btn') { return; }
+        if (el.id === 'welcome') { return; }
+        if (el.id === 'pinned-section') { return; }
+        el.remove();
+    });
+    pinnedIds.clear();
+    renderPinnedSection();
+    // Re-attach welcome if it was removed
+    if (!document.getElementById('welcome')) {
+        messagesEl.insertBefore(welcomeEl, scrollBtn);
+        // Re-attach hint chip handlers
+        welcomeEl.querySelectorAll('.hint-chip').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const hint = /** @type {HTMLButtonElement} */ (btn).dataset.hint;
+                if (hint) { promptEl.value = hint; sendMessage(); }
+            });
+        });
+    }
+    currentMsgEl = null;
+    currentRaw = '';
+    userScrolledUp = false;
+    scrollBtn.classList.remove('visible');
+    updateContextUsage(0, 0, 0);
+    // Reset streaming/agent state so a tab switch never leaves the UI stuck
+    inThinkingBlock = false;
+    thinkingBuf = '';
+    setStreaming(false);
+    agentActive = false;
+    stopBtn.classList.remove('visible');
+    sendBtn.disabled = modelSelect.value === '';
+}
+
+// ── Retry via event delegation ────────────────────────────────────────────────
+
+messagesEl.addEventListener('click', (e) => {
+    const btn = /** @type {HTMLElement} */ (e.target);
+    if (!btn.classList.contains('retry-btn')) { return; }
+    if (streaming) { return; }
+    // Remove everything back to (but not including) the last user message:
+    // tool cards, assistant bubbles, and any orphaned thinking blocks from this run.
+    const msgDiv = btn.closest('.message.assistant');
+    if (msgDiv) {
+        // Collect all nodes from msgDiv back to the previous user message
+        const toRemove = [];
+        let node = /** @type {HTMLElement|null} */ (msgDiv);
+        while (node && !(node.classList?.contains('message') && node.classList?.contains('user'))) {
+            toRemove.push(node);
+            node = /** @type {HTMLElement|null} */ (node.previousElementSibling);
+        }
+        toRemove.forEach(n => n.remove());
+    }
+    setStreaming(true);
+    vscode.postMessage({ command: 'retryLast', model: modelSelect.value });
+});
+
+// ── Feedback button via event delegation ──────────────────────────────────────
+
+const FEEDBACK_LABELS = [
+    { id: 'second-guessed',  label: '🔄 Second-guessed itself' },
+    { id: 'extra-loop',      label: '➿ Extra verification loop' },
+    { id: 'verbose',         label: '📝 Too verbose / over-explained' },
+    { id: 'wrong-tool',      label: '🔧 Wrong tool chosen' },
+    { id: 'ignored-result',  label: '🙈 Ignored tool result' },
+    { id: 'other',           label: '❓ Other issue' },
+];
+
+messagesEl.addEventListener('click', (e) => {
+    const btn = /** @type {HTMLElement} */ (e.target);
+    if (!btn.classList.contains('feedback-btn')) { return; }
+
+    // Remove any existing picker
+    document.querySelector('.feedback-picker')?.remove();
+
+    const picker = document.createElement('div');
+    picker.className = 'feedback-picker';
+    picker.style.cssText = [
+        'position:absolute',
+        'background:var(--vscode-menu-background,#1e1e1e)',
+        'border:1px solid var(--vscode-panel-border,#444)',
+        'border-radius:6px',
+        'padding:4px',
+        'z-index:999',
+        'display:flex',
+        'flex-direction:column',
+        'gap:2px',
+        'min-width:210px',
+        'box-shadow:0 4px 12px rgba(0,0,0,0.4)',
+    ].join(';');
+
+    const msgText = btn.dataset.msgText || '';
+
+    FEEDBACK_LABELS.forEach(({ id, label }) => {
+        const item = document.createElement('button');
+        item.style.cssText = [
+            'background:none',
+            'border:none',
+            'color:var(--vscode-menu-foreground,#ccc)',
+            'text-align:left',
+            'padding:5px 10px',
+            'cursor:pointer',
+            'font-size:12px',
+            'border-radius:4px',
+        ].join(';');
+        item.textContent = label;
+        item.onmouseenter = () => { item.style.background = 'var(--vscode-menu-selectionBackground,#04395e)'; };
+        item.onmouseleave = () => { item.style.background = 'none'; };
+        item.addEventListener('click', () => {
+            picker.remove();
+            btn.textContent = '👍';
+            btn.title = `Feedback recorded: ${label}`;
+            btn.style.opacity = '1';
+            btn.classList.remove('feedback-btn'); // prevent double-click
+            vscode.postMessage({ command: 'submitFeedback', label: id, msgText });
+        });
+        picker.appendChild(item);
+    });
+
+    // Position below the button
+    const rect = btn.getBoundingClientRect();
+    const panelRect = messagesEl.getBoundingClientRect();
+    picker.style.top = (rect.bottom - panelRect.top + messagesEl.scrollTop + 4) + 'px';
+    picker.style.left = Math.max(0, rect.left - panelRect.left - 60) + 'px';
+    messagesEl.style.position = 'relative';
+    messagesEl.appendChild(picker);
+
+    // Close on outside click
+    const close = (/** @type {MouseEvent} */ ev) => {
+        if (!picker.contains(/** @type {Node} */ (ev.target))) {
+            picker.remove();
+            document.removeEventListener('click', close, true);
+        }
+    };
+    setTimeout(() => document.addEventListener('click', close, true), 0);
+});
+
+// ── Thumbs-up button via event delegation ─────────────────────────────────────
+
+messagesEl.addEventListener('click', (e) => {
+    const btn = /** @type {HTMLElement} */ (e.target);
+    if (!btn.classList.contains('thumbsup-btn')) { return; }
+    const msgText = btn.dataset.msgText || '';
+    btn.classList.remove('thumbsup-btn'); // prevent double-click
+    btn.style.opacity = '1';
+    btn.title = 'Marked as helpful';
+    vscode.postMessage({ command: 'submitPositiveFeedback', msgText });
+});
+
+// ── Context bar ───────────────────────────────────────────────────────────────
+
+function updateContextBar() {
+    contextBar.innerHTML = '';
+
+    if (ctx.file) {
+        const pill = document.createElement('span');
+        pill.className = 'ctx-pill' + (ctx.includeFile ? ' active' : '');
+        pill.title = ctx.includeFile
+            ? 'Full file attached — click × to detach'
+            : 'Click to attach full file';
+
+        const fileName = ctx.file.split('/').pop() || ctx.file;
+        pill.innerHTML =
+            `📄 <span style="overflow:hidden;text-overflow:ellipsis;max-width:100px;display:inline-block;vertical-align:middle">${escHtml(fileName)}</span>` +
+            ` <span class="ctx-pill-toggle" data-toggle="file">${ctx.includeFile ? '×' : '+'}</span>`;
+        contextBar.appendChild(pill);
+    }
+
+    if (ctx.selectionLines > 0) {
+        const pill = document.createElement('span');
+        pill.className = 'ctx-pill' + (ctx.includeSelection ? ' active' : '');
+        pill.title = ctx.includeSelection
+            ? 'Selection attached — click × to detach'
+            : 'Click to attach selection';
+        pill.innerHTML =
+            `✂️ ${ctx.selectionLines} line${ctx.selectionLines > 1 ? 's' : ''}` +
+            ` <span class="ctx-pill-toggle" data-toggle="selection">${ctx.includeSelection ? '×' : '+'}</span>`;
+        contextBar.appendChild(pill);
+    }
+
+    // @mention pills
+    mentionedFiles.forEach((f) => {
+        const pill = document.createElement('span');
+        pill.className = 'mention-pill';
+        pill.title = f.rel;
+        pill.innerHTML =
+            `${fileIcon(f.ext)} ${escHtml(f.display)}` +
+            ` <span class="mention-pill-remove" data-remove-rel="${escHtml(f.rel)}">×</span>`;
+        contextBar.appendChild(pill);
+    });
+
+    // Pinned file pills
+    pinnedFiles.forEach((f) => {
+        const pill = document.createElement('span');
+        pill.className = 'pinned-file-pill';
+        pill.title = `📌 ${f.rel} (always included)`;
+        pill.innerHTML =
+            `📌 ${escHtml(f.display)}` +
+            ` <span class="pinned-file-remove" data-unpin-rel="${escHtml(f.rel)}">×</span>`;
+        contextBar.appendChild(pill);
+    });
+
+    // Pin file button
+    const pinBtn = document.createElement('button');
+    pinBtn.id = 'pin-file-btn';
+    pinBtn.title = 'Pin a file (always include in context)';
+    pinBtn.textContent = '📌+';
+    contextBar.appendChild(pinBtn);
+}
+
+contextBar.addEventListener('click', (e) => {
+    const el = /** @type {HTMLElement} */ (e.target);
+
+    // Handle @mention pill removal
+    if (el.dataset.removeRel) {
+        mentionedFiles = mentionedFiles.filter((f) => f.rel !== el.dataset.removeRel);
+        updateContextBar();
+        updateTokenIndicator();
+        return;
+    }
+
+    // Handle pinned file removal
+    if (el.dataset.unpinRel) {
+        pinnedFiles = pinnedFiles.filter((f) => f.rel !== el.dataset.unpinRel);
+        vscode.postMessage({ command: 'updatePinnedFiles', files: pinnedFiles.map(f => f.rel) });
+        updateContextBar();
+        updateTokenIndicator();
+        return;
+    }
+
+    // Handle pin-file button — trigger file search in pin mode
+    if (el.id === 'pin-file-btn') {
+        pinModeActive = true;
+        // Preserve existing input text; append @ at cursor position
+        const cursorPos = promptEl.selectionStart ?? promptEl.value.length;
+        const before = promptEl.value.slice(0, cursorPos);
+        const after = promptEl.value.slice(cursorPos);
+        promptEl.value = before + '@' + after;
+        promptEl.focus();
+        promptEl.selectionStart = promptEl.selectionEnd = cursorPos + 1;
+        mentionAtStart = cursorPos;
+        mentionQuery = '';
+        vscode.postMessage({ command: 'searchFiles', query: '' });
+        return;
+    }
+
+    // Handle file/selection toggle
+    if (!el.dataset.toggle) { return; }
+    if (el.dataset.toggle === 'file') {
+        ctx.includeFile = !ctx.includeFile;
+        if (ctx.includeFile) { ctx.includeSelection = false; }
+    } else if (el.dataset.toggle === 'selection') {
+        ctx.includeSelection = !ctx.includeSelection;
+        if (ctx.includeSelection) { ctx.includeFile = false; }
+    }
+    updateContextBar();
+    updateTokenIndicator();
+});
+
+// ── Command output blocks ─────────────────────────────────────────────────────
+
+/**
+ * @param {string} id
+ * @param {string} cmd
+ */
+function addCommandBlock(id, cmd) {
+    const div = document.createElement('div');
+    div.className = 'cmd-block';
+    div.id = `cmd-${id}`;
+    // Determine label: show "Shell" as the type, with the command as the detail
+    const isSsh = /^\s*(ssh|scp|sftp)\s/i.test(cmd);
+    const label = isSsh ? 'Shell (SSH)' : 'Shell';
+    // Truncate the command for display — full command shown in title tooltip
+    const cmdDisplay = cmd.length > 80 ? cmd.slice(0, 77) + '…' : cmd;
+    div.innerHTML =
+        `<div class="cmd-header" title="${escHtml(cmd)}">` +
+            `<span class="cmd-icon">⚡</span>` +
+            `<span class="cmd-type">${escHtml(label)}</span>` +
+            `<span class="cmd-label">${escHtml(cmdDisplay)}</span>` +
+            `<div class="dots"><span></span><span></span><span></span></div>` +
+        `</div>` +
+        `<div class="cmd-output" style="display:none"></div>`;
+
+    // If a tool-card for this same ID exists (from the toolCall event), replace it
+    // in-place so the shell block appears at the right position in the chat.
+    const existingCard = document.getElementById(`tool-${id}`);
+    if (existingCard) {
+        existingCard.replaceWith(div);
+    } else {
+        messagesEl.insertBefore(div, scrollBtn);
+    }
+
+    // Click header to toggle output visibility.
+    // If user collapses during streaming, set userCollapsed so chunks don't re-expand it.
+    const header = div.querySelector('.cmd-header');
+    const output = div.querySelector('.cmd-output');
+    if (header && output) {
+        header.style.cursor = 'pointer';
+        header.addEventListener('click', () => {
+            const isHidden = output.style.display === 'none';
+            output.style.display = isHidden ? 'block' : 'none';
+            div.dataset.userCollapsed = isHidden ? '' : '1';
+        });
+    }
+    scrollBottom();
+}
+
+/**
+ * @param {string} id
+ * @param {string} text
+ * @param {'stdout'|'stderr'} stream
+ */
+function appendCommandChunk(id, text, stream) {
+    const block = document.getElementById(`cmd-${id}`);
+    if (!block) { return; }
+    const output = block.querySelector('.cmd-output');
+    if (!output) { return; }
+    const span = document.createElement('span');
+    if (stream === 'stderr') {
+        span.className = 'stderr';
+    }
+    span.textContent = text;
+    output.appendChild(span);
+    // Auto-expand while the command is running so live output is visible.
+    // Mark as user-collapsed if they click the header during streaming — respect that.
+    if (!block.dataset.userCollapsed) {
+        output.style.display = 'block';
+    }
+    output.scrollTop = output.scrollHeight;
+    scrollBottom();
+}
+
+/**
+ * @param {string} id
+ * @param {number} exitCode
+ */
+function finalizeCommandBlock(id, exitCode) {
+    const block = document.getElementById(`cmd-${id}`);
+    if (!block) { return; }
+    const ok = exitCode === 0;
+    block.classList.add(ok ? 'success' : 'error');
+    const dots = block.querySelector('.dots');
+    if (dots) { dots.remove(); }
+    const header = block.querySelector('.cmd-header');
+    const output = block.querySelector('.cmd-output');
+    const hasOutput = output && output.textContent.trim().length > 0;
+
+    if (header) {
+        const badge = document.createElement('span');
+        badge.className = 'cmd-exit';
+        // Show green check or red X with exit code
+        badge.textContent = ok ? `✓ exit 0` : `✗ exit ${exitCode}`;
+        badge.style.color = ok ? '#4ec94e' : '#f44747';
+        header.appendChild(badge);
+
+        // Show line/char count hint when collapsed
+        if (hasOutput) {
+            const lines = output.textContent.split('\n').filter(l => l.trim()).length;
+            const hint = document.createElement('span');
+            hint.className = 'cmd-exit';
+            hint.textContent = `${lines} line${lines !== 1 ? 's' : ''} — click to view`;
+            hint.style.opacity = '0.5';
+            header.appendChild(hint);
+        }
+    }
+
+    // On success: collapse output now that the command is done (it was live-expanded during the run).
+    // On failure: always leave expanded so errors are immediately visible.
+    // If the user manually toggled during streaming, respect their choice.
+    if (output && !block.dataset.userCollapsed) {
+        output.style.display = ok ? 'none' : 'block';
+    }
+
+    // Show first line of output as a preview when collapsed (success only).
+    if (ok && hasOutput) {
+        const firstLine = output.textContent.split('\n').find(l => l.trim()) ?? '';
+        if (firstLine.trim()) {
+            const preview = document.createElement('div');
+            preview.className = 'cmd-preview';
+            preview.textContent = firstLine.trim();
+            preview.title = 'Click to expand full output';
+            // Toggle output on click, same as header
+            preview.addEventListener('click', () => {
+                const isHidden = output.style.display === 'none';
+                output.style.display = isHidden ? 'block' : 'none';
+                block.dataset.userCollapsed = isHidden ? '' : '1';
+                preview.style.display = isHidden ? 'none' : '';
+            });
+            // Hide preview when output is expanded (user opened it)
+            const origHeaderClick = block.querySelector('.cmd-header');
+            if (origHeaderClick) {
+                origHeaderClick.addEventListener('click', () => {
+                    preview.style.display = output.style.display === 'none' ? '' : 'none';
+                });
+            }
+            block.insertBefore(preview, output);
+        }
+    }
+
+    scrollBottom();
+}
+
+// ── Subagent status cards ─────────────────────────────────────────────────────
+
+/**
+ * Create a subagent card in the chat when delegate_task fires.
+ * Shows the prompt, live tool activity, and final status.
+ * @param {string} id
+ * @param {string} prompt
+ */
+function addSubagentCard(id, prompt) {
+    const div = document.createElement('div');
+    div.className = 'tool-card subagent-card';
+    div.id = `subagent-${id}`;
+    const promptDisplay = prompt.length > 100 ? prompt.slice(0, 97) + '…' : prompt;
+    div.innerHTML =
+        `<div class="tool-header">` +
+            `<div class="tool-icon">🤖</div>` +
+            `<div class="tool-info">` +
+                `<div class="tool-name">Sub-agent running…</div>` +
+                `<div class="tool-args subagent-activity">${escHtml(promptDisplay)}</div>` +
+            `</div>` +
+            `<div class="dots"><span></span><span></span><span></span></div>` +
+        `</div>` +
+        `<div class="subagent-output" style="display:none"></div>`;
+    messagesEl.appendChild(div);
+    scrollBottom();
+}
+
+/**
+ * Update the subagent card with the latest tool being called.
+ * @param {string} id
+ * @param {string} toolName
+ */
+function updateSubagentTool(id, toolName) {
+    const card = document.getElementById(`subagent-${id}`);
+    if (!card) { return; }
+    const activity = card.querySelector('.subagent-activity');
+    if (!activity) { return; }
+    const icon = TOOL_ICONS[toolName] || '🔧';
+    activity.textContent = `${icon} ${toolName}`;
+}
+
+/**
+ * Append a token to the subagent output area.
+ * @param {string} id
+ * @param {string} text
+ */
+function appendSubagentChunk(id, text) {
+    const card = document.getElementById(`subagent-${id}`);
+    if (!card) { return; }
+    const out = card.querySelector('.subagent-output');
+    if (!out) { return; }
+    out.textContent += text;
+}
+
+/**
+ * Finalize the subagent card with success/failure status.
+ * @param {string} id
+ * @param {'done'|'failed'|'stopped'} status
+ * @param {number} turns
+ * @param {number} filesChanged
+ */
+function finalizeSubagentCard(id, status, turns, filesChanged) {
+    const card = document.getElementById(`subagent-${id}`);
+    if (!card) { return; }
+    const dots = card.querySelector('.dots');
+    if (dots) { dots.remove(); }
+    const activity = card.querySelector('.subagent-activity');
+    const out = card.querySelector('.subagent-output');
+    const ok = status === 'done';
+
+    card.classList.add(ok ? 'success' : 'error');
+
+    // Update title from "Sub-agent running…" to "Sub-agent"
+    const nameEl = card.querySelector('.tool-name');
+    if (nameEl) { nameEl.textContent = 'Sub-agent'; }
+
+    const summary = document.createElement('span');
+    summary.className = 'cmd-exit';
+    const filesNote = filesChanged > 0 ? `, ${filesChanged} file${filesChanged !== 1 ? 's' : ''} changed` : '';
+    summary.textContent = ok ? `✓ done (${turns} turns${filesNote})` : `✗ ${status} (${turns} turns)`;
+    summary.style.color = ok ? '#4ec94e' : '#f44747';
+    if (activity) { activity.textContent = ''; activity.appendChild(summary); }
+
+    // Show output if there is any, collapsed by default on success
+    if (out && out.textContent.trim()) {
+        const header = card.querySelector('.tool-header');
+        if (header) {
+            header.style.cursor = 'pointer';
+            header.addEventListener('click', () => {
+                out.style.display = out.style.display === 'none' ? 'block' : 'none';
+            });
+        }
+        out.style.display = ok ? 'none' : 'block';
+    }
+    scrollBottom();
+}
+
+// ── File-changed notification ─────────────────────────────────────────────────
+
+const FILE_ACTION_ICONS = {
+    created:  '✅',
+    edited:   '✏️',
+    written:  '💾',
+    appended: '📝',
+    renamed:  '🔄',
+    deleted:  '🗑️',
+};
+
+/**
+ * @param {string} filePath
+ * @param {string} action
+ */
+function addFileToast(filePath, action) {
+    const div = document.createElement('div');
+    const isEdit   = action === 'edited'  || action === 'written' || action === 'appended';
+    const isDelete = action === 'deleted';
+    const isCreate = action === 'created';
+    div.className = `file-toast${isEdit ? ' edited' : ''}${isDelete ? ' deleted' : ''}`;
+    const icon = FILE_ACTION_ICONS[action] ?? '📁';
+    div.innerHTML = `${icon} <span>${escHtml(action.charAt(0).toUpperCase() + action.slice(1))}: <strong>${escHtml(filePath)}</strong></span>`;
+    if (isEdit || isDelete || isCreate) {
+        const btn = document.createElement('button');
+        btn.className = 'compact-btn';
+        btn.textContent = '↩ Undo';
+        btn.addEventListener('click', () => {
+            vscode.postMessage({ command: 'undoLastTool' });
+            btn.disabled = true;
+            btn.textContent = 'Undoing…';
+        });
+        div.appendChild(btn);
+    }
+    messagesEl.insertBefore(div, scrollBtn);
+    scrollBottom();
+}
+
+// ── Context toast notifications ─────────────────────────────────────────────
+
+function addFileToastSimple(icon, text) {
+    const div = document.createElement('div');
+    div.className = 'file-toast';
+    div.innerHTML = `${icon} <span>${escHtml(text)}</span>`;
+    messagesEl.insertBefore(div, scrollBtn);
+    scrollBottom();
+}
+
+/**
+ * Show an inline confirmation card with Accept/Reject buttons.
+ * @param {string} id   Unique confirmation ID
+ * @param {string} action  Action type: 'run', 'write', 'rename', 'delete'
+ * @param {string} detail  Human-readable description
+ */
+function addConfirmCard(id, action, detail, toolName) {
+    const icons = { run: '⚡', write: '💾', rename: '🔄', delete: '🗑️', edit: '✏️' };
+    const icon = icons[action] || '❓';
+    const pendingBar = document.getElementById('pending-confirm-bar');
+
+    function makeCard(forBar) {
+        const div = document.createElement('div');
+        div.className = 'confirm-card';
+        if (!forBar) div.id = `confirm-${id}`;
+        div.innerHTML =
+            `<div class="confirm-header">` +
+                `<span class="confirm-icon">${icon}</span>` +
+                `<span class="confirm-detail">${escHtml(detail)}</span>` +
+            `</div>` +
+            `<div class="confirm-actions">` +
+                `<button class="confirm-btn accept">Accept</button>` +
+                `<button class="confirm-btn accept-all" title="Accept this and all future ${escHtml(toolName || action)} calls">Accept All</button>` +
+                `<button class="confirm-btn reject">Reject</button>` +
+            `</div>`;
+        return div;
+    }
+
+    // Card in chat history (scrolls with messages)
+    const historyCard = makeCard(false);
+    // Card pinned in sticky bar (always visible above input)
+    const stickyCard = makeCard(true);
+
+    let resolved = false;
+    let cardObserver = null;
+
+    function resolveAll(accepted, label) {
+        if (resolved) return;
+        resolved = true;
+        if (cardObserver) { cardObserver.disconnect(); cardObserver = null; }
+        // Update history card
+        historyCard.classList.add(accepted ? 'accepted' : 'rejected');
+        historyCard.querySelector('.confirm-actions').innerHTML = `<span class="confirm-resolved">${label}</span>`;
+        // Clear sticky bar
+        if (pendingBar) {
+            pendingBar.style.display = 'none';
+            pendingBar.innerHTML = '';
+        }
+    }
+
+    function wireButtons(card) {
+        card.querySelector('.confirm-btn.accept').addEventListener('click', () => {
+            if (resolved) return;
+            vscode.postMessage({ command: 'confirmResponse', id, accepted: true });
+            resolveAll(true, '✅ Accepted');
+        });
+        card.querySelector('.confirm-btn.accept-all').addEventListener('click', () => {
+            if (resolved) return;
+            vscode.postMessage({ command: 'confirmResponseAll', id, toolName: toolName || action });
+            resolveAll(true, '✅ Accepted All ' + escHtml(toolName || action));
+        });
+        card.querySelector('.confirm-btn.reject').addEventListener('click', () => {
+            if (resolved) return;
+            vscode.postMessage({ command: 'confirmResponse', id, accepted: false });
+            resolveAll(false, '❌ Rejected');
+        });
+    }
+
+    wireButtons(historyCard);
+    wireButtons(stickyCard);
+
+    messagesEl.insertBefore(historyCard, scrollBtn);
+
+    // Show sticky bar only when history card is scrolled out of view
+    if (pendingBar) {
+        pendingBar.innerHTML = '';
+        pendingBar.appendChild(stickyCard);
+        // Start hidden — IntersectionObserver will show it if card scrolls out of view
+        pendingBar.style.display = 'none';
+
+        cardObserver = new IntersectionObserver((entries) => {
+            if (resolved) { cardObserver.disconnect(); cardObserver = null; return; }
+            const visible = entries[0].isIntersecting;
+            // Only show bar if it has content (guard against stale empty bar)
+            pendingBar.style.display = (!visible && pendingBar.innerHTML.trim()) ? 'block' : 'none';
+        }, { threshold: 0.1 });
+        cardObserver.observe(historyCard);
+    }
+
+    scrollBottom();
+}
+
+/**
+ * Show a context warning/compacted/overflow toast in the chat.
+ * @param {'warning'|'compacted'|'overflow'} kind
+ * @param {string} text
+ * @param {boolean} showCompactBtn
+ */
+function addContextToast(kind, text, showCompactBtn) {
+    const icons = { suggest: '💡', warning: '⚠️', compacted: '📦', overflow: '🔴' };
+    const div = document.createElement('div');
+    div.className = `context-toast ${kind}`;
+    div.innerHTML = `${icons[kind] || '⚠️'} <span>${escHtml(text)}</span>`;
+    if (showCompactBtn) {
+        const btn = document.createElement('button');
+        btn.className = 'compact-btn';
+        btn.textContent = 'Compact Now';
+        btn.addEventListener('click', () => {
+            vscode.postMessage({ command: 'compactContext' });
+            btn.disabled = true;
+            btn.textContent = 'Compacting…';
+        });
+        div.appendChild(btn);
+    }
+    messagesEl.insertBefore(div, scrollBtn);
+    scrollBottom();
+}
+
+/** @type {HTMLDivElement | null} */
+const ctxProgressBar = /** @type {HTMLDivElement | null} */ (document.getElementById('ctx-progress-bar'));
+const ctxProgressWrap = /** @type {HTMLDivElement | null} */ (document.getElementById('ctx-progress-wrap'));
+
+/**
+ * Update the running context usage indicator in the footer and progress bar.
+ * @param {number} percentage
+ * @param {number} [usedTokens]
+ * @param {number} [totalTokens]
+ */
+function updateContextUsage(percentage, usedTokens, totalTokens) {
+    if (!contextUsageEl) return;
+
+    // Update slim progress bar
+    if (ctxProgressBar) {
+        const clamped = Math.min(100, Math.max(0, percentage));
+        ctxProgressBar.style.width = `${clamped}%`;
+        ctxProgressBar.className = percentage >= 99 ? 'over'
+            : percentage >= 85 ? 'critical'
+            : percentage >= 60 ? 'warn'
+            : '';
+    }
+    if (ctxProgressWrap) {
+        ctxProgressWrap.title = totalTokens
+            ? `Context: ${Math.round(percentage)}% used (~${(usedTokens || 0).toLocaleString()} / ${totalTokens.toLocaleString()} tokens)`
+            : `Context: ${Math.round(percentage)}% used`;
+    }
+
+    if (percentage <= 0) {
+        contextUsageEl.textContent = '';
+        contextUsageEl.className = '';
+        if (compactBtnFooter) compactBtnFooter.classList.remove('visible');
+        return;
+    }
+    const pct = Math.round(percentage);
+    contextUsageEl.textContent = `${pct}% context`;
+    if (percentage >= 99) {
+        contextUsageEl.className = 'over';
+    } else if (percentage >= 70) {
+        contextUsageEl.className = 'critical';
+    } else if (percentage >= 50) {
+        contextUsageEl.className = 'warn';
+    } else {
+        contextUsageEl.className = '';
+    }
+    // Show compact button whenever context usage is visible
+    if (compactBtnFooter) compactBtnFooter.classList.toggle('visible', pct > 0);
+}
+
+// ── Footer compact button ─────────────────────────────────────────────────────
+if (compactBtnFooter) {
+    compactBtnFooter.addEventListener('click', () => {
+        vscode.postMessage({ command: 'compactContext' });
+        compactBtnFooter.textContent = 'Compacting…';
+        compactBtnFooter.disabled = true;
+    });
+}
+
+// ── Settings button ───────────────────────────────────────────────────────────
+if (settingsBtn) {
+    settingsBtn.addEventListener('click', () => {
+        vscode.postMessage({ command: 'openSettings' });
+    });
+}
+
+// ── Review button ─────────────────────────────────────────────────────────────
+const reviewBtn = /** @type {HTMLButtonElement} */ (document.getElementById('review-btn'));
+if (reviewBtn) {
+    reviewBtn.addEventListener('click', () => {
+        vscode.postMessage({ command: 'reviewProject' });
+    });
+}
+
+// ── Mode-switch notice (native → text-mode tool calling) ─────────────────────
+
+/** @param {string} model */
+function addModeNotice(model) {
+    const div = document.createElement('div');
+    div.className = 'file-toast';
+    div.style.cssText = 'background:rgba(229,192,123,0.08);border-color:rgba(229,192,123,0.35);color:#e5c07b;';
+    div.innerHTML =
+        `⚙️ <span><strong>${escHtml(model)}</strong> uses text-mode tool calling — ` +
+        `remembered for future sessions.</span>`;
+    messagesEl.insertBefore(div, scrollBtn);
+    scrollBottom(true);
+}
+
+// ── Send logic ────────────────────────────────────────────────────────────────
+
+/** @param {boolean} on */
+function setStreaming(on) {
+    streaming = on;
+    if (on) { agentActive = true; }
+    sendBtn.disabled = on || modelSelect.value === '';
+    stopBtn.classList.toggle('visible', on || agentActive);
+    scrollBtn.classList.toggle('visible', (on || agentActive) && userScrolledUp);
+    if (!on && !agentActive) {
+        promptEl.focus();
+        scrollBtn.classList.remove('visible');
+    }
+}
+
+function sendMessage() {
+    const text = promptEl.value.trim();
+    if (!text || streaming) { return; }
+
+    pushInputHistory(text);
+    addUserMessage(text);
+    promptEl.value = '';
+    autoResize();
+    hideMentionDropdown();
+    setStreaming(true);
+    // Show a waiting bubble immediately so there's no silent gap before streamStart
+    startAssistantMessage();
+
+    const filesToSend = mentionedFiles.map((f) => f.rel);
+    const symbolsToSend = mentionedSymbols.map((s) => ({ name: s.name, filePath: s.filePath }));
+    // Clear mention state after send
+    mentionedFiles = [];
+    mentionedSymbols = [];
+    updateContextBar();
+    updateTokenIndicator();
+
+    vscode.postMessage({
+        command: 'sendMessage',
+        text,
+        model: modelSelect.value,
+        trustLevel: trustSelect.value,
+        includeFile: ctx.includeFile,
+        includeSelection: ctx.includeSelection,
+        mentionedFiles: filesToSend,
+        mentionedSymbols: symbolsToSend,
+        pinnedFiles: pinnedFiles.map(f => f.rel),
+    });
+}
+
+sendBtn.addEventListener('click', sendMessage);
+
+stopBtn.addEventListener('click', () => {
+    vscode.postMessage({ command: 'stopGeneration' });
+    setStreaming(false);
+});
+
+newChatBtn.addEventListener('click', () => {
+    if (streaming) { return; }
+    vscode.postMessage({ command: 'newChat' });
+    clearChat();
+});
+
+promptEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+
+// ── Global keyboard shortcuts ─────────────────────────────────────────────────
+
+document.addEventListener('keydown', (e) => {
+    // Ctrl+/ — focus the input textarea from anywhere in the panel
+    if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+        e.preventDefault();
+        promptEl.focus();
+        promptEl.select();
+        return;
+    }
+    // Escape — stop generation when streaming
+    if (e.key === 'Escape' && (streaming || agentActive) && document.activeElement !== promptEl) {
+        e.preventDefault();
+        vscode.postMessage({ command: 'stopGeneration' });
+        setStreaming(false);
+        return;
+    }
+    // Ctrl+K — clear chat (only when not streaming)
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k' && !streaming && !agentActive) {
+        e.preventDefault();
+        vscode.postMessage({ command: 'newChat' });
+        clearChat();
+        return;
+    }
+});
+
+// Auto-resize textarea
+function autoResize() {
+    promptEl.style.height = 'auto';
+    promptEl.style.height = `${Math.min(promptEl.scrollHeight, 140)}px`;
+}
+promptEl.addEventListener('input', () => { autoResize(); updateTokenIndicator(); });
+
+// ── Chat input history (↑/↓ arrow) ───────────────────────────────────────────
+
+/** @type {string[]} */
+const inputHistory = [];
+let inputHistoryIdx = -1;
+let inputHistoryDraft = '';
+const MAX_INPUT_HISTORY = 50;
+
+function pushInputHistory(text) {
+    if (!text.trim()) { return; }
+    // Deduplicate last entry
+    if (inputHistory.length && inputHistory[inputHistory.length - 1] === text) { return; }
+    inputHistory.push(text);
+    if (inputHistory.length > MAX_INPUT_HISTORY) { inputHistory.shift(); }
+    inputHistoryIdx = -1;
+}
+
+promptEl.addEventListener('keydown', (e) => {
+    // Only activate when mention dropdown is hidden
+    if (mentionDropdown.style.display !== 'none') { return; }
+    if (e.key === 'ArrowUp' && inputHistory.length && inputHistoryIdx !== 0) {
+        // Only hijack ArrowUp when navigating history (idx >= 0) or input is empty
+        if (inputHistoryIdx === -1 && promptEl.value !== '') { return; }
+        e.preventDefault();
+        if (inputHistoryIdx === -1) { inputHistoryDraft = promptEl.value; inputHistoryIdx = inputHistory.length; }
+        if (inputHistoryIdx > 0) {
+            inputHistoryIdx--;
+            promptEl.value = inputHistory[inputHistoryIdx];
+            autoResize();
+        }
+        return;
+    }
+    if (e.key === 'ArrowDown' && inputHistoryIdx >= 0) {
+        e.preventDefault();
+        inputHistoryIdx++;
+        if (inputHistoryIdx >= inputHistory.length) {
+            inputHistoryIdx = -1;
+            promptEl.value = inputHistoryDraft;
+        } else {
+            promptEl.value = inputHistory[inputHistoryIdx];
+        }
+        autoResize();
+        return;
+    }
+});
+
+// ── Slash commands ─────────────────────────────────────────────────────────
+
+const SLASH_COMMANDS = {
+    '/test':     { label: '/test',     desc: 'Generate tests for selection or file',   prompt: 'Write comprehensive tests for the following code. Use the project\'s existing test framework.\n\n' },
+    '/fix':      { label: '/fix',      desc: 'Fix errors in selection or file',         prompt: 'Find and fix all bugs and errors in the following code. Explain each fix.\n\n' },
+    '/review':   { label: '/review',   desc: 'Code review with suggestions',            prompt: 'Review the following code for bugs, security issues, performance problems, and style. Provide specific suggestions.\n\n' },
+    '/doc':      { label: '/doc',      desc: 'Add documentation / comments',            prompt: 'Add clear, concise documentation comments to the following code. Use the language\'s standard doc format.\n\n' },
+    '/explain':  { label: '/explain',  desc: 'Explain how this code works',             prompt: 'Explain the following code step by step in plain language.\n\n' },
+    '/refactor': { label: '/refactor', desc: 'Refactor for clarity and maintainability', prompt: 'Refactor the following code to improve readability, maintainability, and performance. Show the changes.\n\n' },
+    '/optimize': { label: '/optimize', desc: 'Optimize for performance',                prompt: 'Optimize the following code for performance. Explain the improvements.\n\n' },
+    '/context':  { label: '/context',  desc: 'Generate or update AGENTS.md project context file', prompt: 'Scan this project and generate (or update) an AGENTS.md file in the workspace root. The file should include:\n1. One-paragraph project description (what it does, tech stack)\n2. Directory structure overview (key folders and their purpose)\n3. Coding conventions you can infer from reading the code (naming, error handling, return formats, DB patterns, etc.)\n4. Key domains/modules — one line each explaining what each major file or group of files does\n5. Any constraints or rules the agent should follow when making changes\n\nSteps:\n- Read the root directory listing\n- Read package.json or requirements.txt to identify the stack\n- Sample 3-5 representative source files to infer conventions\n- If AGENTS.md already exists, read it first and update rather than replace\n- Write the final file to AGENTS.md in the project root\n\nBe specific and factual — only write what you can confirm from the code, not guesses.' },
+};
+
+const slashDropdown = document.createElement('div');
+slashDropdown.id = 'slash-dropdown';
+slashDropdown.style.cssText = mentionDropdown.style.cssText;
+slashDropdown.style.display = 'none';
+document.getElementById('input-container').appendChild(slashDropdown);
+
+let slashResults = [];
+let slashSelectedIdx = 0;
+
+function showSlashDropdown(filter) {
+    const q = filter.toLowerCase();
+    slashResults = Object.values(SLASH_COMMANDS).filter(c => c.label.includes(q) || c.desc.toLowerCase().includes(q));
+    slashSelectedIdx = 0;
+    slashDropdown.innerHTML = '';
+    if (!slashResults.length) { slashDropdown.style.display = 'none'; return; }
+    slashResults.forEach((c, i) => {
+        const item = document.createElement('div');
+        item.className = 'mention-item' + (i === 0 ? ' selected' : '');
+        item.innerHTML = `<span class="mention-item-base">${escHtml(c.label)}</span><span class="mention-item-rel">${escHtml(c.desc)}</span>`;
+        item.addEventListener('mousedown', (e) => { e.preventDefault(); selectSlashItem(i); });
+        slashDropdown.appendChild(item);
+    });
+    slashDropdown.style.display = 'block';
+}
+
+function hideSlashDropdown() { slashDropdown.style.display = 'none'; slashResults = []; }
+
+function updateSlashHighlight() {
+    const items = slashDropdown.querySelectorAll('.mention-item');
+    items.forEach((el, i) => el.classList.toggle('selected', i === slashSelectedIdx));
+    items[slashSelectedIdx]?.scrollIntoView({ block: 'nearest' });
+}
+
+function selectSlashItem(idx) {
+    const cmd = slashResults[idx];
+    if (!cmd) { return; }
+    // Replace the /command text with the expanded prompt (or just the command label if no prompt)
+    promptEl.value = cmd.prompt ?? (cmd.label + ' ');
+    autoResize();
+    hideSlashDropdown();
+    promptEl.focus();
+    // Move cursor to end
+    promptEl.selectionStart = promptEl.selectionEnd = promptEl.value.length;
+}
+
+// ── Commands panel (/  button) ────────────────────────────────────────────────
+
+const commandsBtn  = /** @type {HTMLButtonElement} */ (document.getElementById('commands-btn'));
+const commandsPanel = /** @type {HTMLDivElement}   */ (document.getElementById('commands-panel'));
+
+/** Build and show the commands panel. */
+function openCommandsPanel() {
+    commandsPanel.innerHTML = '';
+    const header = document.createElement('div');
+    header.id = 'commands-panel-header';
+    header.textContent = 'Commands';
+    commandsPanel.appendChild(header);
+
+    Object.values(SLASH_COMMANDS).forEach((cmd, i) => {
+        const item = document.createElement('div');
+        item.className = 'cmd-item';
+        item.innerHTML =
+            `<span class="cmd-item-label">${escHtml(cmd.label)}</span>` +
+            `<span class="cmd-item-desc">${escHtml(cmd.desc)}</span>`;
+        item.addEventListener('click', () => {
+            promptEl.value = cmd.prompt ?? (cmd.label + ' ');
+            autoResize();
+            updateTokenIndicator();
+            closeCommandsPanel();
+            promptEl.focus();
+            promptEl.selectionStart = promptEl.selectionEnd = promptEl.value.length;
+        });
+        commandsPanel.appendChild(item);
+    });
+
+    commandsPanel.style.display = 'block';
+    commandsBtn.classList.add('active');
+}
+
+function closeCommandsPanel() {
+    commandsPanel.style.display = 'none';
+    commandsBtn.classList.remove('active');
+}
+
+function toggleCommandsPanel() {
+    if (commandsPanel.style.display === 'none') {
+        openCommandsPanel();
+    } else {
+        closeCommandsPanel();
+    }
+}
+
+commandsBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleCommandsPanel();
+});
+
+// Close panel when clicking outside it
+document.addEventListener('click', (e) => {
+    if (commandsPanel.style.display !== 'none' &&
+        !commandsPanel.contains(/** @type {Node} */ (e.target)) &&
+        e.target !== commandsBtn) {
+        closeCommandsPanel();
+    }
+});
+
+// Typing '/' at the start of an empty input also opens the panel
+promptEl.addEventListener('keydown', (e) => {
+    if (e.key === '/' && promptEl.value === '' && !e.ctrlKey && !e.metaKey) {
+        // Let the character land, then open panel and clear the '/'
+        setTimeout(() => {
+            if (promptEl.value === '/') {
+                promptEl.value = '';
+                autoResize();
+                openCommandsPanel();
+            }
+        }, 0);
+    } else if (e.key === 'Escape' && commandsPanel.style.display !== 'none') {
+        e.stopPropagation();
+        closeCommandsPanel();
+        promptEl.focus();
+    }
+});
+
+// ── @mention autocomplete ─────────────────────────────────────────────────────
+
+const EXT_ICONS = {
+    ts:'🟦', tsx:'🟦', js:'🟨', jsx:'🟨', py:'🐍', rs:'🦀', go:'🐹',
+    java:'☕', kt:'🟪', cs:'🔷', cpp:'⚙️', c:'⚙️', rb:'💎', php:'🐘',
+    swift:'🍎', sh:'🖥️', bash:'🖥️', css:'🎨', scss:'🎨', html:'🌐',
+    json:'📋', yaml:'📋', yml:'📋', md:'📝', sql:'🗄️', xml:'📄',
+    toml:'📄', dockerfile:'🐳', lock:'🔒',
+};
+function fileIcon(ext) { return EXT_ICONS[ext] || '📄'; }
+
+function showMentionDropdown(results) {
+    mentionResults = results;
+    mentionSelectedIdx = 0;
+    mentionDropdown.innerHTML = '';
+
+    if (!results.length) {
+        mentionDropdown.style.display = 'none';
+        return;
+    }
+
+    results.forEach((f, i) => {
+        const item = document.createElement('div');
+        item.className = 'mention-item' + (i === 0 ? ' selected' : '');
+        item.dataset.idx = String(i);
+        item.innerHTML =
+            `<span class="mention-item-icon">${fileIcon(f.ext)}</span>` +
+            `<span class="mention-item-base">${escHtml(f.display)}</span>` +
+            `<span class="mention-item-rel">${escHtml(f.rel)}</span>`;
+        item.addEventListener('mousedown', (e) => {
+            e.preventDefault(); // keep textarea focused
+            selectMentionItem(i);
+        });
+        mentionDropdown.appendChild(item);
+    });
+
+    mentionDropdown.style.display = 'block';
+}
+
+function hideMentionDropdown() {
+    mentionDropdown.style.display = 'none';
+    mentionAtStart = -1;
+    mentionQuery = '';
+    mentionResults = [];
+    pinModeActive = false;
+}
+
+function selectMentionItem(idx) {
+    const file = mentionResults[idx];
+    if (!file) { return; }
+
+    // Replace @query in textarea with empty string (the pill takes its place)
+    const val = promptEl.value;
+    const before = val.slice(0, mentionAtStart);
+    const after  = val.slice(mentionAtStart + 1 + mentionQuery.length); // +1 for '@'
+    promptEl.value = before + after;
+    autoResize();
+
+    // If pin mode, add to pinned files instead of mentioned files
+    if (pinModeActive) {
+        pinModeActive = false;
+        if (!pinnedFiles.some((f) => f.rel === file.rel)) {
+            pinnedFiles.push(file);
+            vscode.postMessage({ command: 'updatePinnedFiles', files: pinnedFiles.map(f => f.rel) });
+        }
+        hideMentionDropdown();
+        // Restore input to what it was before the @ was injected
+        const val2 = promptEl.value;
+        const before2 = val2.slice(0, mentionAtStart);
+        const after2 = val2.slice(mentionAtStart + 1 + mentionQuery.length);
+        promptEl.value = before2 + after2;
+        autoResize();
+        updateContextBar();
+        updateTokenIndicator();
+        return;
+    }
+
+    // Add to mentioned files (avoid duplicates)
+    if (!mentionedFiles.some((f) => f.rel === file.rel)) {
+        mentionedFiles.push(file);
+        updateContextBar();
+    }
+
+    hideMentionDropdown();
+    promptEl.focus();
+    updateTokenIndicator();
+}
+
+function navigateMentionDropdown(direction) {
+    if (!mentionResults.length) { return; }
+    const items = mentionDropdown.querySelectorAll('.mention-item');
+    items[mentionSelectedIdx]?.classList.remove('selected');
+    mentionSelectedIdx = (mentionSelectedIdx + direction + mentionResults.length) % mentionResults.length;
+    items[mentionSelectedIdx]?.classList.add('selected');
+    items[mentionSelectedIdx]?.scrollIntoView({ block: 'nearest' });
+}
+
+promptEl.addEventListener('input', () => {
+    const val = promptEl.value;
+    const pos = promptEl.selectionStart ?? val.length;
+
+    // Check for slash command at start of input
+    if (val.startsWith('/') && !val.includes(' ') && !val.includes('\n')) {
+        showSlashDropdown(val);
+        return;
+    }
+    hideSlashDropdown();
+
+    // Check if there's an active @ mention being typed
+    const before = val.slice(0, pos);
+    const atIdx = before.lastIndexOf('@');
+
+    if (atIdx >= 0) {
+        const fragment = before.slice(atIdx + 1);
+        // Only trigger if no space in the query (space = @mention ended)
+        if (!fragment.includes(' ') && !fragment.includes('\n')) {
+            mentionAtStart = atIdx;
+            mentionQuery = fragment;
+            clearTimeout(mentionSearchTimer);
+            mentionSearchTimer = setTimeout(() => {
+                vscode.postMessage({ command: 'searchFiles', query: fragment });
+            }, 150);
+            return;
+        }
+    }
+
+    // No active mention
+    hideMentionDropdown();
+    pinModeActive = false;
+    updateTokenIndicator();
+});
+
+promptEl.addEventListener('keydown', (e) => {
+    // Slash command dropdown navigation
+    if (slashDropdown.style.display !== 'none') {
+        if (e.key === 'ArrowDown')  { e.preventDefault(); slashSelectedIdx = (slashSelectedIdx + 1) % slashResults.length; updateSlashHighlight(); return; }
+        if (e.key === 'ArrowUp')    { e.preventDefault(); slashSelectedIdx = (slashSelectedIdx - 1 + slashResults.length) % slashResults.length; updateSlashHighlight(); return; }
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectSlashItem(slashSelectedIdx); return; }
+        if (e.key === 'Tab')        { e.preventDefault(); selectSlashItem(slashSelectedIdx); return; }
+        if (e.key === 'Escape')     { hideSlashDropdown(); return; }
+    }
+    // @mention dropdown navigation
+    if (mentionDropdown.style.display !== 'none') {
+        if (e.key === 'ArrowDown')  { e.preventDefault(); navigateMentionDropdown(+1); return; }
+        if (e.key === 'ArrowUp')    { e.preventDefault(); navigateMentionDropdown(-1); return; }
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectMentionItem(mentionSelectedIdx); return; }
+        if (e.key === 'Escape')     { hideMentionDropdown(); return; }
+        if (e.key === 'Tab')        { e.preventDefault(); selectMentionItem(mentionSelectedIdx); return; }
+    }
+});
+
+// Hint chips (initial welcome screen)
+document.querySelectorAll('.hint-chip').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        const hint = /** @type {HTMLButtonElement} */ (btn).dataset.hint;
+        if (hint) { promptEl.value = hint; sendMessage(); }
+    });
+});
+
+// ── Template handling ────────────────────────────────────────────────────────────
+
+templateToggleBtn.addEventListener('click', () => {
+    templateBarVisible = !templateBarVisible;
+    templateBar.style.display = templateBarVisible ? 'block' : 'none';
+    if (templateBarVisible) {
+        vscode.postMessage({ command: 'getTemplates' });
+    }
+});
+
+templateSelect.addEventListener('change', () => {
+    const name = templateSelect.value;
+    if (!name) return;
+    
+    const template = templates.find(t => t.name === name);
+    if (!template) return;
+    
+    // Substitute variables with proper escaping to prevent corruption
+    const values = {
+        language: ctx.language || 'code',
+        filename: ctx.file ? ctx.file.split('/').pop() : 'file',
+        selection: ctx.selectionLines > 0 ? '(selected code)' : '(no selection)',
+        error: '(error details)'
+    };
+    
+    let prompt = template.prompt;
+    // Sort keys by length (longest first) to prevent partial replacements
+    // e.g., replace {languageId} before {language}
+    const sortedKeys = Object.keys(values).sort((a, b) => b.length - a.length);
+    for (const key of sortedKeys) {
+        const value = values[key];
+        prompt = prompt.replace(new RegExp(`\\{${key}\\}`, 'g'), value);
+    }
+    
+    promptEl.value = prompt;
+    autoResize();
+    updateTokenIndicator();
+    templateSelect.value = ''; // Reset dropdown
+    promptEl.focus();
+});
+
+function populateTemplates(templateList) {
+    templates = templateList;
+    templateSelect.innerHTML = '<option value="">Select a template...</option>';
+    
+    templateList.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.name;
+        opt.textContent = t.builtin ? `⭐ ${t.name}` : t.name;
+        templateSelect.appendChild(opt);
+    });
+}
+
+// ── Smart context handling ────────────────────────────────────────────────────────────
+
+smartContextToggle.addEventListener('change', () => {
+    vscode.postMessage({ 
+        command: 'toggleSmartContext', 
+        enabled: smartContextToggle.checked 
+    });
+});
+
+// ── Search handling ──────────────────────────────────────────────────────────────
+
+searchBtn.addEventListener('click', () => {
+    const isVisible = searchPanel.style.display !== 'none';
+    searchPanel.style.display = isVisible ? 'none' : 'block';
+    if (!isVisible) {
+        searchInput.focus();
+    } else {
+        clearSearch();
+    }
+});
+
+searchInput.addEventListener('input', () => {
+    performSearch(searchInput.value);
+});
+
+searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        if (e.shiftKey) {
+            navigateSearch(-1);
+        } else {
+            navigateSearch(1);
+        }
+    } else if (e.key === 'Escape') {
+        clearSearch();
+        searchPanel.style.display = 'none';
+    }
+});
+
+searchPrevBtn.addEventListener('click', () => navigateSearch(-1));
+searchNextBtn.addEventListener('click', () => navigateSearch(1));
+searchClearBtn.addEventListener('click', () => {
+    clearSearch();
+    searchPanel.style.display = 'none';
+});
+
+function performSearch(query) {
+    searchQuery = query.trim().toLowerCase();
+    
+    // Clear previous highlights efficiently
+    const highlights = document.querySelectorAll('.search-highlight');
+    highlights.forEach(el => {
+        const parent = el.parentNode;
+        if (parent) {
+            parent.replaceChild(document.createTextNode(el.textContent || ''), el);
+        }
+    });
+    // Normalize all text nodes after clearing highlights
+    document.querySelectorAll('.msg-content').forEach(content => {
+        content.normalize();
+    });
+    
+    searchMatches = [];
+    searchCurrentIndex = -1;
+    
+    if (!searchQuery) {
+        // Show all messages
+        document.querySelectorAll('.message').forEach(msg => {
+            msg.classList.remove('search-hidden');
+        });
+        searchResults.textContent = '';
+        return;
+    }
+    
+    // Search through messages
+    const messages = document.querySelectorAll('.message');
+    messages.forEach(msg => {
+        const content = msg.querySelector('.msg-content');
+        if (!content) return;
+        
+        const text = content.textContent.toLowerCase();
+        if (text.includes(searchQuery)) {
+            searchMatches.push(msg);
+            msg.classList.remove('search-hidden');
+            highlightInElement(content, searchQuery);
+        } else {
+            msg.classList.add('search-hidden');
+        }
+    });
+    
+    // Update results counter
+    if (searchMatches.length > 0) {
+        searchCurrentIndex = 0;
+        updateSearchResults();
+        scrollToCurrentMatch();
+    } else {
+        searchResults.textContent = 'No results';
+    }
+}
+
+function highlightInElement(element, query) {
+    const walker = document.createTreeWalker(
+        element,
+        NodeFilter.SHOW_TEXT,
+        null
+    );
+    
+    const nodesToReplace = [];
+    let node;
+    while (node = walker.nextNode()) {
+        const text = node.textContent.toLowerCase();
+        if (text.includes(query)) {
+            nodesToReplace.push(node);
+        }
+    }
+    
+    nodesToReplace.forEach(node => {
+        const text = node.textContent;
+        const lowerText = text.toLowerCase();
+        const fragments = [];
+        let lastIndex = 0;
+        let index = lowerText.indexOf(query);
+        
+        while (index !== -1) {
+            // Add text before match
+            if (index > lastIndex) {
+                fragments.push(document.createTextNode(text.substring(lastIndex, index)));
+            }
+            
+            // Add highlighted match
+            const span = document.createElement('span');
+            span.className = 'search-highlight';
+            span.textContent = text.substring(index, index + query.length);
+            fragments.push(span);
+            
+            lastIndex = index + query.length;
+            index = lowerText.indexOf(query, lastIndex);
+        }
+        
+        // Add remaining text
+        if (lastIndex < text.length) {
+            fragments.push(document.createTextNode(text.substring(lastIndex)));
+        }
+        
+        // Replace node with fragments
+        const parent = node.parentNode;
+        fragments.forEach(frag => parent.insertBefore(frag, node));
+        parent.removeChild(node);
+    });
+}
+
+function navigateSearch(direction) {
+    if (searchMatches.length === 0) return;
+    
+    searchCurrentIndex = (searchCurrentIndex + direction + searchMatches.length) % searchMatches.length;
+    updateSearchResults();
+    scrollToCurrentMatch();
+}
+
+function updateSearchResults() {
+    if (searchMatches.length === 0) {
+        searchResults.textContent = 'No results';
+        return;
+    }
+    
+    searchResults.textContent = `${searchCurrentIndex + 1} of ${searchMatches.length}`;
+    
+    // Update current highlight
+    document.querySelectorAll('.search-highlight.current').forEach(el => {
+        el.classList.remove('current');
+    });
+    
+    const currentMsg = searchMatches[searchCurrentIndex];
+    const firstHighlight = currentMsg.querySelector('.search-highlight');
+    if (firstHighlight) {
+        firstHighlight.classList.add('current');
+    }
+}
+
+function scrollToCurrentMatch() {
+    if (searchCurrentIndex < 0 || searchCurrentIndex >= searchMatches.length) return;
+    
+    const currentMsg = searchMatches[searchCurrentIndex];
+    currentMsg.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function clearSearch() {
+    searchInput.value = '';
+    searchQuery = '';
+    searchMatches = [];
+    searchCurrentIndex = -1;
+    searchResults.textContent = '';
+    
+    // Remove all highlights efficiently
+    const highlights = document.querySelectorAll('.search-highlight');
+    highlights.forEach(el => {
+        const parent = el.parentNode;
+        if (parent) {
+            parent.replaceChild(document.createTextNode(el.textContent || ''), el);
+        }
+    });
+    // Normalize all text nodes after clearing highlights
+    document.querySelectorAll('.msg-content').forEach(content => {
+        content.normalize();
+    });
+    
+    // Show all messages
+    document.querySelectorAll('.message').forEach(msg => {
+        msg.classList.remove('search-hidden');
+    });
+}
+
+// ── Message handler (extension → webview) ────────────────────────────────────
+
+window.addEventListener('message', (event) => {
+    const msg = event.data;
+
+    switch (msg.type) {
+        case 'models':
+            populateModels(msg.models, msg.connected, msg.defaultModel);
+            break;
+
+        case 'streamStart':
+            // Only create a new bubble if sendMessage() hasn't already created one
+            if (!currentMsgEl) { startAssistantMessage(); }
+            break;
+
+        case 'token':
+            appendToken(msg.text);
+            break;
+
+        case 'streamEnd':
+            finalizeMessage();
+            setStreaming(false);
+            break;
+
+        case 'agentStatus': {
+            // Update the status bar with current turn progress or sub-agent activity.
+            // phase: 'thinking' = main loop turn N/MAX, 'subagent' = waiting on a sub-agent.
+            if (msg.phase === 'subagent') {
+                const preview = msg.subagentPrompt ? ` — ${String(msg.subagentPrompt).slice(0, 50)}…` : '';
+                statusText.textContent = `🤖 Sub-agent running${preview}`;
+            } else if (msg.turn && msg.maxTurns) {
+                lastAgentTurn = { turn: msg.turn, maxTurns: msg.maxTurns };
+                statusText.textContent = `⚙ Agent turn ${msg.turn}/${msg.maxTurns}`;
+            }
+            break;
+        }
+
+        case 'agentDone':
+            agentActive = false;
+            stopBtn.classList.remove('visible');
+            scrollBtn.classList.remove('visible');
+            sendBtn.disabled = modelSelect.value === '';
+            promptEl.focus();
+            // Restore status bar to connection state
+            statusText.textContent = modelSelect.value ? '● Connected' : 'No model selected';
+            // Clear any stale pending-confirm bar when agent finishes
+            { const b = document.getElementById('pending-confirm-bar'); if (b) { b.style.display = 'none'; b.innerHTML = ''; } }
+            // Sweep tool cards still showing a spinner (toolCall with no matching toolResult)
+            document.querySelectorAll('.tool-card:not(.success):not(.error) .dots').forEach(dots => {
+                dots.remove();
+            });
+            break;
+
+        case 'info':
+            // Lightweight status message — show in a transient system bubble
+            appendSystemNote(msg.text);
+            break;
+
+        case 'dispatchQueued':
+            // Extension is re-sending a queued message after the previous run finished.
+            // Re-post it directly to the extension — bypass the normal send path so we
+            // don't need to re-render the input or touch prompt state.
+            // Guard: if agentDone hasn't arrived yet, retry after a short delay rather than dropping.
+            if (msg.msg) {
+                const doDispatch = () => {
+                    if (!agentActive) {
+                        setStreaming(true);
+                        startAssistantMessage();
+                        vscode.postMessage(msg.msg);
+                    } else {
+                        // agentDone not yet processed -- retry once more after another tick
+                        setTimeout(doDispatch, 200);
+                    }
+                };
+                doDispatch();
+            }
+            break;
+
+        case 'toolCall': {
+            // If a waiting bubble exists with no content yet, remove it — tool cards replace it.
+            // We re-add a "still working" stub after the tool card so the user can see activity.
+            if (currentMsgEl && !currentRaw) { currentMsgEl.remove(); currentMsgEl = null; }
+            addToolCard(msg.id, msg.name, msg.args);
+            // Show tool name in status bar so the user always sees what the agent is doing,
+            // even when the model emits no narration text before the tool call.
+            const toolIcon = TOOL_ICONS[msg.name] || '🔧';
+            const toolLabel = String(msg.args?.command ?? msg.args?.query ?? msg.args?.path ?? msg.args?.search ?? '').slice(0, 50);
+            statusText.textContent = `${toolIcon} ${msg.name}${toolLabel ? ` — ${toolLabel}` : ''}`;
+            break;
+        }
+
+        case 'toolResult':
+            updateToolCard(msg.id, msg.success, msg.preview ?? '', msg.fullResult ?? '');
+            // Restore turn-progress status after tool completes (overwritten by toolCall handler)
+            if (agentActive && lastAgentTurn) {
+                statusText.textContent = `⚙ Agent turn ${lastAgentTurn.turn}/${lastAgentTurn.maxTurns}`;
+            }
+            break;
+
+
+        case 'runEnd':
+            // Safety-net cleanup fired from inside agent.run() before provider posts agentDone.
+            // agentDone arrives immediately after and is fully idempotent, so no harm if both fire.
+            // Guard on agentActive so a late-arriving runEnd after agentDone is a no-op.
+            if (agentActive) {
+                agentActive = false;
+                stopBtn.classList.remove('visible');
+                scrollBtn.classList.remove('visible');
+                sendBtn.disabled = modelSelect.value === '';
+                setStreaming(false);
+                statusText.textContent = modelSelect.value ? '● Connected' : 'No model selected';
+            }
+            // Sweep any tool cards that are still showing a spinner (toolCall dispatched but
+            // no toolResult arrived — e.g. agent hit isPostEditSummary and broke out early).
+            document.querySelectorAll('.tool-card:not(.success):not(.error) .dots').forEach(dots => {
+                dots.remove();
+            });
+            break;
+
+        case 'error':
+            addErrorMessage(msg.text);
+            agentActive = false;
+            setStreaming(false);
+            statusText.textContent = modelSelect.value ? '● Connected' : 'No model selected';
+            break;
+
+        case 'timeoutRetry':
+            addTimeoutRetryCard(msg.attempt, msg.delayS);
+            break;
+
+        case 'turnLimit':
+            addTurnLimitCard(msg.text, msg.canAutoContinue, msg.longSession);
+            agentActive = false;
+            setStreaming(false);
+            statusText.textContent = modelSelect.value ? '● Connected' : 'No model selected';
+            break;
+
+        case 'clearChat':
+            clearChat();
+            activeSessionId = null; // reset until sessionLoaded or sessionSaved arrives
+            // Clear the input box and input history state when switching tabs
+            promptEl.value = '';
+            autoResize();
+            inputHistoryIdx = -1;
+            inputHistoryDraft = '';
+            break;
+
+        case 'removeLastAssistant':
+            removeLastAssistantMsg();
+            break;
+
+        case 'commandStart':
+            addCommandBlock(msg.id, msg.cmd);
+            break;
+
+        case 'commandChunk':
+            appendCommandChunk(msg.id, msg.text, msg.stream);
+            break;
+
+        case 'commandEnd':
+            finalizeCommandBlock(msg.id, msg.exitCode);
+            break;
+
+        case 'subagentStart':
+            addSubagentCard(msg.id, msg.prompt);
+            break;
+
+        case 'subagentChunk':
+            appendSubagentChunk(msg.id, msg.text);
+            break;
+
+        case 'subagentTool':
+            updateSubagentTool(msg.id, msg.name);
+            break;
+
+        case 'subagentEnd':
+            finalizeSubagentCard(msg.id, msg.status, msg.turns, msg.filesChanged);
+            break;
+
+        case 'reasoningCard':
+            addReasoningCard(msg);
+            break;
+
+        case 'planCard':
+            addPlanCard(msg);
+            break;
+
+        case 'planProgress':
+            addPlanProgress(msg);
+            break;
+
+        case 'planComplete':
+            addPlanComplete();
+            break;
+
+        case 'fileChanged':
+            addFileToast(msg.path, msg.action);
+            break;
+
+        case 'modeSwitch':
+            addModeNotice(msg.model);
+            break;
+
+        case 'tabList':
+            tabList = msg.tabs || [];
+            renderTabBar();
+            break;
+
+        case 'tabBadge': {
+            // A background tab finished or needs attention — add a dot to its button
+            const badgeBtn = tabBar.querySelector(`.tab-btn[data-tab-id="${CSS.escape(msg.tabId)}"]`);
+            if (badgeBtn && !badgeBtn.classList.contains('active')) {
+                badgeBtn.classList.remove('tab-badge-done', 'tab-badge-attention');
+                badgeBtn.classList.add(msg.badge === 'done' ? 'tab-badge-done' : 'tab-badge-attention');
+            }
+            break;
+        }
+
+        case 'sessionList':
+            renderSessionList(msg.sessions, msg.currentId);
+            break;
+
+        case 'sessionLoaded':
+            renderStoredSession(msg.session, msg.messages, msg.pinnedMsgIds);
+            if (msg.resumeSummary) { showResumeBanner(msg.resumeSummary); }
+            // Restore the draft the user had typed in this tab before switching away
+            if (msg.draft !== undefined) {
+                promptEl.value = msg.draft;
+                autoResize();
+            }
+            // Restore agent-active state if this tab still has a running agent
+            if (msg.agentRunning) {
+                agentActive = true;
+                stopBtn.classList.add('visible');
+                setStreaming(false); // show stop btn but don't animate send btn (we're not streaming right now)
+                // Show a subtle status line so user knows agent is between turns (not stuck)
+                setStatus('running', 'Agent working in background…');
+            }
+            break;
+
+        case 'sessionSaved':
+            // Update active session id and refresh title in history panel if open
+            activeSessionId = msg.session.id;
+            if (msg.session.title && historyPanel.classList.contains('open')) {
+                const titleEl = historyList.querySelector(`.session-item[data-id="${CSS.escape(msg.session.id)}"] .session-title`);
+                if (titleEl) { titleEl.textContent = msg.session.title; }
+            }
+            break;
+
+        case 'contextUpdate':
+            ctx.file           = msg.file ?? null;
+            ctx.fileLines      = msg.fileLines ?? 0;
+            ctx.language       = msg.language ?? '';
+            ctx.selectionLines = msg.selectionLines ?? 0;
+            if (!ctx.file)           { ctx.includeFile = false; }
+            if (!ctx.selectionLines) { ctx.includeSelection = false; }
+            updateContextBar();
+            updateTokenIndicator();
+            break;
+
+        case 'fileSearchResults':
+            // Only apply if the query matches the current active mention
+            if (msg.query === mentionQuery) {
+                showMentionDropdown(msg.files ?? []);
+            }
+            break;
+
+        case 'presetRestored':
+            // Restore preset selection from workspace state, but settings model takes priority
+            if (msg.preset && MODEL_PRESETS[msg.preset]) {
+                const config = MODEL_PRESETS[msg.preset];
+                // Only restore preset if it doesn't conflict with the settings-configured model
+                if (!defaultModel || defaultModel === config.model) {
+                    currentPreset = msg.preset;
+                    presetSelect.value = msg.preset;
+                    const modelExists = Array.from(modelSelect.options).some(opt => opt.value === config.model);
+                    if (modelExists && (modelSelect.value === config.model || modelSelect.value === '')) {
+                        modelSelect.value = config.model;
+                    }
+                } else {
+                    // Settings model differs from preset — stay on custom
+                    currentPreset = '';
+                    presetSelect.value = '';
+                }
+            }
+            break;
+
+        case 'sendFromCommand':
+            // Handle programmatic message send (e.g., from Explain Selection)
+            promptEl.value = msg.text;
+            ctx.includeFile = msg.includeFile ?? false;
+            ctx.includeSelection = msg.includeSelection ?? false;
+            updateContextBar();
+            sendMessage();
+            break;
+
+        case 'templates':
+            populateTemplates(msg.templates ?? []);
+            break;
+
+        case 'smartContextRestored':
+            smartContextToggle.checked = msg.enabled ?? false;
+            break;
+
+        case 'trustLevelRestored': {
+            const lvl = msg.level ?? 'normal';
+            trustSelect.value = lvl;
+            trustSelect.className = lvl === 'yolo' ? 'trust-yolo' : lvl === 'trust' ? 'trust-trust' : '';
+            break;
+        }
+
+        case 'pinnedFilesRestored':
+            pinnedFiles = (msg.files ?? []).map(f => ({
+                rel: f.rel,
+                display: f.rel.split('/').pop() || f.rel,
+                ext: (f.rel.split('.').pop() || '').toLowerCase()
+            }));
+            updateContextBar();
+            break;
+
+        case 'smartContextFiles':
+            smartContextFiles = msg.files ?? [];
+            // Show notification about included files
+            if (smartContextFiles.length > 0) {
+                const fileList = smartContextFiles.join(', ');
+                console.log(`[smart-context] Auto-included: ${fileList}`);
+            }
+            break;
+
+        case 'compactingStarted': {
+            // Create a placeholder that summary tokens will stream into
+            const el = document.createElement('div');
+            el.id = 'compaction-in-progress';
+            el.className = 'msg system-msg compaction-summary';
+            const lbl = document.createElement('span');
+            lbl.className = 'system-label';
+            lbl.textContent = '📦 Compacting — generating summary…';
+            const body = document.createElement('div');
+            body.className = 'summary-body';
+            body.style.fontStyle = 'italic';
+            body.style.opacity = '0.7';
+            el.appendChild(lbl);
+            el.appendChild(body);
+            messagesEl.insertBefore(el, scrollBtn);
+            scrollBottom();
+            if (compactBtnFooter) { compactBtnFooter.textContent = 'Compacting…'; compactBtnFooter.disabled = true; }
+            break;
+        }
+
+        case 'compactSummaryToken': {
+            const el = document.getElementById('compaction-in-progress');
+            if (el) {
+                const body = el.querySelector('.summary-body');
+                if (body) { body.textContent += msg.token; scrollBottom(); }
+            }
+            break;
+        }
+
+        case 'contextWarning':
+            if (msg.level === 'warning') {
+                addContextToast('suggest',
+                    `Context at ${Math.round(msg.percentage)}% — good time to compact before it fills up`,
+                    true);
+            } else {
+                addContextToast('warning',
+                    `Context at ${Math.round(msg.percentage)}% — compact soon or start a new chat`,
+                    true);
+            }
+            updateContextUsage(msg.percentage);
+            break;
+
+        case 'contextCompacted': {
+            addContextToast('compacted',
+                `Context compacted: removed ${msg.messagesRemoved} old message${msg.messagesRemoved !== 1 ? 's' : ''}`,
+                false);
+            updateContextUsage(msg.newPercentage);
+            if (compactBtnFooter) { compactBtnFooter.textContent = '🗜️ Compact'; compactBtnFooter.disabled = false; }
+            // Finalize the streaming placeholder if present, otherwise create fresh
+            const existing = document.getElementById('compaction-in-progress');
+            if (existing) {
+                existing.removeAttribute('id');
+                const lbl = existing.querySelector('.system-label');
+                if (lbl) lbl.textContent = '📦 Context compacted — here is what we have been working on:';
+                const body = existing.querySelector('.summary-body');
+                if (body) { body.style.fontStyle = ''; body.style.opacity = ''; }
+            } else if (msg.summary) {
+                const summaryEl = document.createElement('div');
+                summaryEl.className = 'msg system-msg compaction-summary';
+                const summaryLabel = document.createElement('span');
+                summaryLabel.className = 'system-label';
+                summaryLabel.textContent = '📦 Context compacted — here is what we have been working on:';
+                const summaryBody = document.createElement('div');
+                summaryBody.className = 'summary-body';
+                summaryBody.innerHTML = renderMarkdown(msg.summary);
+                summaryEl.appendChild(summaryLabel);
+                summaryEl.appendChild(summaryBody);
+                messagesEl.insertBefore(summaryEl, scrollBtn);
+                scrollBottom();
+            }
+            break;
+        }
+
+        case 'contextOverflow':
+            addContextToast('overflow',
+                `Context at ${Math.round(msg.percentage)}% — responses may be truncated`,
+                true);
+            updateContextUsage(msg.percentage);
+            break;
+
+        case 'contextStats':
+            updateContextUsage(msg.percentage, msg.usedTokens, msg.totalTokens);
+            break;
+
+        case 'undoResult':
+            addFileToastSimple(msg.success ? '↩️' : '⚠️', msg.message);
+            break;
+
+        case 'confirmAction':
+            addConfirmCard(msg.id, msg.action, msg.detail, msg.toolName);
+            break;
+
+        case 'autoApproved': {
+            // Show a small toast for batch-approved actions (no buttons needed)
+            const autoIcons = { run: '⚡', write: '💾', rename: '🔄', delete: '🗑️', edit: '✏️' };
+            const autoIcon = autoIcons[msg.action] || '✅';
+            addFileToastSimple(autoIcon, `Auto-approved: ${msg.detail}`);
+            break;
+        }
+
+        case 'dismissConfirmation': {
+            // Agent was stopped or a new turn started — dismiss any open confirmation cards
+            const openCards = messagesEl.querySelectorAll('.confirm-card:not(.accepted):not(.rejected)');
+            openCards.forEach(card => {
+                card.classList.add('rejected');
+                const actions = card.querySelector('.confirm-actions');
+                if (actions) { actions.innerHTML = '<span class="confirm-resolved">⏹ Dismissed</span>'; }
+            });
+            // Clear sticky bar
+            const pendingBarDismiss = document.getElementById('pending-confirm-bar');
+            if (pendingBarDismiss) { pendingBarDismiss.style.display = 'none'; pendingBarDismiss.innerHTML = ''; }
+            break;
+        }
+    }
+});
+
+// ── History panel ─────────────────────────────────────────────────────────────
+
+/** @type {string | null} Current active session id (for highlighting in the list) */
+let activeSessionId = null;
+
+function openHistoryPanel() {
+    historyPanel.classList.add('open');
+    historyBtn.classList.add('active');
+    vscode.postMessage({ command: 'listSessions' });
+}
+
+function closeHistoryPanel() {
+    historyPanel.classList.remove('open');
+    historyBtn.classList.remove('active');
+}
+
+historyBtn.addEventListener('click', () => {
+    historyPanel.classList.contains('open') ? closeHistoryPanel() : openHistoryPanel();
+});
+historyCloseBtn.addEventListener('click', closeHistoryPanel);
+
+historyClearBtn.addEventListener('click', async () => {
+    // VS Code webviews don't support confirm(), so we use a simple approach
+    vscode.postMessage({ command: 'clearAllSessions' });
+    closeHistoryPanel();
+});
+
+/**
+ * @typedef {{ id: string, title: string, model: string, messageCount: number, updatedAt: number, relativeTime: string }} SessionSummary
+ */
+
+/**
+ * @param {SessionSummary[]} sessions
+ * @param {string | null} currentId
+ */
+function renderSessionList(sessions, currentId) {
+    activeSessionId = currentId;
+    historyList.innerHTML = '';
+
+    if (!sessions.length) {
+        const empty = document.createElement('div');
+        empty.id = 'history-empty';
+        empty.innerHTML = '<span style="font-size:24px;opacity:0.4">🕐</span><span>No saved chats yet.<br>Start a conversation to save it here.</span>';
+        historyList.appendChild(empty);
+        return;
+    }
+
+    sessions.forEach((s) => {
+        const item = document.createElement('div');
+        item.className = 'session-item' + (s.id === currentId ? ' active' : '');
+        item.dataset.id = s.id;
+
+        const info = document.createElement('div');
+        info.className = 'session-info';
+
+        const title = document.createElement('div');
+        title.className = 'session-title';
+        title.textContent = s.title;
+
+        const meta = document.createElement('div');
+        meta.className = 'session-meta';
+        meta.innerHTML =
+            `<span>${escHtml(s.relativeTime)}</span>` +
+            `<span>${s.messageCount} msg${s.messageCount !== 1 ? 's' : ''}</span>` +
+            `<span>${escHtml(s.model.split(':')[0])}</span>`;
+
+        info.appendChild(title);
+        info.appendChild(meta);
+
+        const del = document.createElement('button');
+        del.className = 'session-delete';
+        del.title = 'Delete chat';
+        del.textContent = '🗑';
+        del.addEventListener('click', (e) => {
+            e.stopPropagation();
+            vscode.postMessage({ command: 'deleteSession', id: s.id });
+        });
+
+        item.appendChild(info);
+        item.appendChild(del);
+
+        item.addEventListener('click', () => {
+            vscode.postMessage({ command: 'loadSession', id: s.id });
+            closeHistoryPanel();
+        });
+
+        historyList.appendChild(item);
+    });
+}
+
+// ── Load a stored session into the chat UI ────────────────────────────────────
+
+/**
+ * @param {SessionSummary} session
+ * @param {Array<{role: string, content: string, timestamp: number}>} messages
+ */
+function renderStoredSession(session, messages, savedPins) {
+    clearChat();
+    activeSessionId = session.id;
+
+    if (!messages.length) { return; }
+
+    messages.forEach((msg) => {
+        if (msg.role === 'user') {
+            if (msg.content) { addUserMessage(msg.content, msg.timestamp); }
+        } else if (msg.role === 'assistant') {
+            if (msg.content) { addStoredAssistantMessage(msg.content, msg.timestamp); }
+        } else if (msg.role === 'error') {
+            addErrorMessage(msg.content);
+        } else if (msg.role === 'tool_call') {
+            if (msg.content) { addStoredToolCall(msg.content); }
+        }
+    });
+
+    // Restore pinned messages
+    if (savedPins && savedPins.length) {
+        pinnedIds = new Set(savedPins);
+        messagesEl.querySelectorAll('.message[data-msg-id]').forEach(m => {
+            if (pinnedIds.has(m.dataset.msgId)) {
+                m.querySelector('.pin-btn')?.classList.add('pinned');
+            }
+        });
+        renderPinnedSection();
+    }
+}
+
+/**
+ * Add a completed assistant message (no streaming — render markdown immediately).
+ * @param {string} content
+ * @param {number} timestamp
+ */
+function addStoredAssistantMessage(content, timestamp) {
+    hideWelcome();
+    const div = document.createElement('div');
+    div.className = 'message assistant';
+    const ts = timestamp || Date.now();
+    const absTime = new Date(ts).toLocaleString();
+    const timeStr = relativeTimeStr(ts);
+    const cleanContent = stripToolBlocksClient(content);
+    div.innerHTML =
+        `<div class="msg-header">` +
+            `<span class="msg-role">Agent</span>` +
+            `<time class="msg-time" data-ts="${ts}" title="${absTime}">${timeStr}</time>` +
+            `<div class="msg-actions"><button class="msg-action-btn retry-btn" title="Retry">↺ Retry</button></div>` +
+        `</div>` +
+        `<div class="msg-content">${renderMarkdown(cleanContent)}</div>`;
+    messagesEl.insertBefore(div, scrollBtn);
+    assignMsgId(div);
+    div.querySelector('.msg-header').appendChild(createPinBtn(div));
+}
+
+/**
+ * Render a persisted tool-call summary (command + output) in the chat.
+ * Content format: "✓ `cmd`\noutput..." or "✗ `cmd`\noutput..."
+ * @param {string} content
+ */
+function addStoredToolCall(content) {
+    hideWelcome();
+    const lines = content.split('\n');
+    const header = lines[0] || '';
+    const output = lines.slice(1).join('\n').trim();
+    const ok = header.startsWith('✓');
+    const icon = ok ? '✓' : '✗';
+    const cmdMatch = header.match(/`([^`]+)`/);
+    const cmdText = cmdMatch ? cmdMatch[1] : header.replace(/^[✓✗]\s*/, '');
+
+    const div = document.createElement('div');
+    div.className = 'cmd-block stored-tool-call';
+    div.style.opacity = '0.85';
+
+    const headerEl = document.createElement('div');
+    headerEl.className = 'cmd-header';
+    headerEl.style.cursor = output ? 'pointer' : 'default';
+    headerEl.innerHTML =
+        `<span class="cmd-status ${ok ? 'cmd-ok' : 'cmd-err'}">${icon}</span>` +
+        `<span class="cmd-name">${escHtml(cmdText)}</span>` +
+        (output ? `<span class="cmd-toggle" style="margin-left:auto;font-size:0.75em;opacity:0.6">▶</span>` : '');
+
+    div.appendChild(headerEl);
+
+    if (output) {
+        const bodyEl = document.createElement('pre');
+        bodyEl.className = 'cmd-output';
+        bodyEl.style.display = 'none';
+        bodyEl.textContent = output;
+        div.appendChild(bodyEl);
+
+        headerEl.addEventListener('click', () => {
+            const shown = bodyEl.style.display !== 'none';
+            bodyEl.style.display = shown ? 'none' : 'block';
+            const toggle = headerEl.querySelector('.cmd-toggle');
+            if (toggle) { toggle.textContent = shown ? '▶' : '▼'; }
+        });
+    }
+
+    messagesEl.insertBefore(div, scrollBtn);
+}
+
+// ── Update addUserMessage to accept an optional stored timestamp ──────────────
+// (override the existing one)
+function addUserMessage(text, timestamp) {
+    hideWelcome();
+    const div = document.createElement('div');
+    div.className = 'message user';
+    const ts = timestamp || Date.now();
+    const absTime = new Date(ts).toLocaleString();
+    div.innerHTML =
+        `<div class="msg-header">` +
+            `<span class="msg-role">You</span>` +
+            `<time class="msg-time" data-ts="${ts}" title="${absTime}">${relativeTimeStr(ts)}</time>` +
+        `</div>` +
+        `<div class="msg-content">${escHtml(text).replace(/\n/g, '<br>')}</div>`;
+    messagesEl.insertBefore(div, scrollBtn);
+    assignMsgId(div);
+    div.querySelector('.msg-header').appendChild(createPinBtn(div));
+    userScrolledUp = false;
+    scrollBottom(true);
+}
+
+// ── Tab bar ────────────────────────────────────────────────────────────────────
+
+const tabBar = /** @type {HTMLElement} */ (document.getElementById('tab-bar'));
+const tabAdd = /** @type {HTMLButtonElement} */ (document.getElementById('tab-add'));
+
+/** @type {Array<{tabId: string, title: string, active: boolean}>} */
+let tabList = [];
+
+/**
+ * Render the tab bar from the current tabList state.
+ */
+function renderTabBar() {
+    // Remove existing tab buttons (keep the + button)
+    tabBar.querySelectorAll('.tab-btn').forEach(el => el.remove());
+
+    tabList.forEach((tab) => {
+        const btn = document.createElement('button');
+        btn.className = 'tab-btn' + (tab.active ? ' active' : '');
+        btn.title = tab.title;
+        btn.dataset.tabId = tab.tabId;
+
+        const label = document.createElement('span');
+        label.className = 'tab-label';
+        // Show a spinner prefix for non-active running tabs so user knows work is happening
+        label.textContent = (!tab.active && tab.running ? '⟳ ' : '') + tab.title;
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'tab-close';
+        closeBtn.title = 'Close tab';
+        closeBtn.textContent = '×';
+        closeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            vscode.postMessage({ command: 'closeTab', tabId: tab.tabId });
+        });
+
+        btn.appendChild(label);
+        btn.appendChild(closeBtn);
+
+        btn.addEventListener('click', () => {
+            if (!btn.classList.contains('active')) {
+                // Clear any badge on this tab when switching to it
+                btn.classList.remove('tab-badge-done', 'tab-badge-attention');
+                // Save the current draft before switching so the provider can restore it later
+                vscode.postMessage({ command: 'switchTab', tabId: tab.tabId, draft: promptEl.value });
+            }
+        });
+
+        // Insert before the + button
+        tabBar.insertBefore(btn, tabAdd);
+    });
+
+    // Always show the bar (so + is always accessible). Tab buttons are only shown when
+    // there are 2+ tabs — with a single tab they're redundant and just waste space.
+    tabBar.style.display = 'flex';
+    const showTabs = tabList.length > 1;
+    tabBar.querySelectorAll('.tab-btn').forEach(el => {
+        /** @type {HTMLElement} */ (el).style.display = showTabs ? '' : 'none';
+    });
+}
+
+tabAdd.addEventListener('click', () => {
+    vscode.postMessage({ command: 'openTab' });
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+
+try {
+    setStatus('checking', 'Connecting…');
+    // Request models + current editor context
+    vscode.postMessage({ command: 'getModels' });
+    vscode.postMessage({ command: 'getContext' });
+} catch (initErr) {
+    const el = document.getElementById('status-text');
+    if (el) { el.textContent = 'Init error: ' + initErr.message; el.style.color = '#f44747'; }
+    try { vscode.postMessage({ command: 'webviewError', text: '[webview init] ' + initErr.stack }); } catch(_) {}
+}

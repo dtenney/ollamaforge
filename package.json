@@ -1,0 +1,518 @@
+{
+  "name": "ollamaforge",
+  "displayName": "Ollama Forge",
+  "version": "1.0.0",
+  "description": "Local AI coding agent powered by Ollama — memory, code graph, autonomous agent, MCP support. 100% local, no telemetry, no internet required.",
+  "publisher": "dtenney",
+  "author": {
+    "name": "David Tenney"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dtenney/ollamaforge"
+  },
+  "keywords": [
+    "ollama",
+    "ai",
+    "llm",
+    "offline",
+    "coding-assistant",
+    "agent",
+    "local-ai"
+  ],
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "icon": "images/logo.png",
+  "galleryBanner": {
+    "color": "#0D1117",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "dist/main.js",
+  "scripts": {
+    "vendor": "node scripts/vendor-hljs.js",
+    "compile": "npm run vendor && tsc",
+    "deploy": "npm run bundle && node scripts/deploy.js",
+    "bundle": "npm run vendor && node esbuild.js",
+    "bundle:prod": "npm run vendor && node esbuild.js --production",
+    "build": "npm run deploy",
+    "package": "npm run compile && npx vsce package",
+    "vscode:prepublish": "npm run bundle:prod",
+    "test": "npm run compile && vscode-test",
+    "test:unit": "npm run compile && mocha dist/test/unit/**/*.test.js",
+    "test:harness": "npm run compile && mocha --require dist/test/vscode-mock.js --timeout 30000 dist/test/unit/agentHarness.test.js",
+    "test:coverage": "npm run compile && nyc mocha dist/test/unit/**/*.test.js"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^18.0.0",
+    "@types/sinon": "^17.0.3",
+    "@types/vscode": "^1.80.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^2.22.0",
+    "better-sqlite3": "^13.0.2",
+    "esbuild": "^0.27.4",
+    "highlight.js": "^11.11.1",
+    "mocha": "^10.3.0",
+    "nyc": "^18.0.0",
+    "sinon": "^17.0.1",
+    "tree-sitter": "^0.25.1",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "typescript": "^5.0.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ollama-sidebar",
+          "title": "Ollama Forge",
+          "icon": "images/sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ollama-sidebar": [
+        {
+          "type": "webview",
+          "id": "ollamaForge.chatView",
+          "name": "Chat"
+        },
+        {
+          "id": "ollamaForge.memoryView",
+          "name": "Memory"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ollamaForge.newChat",
+        "title": "New Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "ollamaForge.openChat",
+        "title": "Ollama: Open Chat"
+      },
+      {
+        "command": "ollamaForge.generateCode",
+        "title": "Ollama: Generate Code (selection)"
+      },
+      {
+        "command": "ollamaForge.explainSelection",
+        "title": "Ollama: Explain Selection"
+      },
+      {
+        "command": "ollamaForge.codeAction",
+        "title": "Ollama: Code Action"
+      },
+      {
+        "command": "ollamaForge.explainError",
+        "title": "Ollama: Explain Error"
+      },
+      {
+        "command": "ollamaForge.diagnose",
+        "title": "Ollama: Run Diagnostics"
+      },
+      {
+        "command": "ollamaForge.createMCPConfig",
+        "title": "Ollama: Create MCP Config File"
+      },
+      {
+        "command": "ollamaForge.runMemoryMaintenance",
+        "title": "Ollama: Run Memory Maintenance"
+      },
+      {
+        "command": "ollamaForge.clearMemory",
+        "title": "Ollama: Clear All Memory"
+      },
+      {
+        "command": "ollamaForge.clearApprovals",
+        "title": "Ollama: Clear Tool Approvals (Reset Confirmations)"
+      },
+      {
+        "command": "ollamaForge.refreshMemory",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ollamaForge.promoteEntry",
+        "title": "Promote to Higher Tier",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "ollamaForge.demoteEntry",
+        "title": "Demote to Lower Tier",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "ollamaForge.deleteMemoryEntry",
+        "title": "Delete Entry",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "ollamaForge.exportMemory",
+        "title": "Ollama: Export Memory"
+      },
+      {
+        "command": "ollamaForge.importMemory",
+        "title": "Ollama: Import Memory"
+      },
+      {
+        "command": "ollamaForge.showMemoryStats",
+        "title": "Ollama: Show Memory Statistics",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "ollamaForge.manageTemplates",
+        "title": "Ollama: Manage Prompt Templates"
+      },
+      {
+        "command": "ollamaForge.triggerInlineCompletion",
+        "title": "Ollama: Trigger Inline Completion"
+      },
+      {
+        "command": "ollamaForge.exportChatMarkdown",
+        "title": "Ollama: Export Chat as Markdown"
+      },
+      {
+        "command": "ollamaForge.exportChatJSON",
+        "title": "Ollama: Export Chat as JSON"
+      },
+      {
+        "command": "ollamaForge.reviewChanges",
+        "title": "Ollama: Review My Changes"
+      },
+      {
+        "command": "ollamaForge.reviewCommit",
+        "title": "Ollama: Review Commit"
+      },
+      {
+        "command": "ollamaForge.switchWorkspace",
+        "title": "Ollama: Switch Workspace Folder"
+      },
+      {
+        "command": "ollamaForge.ingestMarkdown",
+        "title": "Ollama: Ingest Markdown Files into Memory"
+      },
+      {
+        "command": "ollamaForge.scanProjectDocs",
+        "title": "Ollama: Scan Project Docs into Memory"
+      },
+      {
+        "command": "ollamaForge.exportLog",
+        "title": "Ollama: Export Agent Log for Review"
+      },
+      {
+        "command": "ollamaForge.acceptProposedRules",
+        "title": "Ollama Forge: Accept Proposed Rules"
+      },
+      {
+        "command": "ollamaForge.runDreamCycle",
+        "title": "Ollama Forge: Run Dream Cycle"
+      },
+      {
+        "command": "ollamaForge.checkStackHealth",
+        "title": "Ollama Forge: Check Stack Health"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "ollamaForge.newChat",
+          "when": "view == ollamaForge.chatView",
+          "group": "navigation"
+        },
+        {
+          "command": "ollamaForge.refreshMemory",
+          "when": "view == ollamaForge.memoryView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ollamaForge.showMemoryStats",
+          "when": "view == ollamaForge.memoryView",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "ollamaForge.promoteEntry",
+          "when": "view == ollamaForge.memoryView && viewItem == memoryEntry",
+          "group": "inline@1"
+        },
+        {
+          "command": "ollamaForge.demoteEntry",
+          "when": "view == ollamaForge.memoryView && viewItem == memoryEntry",
+          "group": "inline@2"
+        },
+        {
+          "command": "ollamaForge.deleteMemoryEntry",
+          "when": "view == ollamaForge.memoryView && viewItem == memoryEntry",
+          "group": "inline@3"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "ollamaForge.openChat",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o"
+      },
+      {
+        "command": "ollamaForge.explainSelection",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "ollamaForge.acceptDiff",
+        "key": "alt+a",
+        "mac": "alt+a",
+        "when": "diffEditorVisible"
+      },
+      {
+        "command": "ollamaForge.rejectDiff",
+        "key": "alt+r",
+        "mac": "alt+r",
+        "when": "diffEditorVisible"
+      },
+      {
+        "command": "ollamaForge.triggerInlineCompletion",
+        "key": "alt+c",
+        "mac": "alt+c",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Ollama Forge",
+      "properties": {
+        "ollamaForge.serverUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Ollama server URL, e.g. `http://localhost:11434` or `http://192.168.1.100:11434`."
+        },
+        "ollamaForge.contextWindow": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Override the context window size (in tokens) for the selected model. Set to `0` (default) to auto-detect from Ollama. Use this when Ollama reports the architecture maximum instead of the actual loaded `num_ctx` — e.g. set to `65536` for `gemma4:26b-65k`."
+        },
+        "ollamaForge.model": {
+          "type": "string",
+          "default": "qwen3.6:35b-a3b-32k",
+          "description": "Default model to use when the extension starts. Overridable per session via the model selector in the sidebar."
+        },
+        "ollamaForge.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "markdownDescription": "Sampling temperature (0 = deterministic, 1 = balanced, 2 = creative). Only sent to Ollama when it differs from the default."
+        },
+        "ollamaForge.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Custom system prompt override. Leave empty to use the built-in coding assistant prompt."
+        },
+        "ollamaForge.autoIncludeFile": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-attach the full active file content to every message sent."
+        },
+        "ollamaForge.autoIncludeSelection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-attach selected code from the active editor when a selection exists."
+        },
+        "ollamaForge.maxContextFiles": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum number of workspace files to include when the agent auto-loads context. Higher values increase token usage."
+        },
+        "ollamaForge.injectGitDiff": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When enabled, injects a concise `git diff` of your uncommitted changes into every message. Helps the agent understand what you're currently working on. Only works in git repositories."
+        },
+        "ollamaForge.autoRunTests": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, automatically run the corresponding test file after a successful edit. Results are shown in the chat. Only runs if a matching test file is found."
+        },
+        "ollamaForge.mcpServers": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "MCP (Model Context Protocol) servers to connect to. Each server provides additional tools for the agent. Example: `[{\"name\": \"filesystem\", \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/path/to/workspace\"]}]`",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Server name"
+              },
+              "command": {
+                "type": "string",
+                "description": "Command to run"
+              },
+              "args": {
+                "type": "array",
+                "description": "Command arguments",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "object",
+                "description": "Environment variables"
+              }
+            },
+            "required": [
+              "name",
+              "command",
+              "args"
+            ]
+          }
+        },
+        "ollamaForge.memory.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable multi-tiered memory system for persistent project knowledge."
+        },
+        "ollamaForge.memory.qdrantUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Qdrant server URL for semantic memory search, e.g. `http://192.168.1.100:6333`. Leave empty to auto-derive from the Ollama server URL with port 6333."
+        },
+        "ollamaForge.memory.embeddingModel": {
+          "type": "string",
+          "default": "nomic-embed-text",
+          "description": "Ollama embedding model for semantic search (e.g., nomic-embed-text, mxbai-embed-large)."
+        },
+        "ollamaForge.memory.embeddingUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Ollama URL for embeddings. Leave empty to use main Ollama URL."
+        },
+        "ollamaForge.memory.autoSave": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically save important information to memory as the AI discovers it. Saves are filtered through garbage patterns and semantic dedup to prevent noise."
+        },
+        "ollamaForge.autoCompactContext": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically compact conversation history when context reaches 99% of model's limit. You'll be alerted at 70% usage and reminded until 99%, then auto-compact will trigger if enabled."
+        },
+        "ollamaForge.enableThinking": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable chain-of-thought reasoning for models that support it (e.g. qwen3, deepseek-r1). The model will reason internally before responding — slower but more accurate for complex tasks like code verification, debugging, and doc cross-checking. Requires a compatible Ollama model."
+        },
+        "ollamaForge.search.url": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "URL of your [SearXNG](https://searxng.github.io/searxng/) instance, e.g. `http://192.168.1.100:8888`. Leave empty to disable web search (agent stays fully offline).\n\nSearXNG is a free, self-hosted meta-search engine — no API key required. Run it alongside Ollama on the same host:\n```\ndocker run -d --name searxng -p 8888:8080 \\\n  -e SEARXNG_SECRET=$(openssl rand -hex 32) \\\n  searxng/searxng:latest\n```\nThe agent appends `/search?q={query}&format=json` automatically. SearXNG must have the `json` output format enabled (on by default in the Docker image)."
+        },
+        "ollamaForge.search.resultsLimit": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 20,
+          "markdownDescription": "Maximum number of search results returned per `web_search` call (1–20, default 5). Higher values give the agent more context but use more tokens."
+        },
+        "ollamaForge.comfyui.url": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Base URL of your ComfyUI server, e.g. `http://192.168.1.100:8188`. Leave empty to disable image generation. ComfyUI must be running with SDXL Base (`sd_xl_base_1.0.safetensors`) loaded. Generated images are saved to `.ollamaforge/tasks/<task_id>/images/` in the workspace."
+        },
+        "ollamaForge.codeLens.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show \"✨ Explain\" and \"📝 Document\" lenses above functions and classes. **Note:** May add visual clutter in large files."
+        },
+        "ollamaForge.inlineCompletions.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable inline code completions (similar to GitHub Copilot). Suggestions appear automatically as you type. **Note:** This feature uses your local Ollama model and may slow down typing on slower machines."
+        },
+        "ollamaForge.inlineCompletions.triggerMode": {
+          "type": "string",
+          "enum": [
+            "automatic",
+            "manual"
+          ],
+          "default": "automatic",
+          "markdownDescription": "How to trigger inline completions: `automatic` (as you type) or `manual` (only when you press the shortcut)."
+        },
+        "ollamaForge.maxTurnsPerSession": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 200,
+          "markdownDescription": "Maximum number of agent tool-call turns per session. `0` (default) uses built-in limits per task type (sweep=50, merge=60, plan=50, normal=40, small-model=8). Set to a lower value (e.g. `24`) to cap resource usage for large models."
+        },
+        "ollamaForge.routing.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable automatic multi-model routing. When enabled, the agent uses a smaller/faster model for read-only exploration turns (shell_read, memory_search) and reserves the main model for write/edit turns. Configure the fast model with `routing.fastModel`."
+        },
+        "ollamaForge.routing.fastModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model name to use for read-only exploration turns when `routing.enabled` is true (e.g. `qwen2.5-coder:1.5b`). Leave empty to use the main model for all turns."
+        },
+        "ollamaForge.routing.criticModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model name to use for the automated critic review pass after edits when `routing.enabled` is true (e.g. `qwen2.5-coder:7b`). Leave empty to use the main model."
+        },
+        "ollamaForge.dreamModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model to use for the dream cycle (self-improvement analysis). Leave empty to use the main model. Prefer a model with a large context window (≥32k) since the dream prompt includes feedback logs and session history."
+        },
+        "ollamaForge.contextFile.autoUpdateDays": {
+          "type": "number",
+          "default": 7,
+          "minimum": 0,
+          "markdownDescription": "Automatically refresh `AGENTS.md` in the background when it is older than this many days (checked on workspace open). Set to `0` to disable auto-refresh. The `/context` slash command always refreshes on demand regardless of this setting."
+        },
+        "ollamaForge.keepAlive": {
+          "type": "string",
+          "default": "10m",
+          "markdownDescription": "How long Ollama keeps the model loaded in GPU memory between requests. Use Ollama duration syntax: `10m` (10 minutes), `1h` (1 hour), `0` (unload immediately after each request), `-1` (keep loaded forever). A longer value reduces cold-start latency for consecutive agent turns. Default: `10m`."
+        },
+        "ollamaForge.stack.sshHost": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "SSH host for stack health checks, e.g. `user@192.168.1.100`. Leave empty to disable. Requires existing SSH key auth — no passwords stored."
+        },
+        "ollamaForge.stack.composePath": {
+          "type": "string",
+          "default": "~/docker-compose.yml",
+          "markdownDescription": "Path to `docker-compose.yml` on the remote host, used for service restarts and upgrades of Qdrant and SearXNG."
+        },
+        "ollamaForge.stack.healthCheckOnDream": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run a stack health check as part of the nightly dream cycle. Issues are surfaced in the dream cycle notification."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "axios": "^1.13.6"
+  }
+}

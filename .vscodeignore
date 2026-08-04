@@ -1,0 +1,72 @@
+# ── Source & build tooling (never ship) ──────────────────────────────────────
+src/**
+**/*.ts
+tsconfig.json
+esbuild.js
+.vscode/**
+.github/**
+scripts/**
+
+# node_modules — excluded entirely; all deps are bundled into dist/main.js by esbuild
+node_modules/**
+
+# Internal dev docs
+docs/internal/**
+CONTRIBUTING.md
+MANUAL_TESTS.md
+CODE_REVIEW.md
+GAP_ANALYSIS.md
+IMPLEMENTATION_PLAN.md
+MEMORY_IMPROVEMENTS.md
+NEXT_FEATURES.md
+SESSION_FINAL_STATE.md
+SESSION_STATE.md
+DESIGN_VISION.md
+PROJECT_STATUS.md
+RECOMMENDATIONS.md
+VIBE_CODING_DESIGN.md
+SYNERGY_AUDIT.md
+CONTEXT_MANAGEMENT_TODO.md
+PYTHON_TOOLING_TODO.md
+.ollamapilot/**
+
+# Build artefacts
+*.vsix
+package-lock.json
+.nycrc
+coverage/**
+.nyc_output/**
+.vscode-test.mjs
+.vscode-test/**
+
+# Git
+.gitignore
+.git/**
+.claude/**
+
+# Logs / temp
+*.log
+*.tsbuildinfo
+vsce_ls.txt
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# dist — keep only the esbuild bundle; exclude old tsc-compiled individual files
+dist/**
+!dist/main.js
+!dist/highlight.bundle.js
+!dist/node_modules/**
+
+# ── Keep in VSIX ─────────────────────────────────────────────────────────────
+# dist/main.js      ← esbuild single-file bundle (all deps included)
+# dist/highlight.bundle.js ← syntax highlighting vendor bundle
+# webview/**        ← chat UI (HTML + JS + vendor hljs)
+# images/**         ← logo, banner, sidebar icon, demo gif
+# docs/CHANGELOG.md ← user-facing release notes
+# package.json      ← manifest
+# README.md         ← Marketplace description
+# settings.example.json
+# mcp.example.json
+# LICENSE
