@@ -32,7 +32,7 @@ A local AI coding agent for VS Code powered by Ollama. 100% local — no telemet
 ## Setup
 
 1. Install the `.vsix` from the releases page
-2. Set `ollamaForge.serverUrl` to your Ollama instance (e.g. `http://192.168.0.29:11434`)
+2. Set `ollamaForge.serverUrl` to your Ollama instance (e.g. `http://192.168.1.100:11434`)
 3. Select a model from the sidebar dropdown
 4. Open a workspace and start chatting
 
