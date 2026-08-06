@@ -271,6 +271,19 @@
     }
     .tl-keep-going:hover { background: var(--vscode-button-secondaryHoverBackground, rgba(128,128,128,0.3)); }
     .tl-keep-going:disabled { opacity: 0.5; cursor: default; }
+    .tl-countdown { opacity: 0.6; font-size: 10px; margin-left: 3px; }
+    .tl-stop-continue {
+      margin-left: 4px;
+      padding: 4px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--vscode-button-border, transparent);
+      background: transparent;
+      color: var(--vscode-button-secondaryForeground, #ccc);
+      font-size: 11px;
+      cursor: pointer;
+      opacity: 0.6;
+    }
+    .tl-stop-continue:hover { opacity: 1; background: var(--vscode-button-secondaryHoverBackground, rgba(128,128,128,0.2)); }
     .message.user {
       background: var(--vscode-editor-background, rgba(0,0,0,0.18));
       border-left: 2px solid var(--vscode-focusBorder, #0078d4);
@@ -769,26 +782,30 @@
 
     /* ── Command output block ────────────────────────────────────────────── */
     .cmd-block {
+      display: block;
       margin: 4px 14px;
       border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.25));
       border-left: 3px solid #e5c07b;
       border-radius: 5px;
       overflow: hidden;
       font-size: 11px;
+      min-height: 26px;
     }
     .cmd-block.success { border-left-color: #4ec94e; }
     .cmd-block.error   { border-left-color: #f44747; }
     .cmd-header {
-      display: flex;
+      display: flex !important;
       align-items: center;
       gap: 6px;
-      padding: 4px 10px;
-      background: rgba(0,0,0,0.15);
+      padding: 5px 10px;
+      min-height: 26px;
+      box-sizing: border-box;
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(0,0,0,0.15));
       border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
     }
-    .cmd-icon  { font-size: 11px; line-height: 1; flex-shrink: 0; }
+    .cmd-icon  { font-size: 12px; line-height: 1; flex-shrink: 0; }
     .cmd-type  {
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 600;
       color: var(--vscode-terminal-ansiYellow, #e5c07b);
       flex-shrink: 0;
@@ -796,14 +813,15 @@
     }
     .cmd-label {
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 10px;
-      opacity: 0.55;
+      font-size: 11px;
+      color: var(--vscode-editor-foreground, #ccc);
+      opacity: 0.7;
       flex: 1;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .cmd-exit  { font-size: 10px; opacity: 0.55; flex-shrink: 0; }
+    .cmd-exit  { font-size: 11px; opacity: 0.7; flex-shrink: 0; }
     .cmd-preview {
       padding: 3px 10px 3px 27px;
       font-family: var(--vscode-editor-font-family, monospace);

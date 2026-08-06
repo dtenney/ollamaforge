@@ -28,7 +28,7 @@
   // ComfyUI must be running with SDXL Base (sd_xl_base_1.0.safetensors) loaded.
   // Binds to 0.0.0.0 by default so it's reachable over the network.
   //
-  // Generated images are saved to .ollamapilot/tasks/<task_id>/images/ in the
+  // Generated images are saved to .ollamaforge/tasks/<task_id>/images/ in the
   // workspace and can be embedded in task_report HTML output.
   //
   // Leave empty to disable image generation.
@@ -63,7 +63,7 @@
   "ollamaAgent.enableThinking": false,
 
   // ── MCP servers ─────────────────────────────────────────────────────────────
-  // Alternatively, put server config in <project>/.ollamapilot/mcp.json.
+  // Alternatively, put server config in <project>/.ollamaforge/mcp.json.
   // See mcp.example.json in the extension install directory for all available servers.
   "ollamaAgent.mcpServers": [],
 

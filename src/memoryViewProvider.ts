@@ -85,8 +85,9 @@ export class MemoryTreeItem extends vscode.TreeItem {
             `Last Accessed: ${new Date(entry.lastAccessed).toLocaleString()}`,
             `Accessed: ${entry.accessCount} times`
         ];
-        if (entry.tags?.length) {
-            lines.push(`Tags: ${entry.tags.join(', ')}`);
+        const tags = Array.isArray(entry.tags) ? entry.tags : (entry.tags ? [String(entry.tags)] : []);
+        if (tags.length) {
+            lines.push(`Tags: ${tags.join(', ')}`);
         }
         return lines.join('\n');
     }

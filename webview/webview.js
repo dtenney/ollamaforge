@@ -493,10 +493,21 @@ function renderMarkdown(text) {
     // 9b. Linkify bare file paths in prose (e.g. "docs/foo.md", "src/agent.ts")
     // Match relative paths that contain a slash and a file extension.
     // Must come after inline-code restore so we don't double-wrap.
+    // Guard: extract existing <a class="file-link"> tags first so we don't re-wrap paths already linked.
+    /** @type {string[]} */
+    const existingLinks = [];
+    text = text.replace(/<a class="file-link"[^>]*>[\s\S]*?<\/a>/g, (m) => {
+        const id = `\x01FL${existingLinks.length}\x01`;
+        existingLinks.push(m);
+        return id;
+    });
     text = text.replace(
         /(?<![">\/\\])(\b(?:[a-zA-Z0-9_\-]+\/)+[a-zA-Z0-9_\-]+\.[a-zA-Z]{1,6}\b)/g,
         (match) => `<a class="file-link" data-file="${escHtml(match)}" href="#" title="Open in VS Code">${escHtml(match)}</a>`
     );
+    existingLinks.forEach((link, i) => {
+        text = text.replace(`\x01FL${i}\x01`, link);
+    });
 
     // 10. Restore think blocks
     thinks.forEach((content, i) => {
@@ -769,8 +780,8 @@ function appendToken(token) {
         // During streaming: strip complete <tool>...</tool> blocks, then hide any
         // in-progress (unclosed) tool block at the tail so partial JSON doesn't show.
         let display = stripToolBlocksClient(currentRaw);
-        // Strip bare remnants of split tool tags (e.g. "tool>" when "<" was emitted separately)
-        display = display.replace(/\btool>\s*/gi, '').replace(/<\/tool>/gi, '');
+        // Strip bare remnants of split tool tags and alternate closing tags
+        display = display.replace(/\btool>\s*/gi, '').replace(/<\/tool(?:_call)?>/gi, '').replace(/<\/?(?:parameter|function)>/gi, '');
 
         // Strip inline <think>...</think>, <scratch_pad>...</scratch_pad>, and
         // <antThinking>...</antThinking> blocks.
@@ -1023,7 +1034,9 @@ function stripToolBlocksClient(text) {
     result = result.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, '');
     result = result.replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/gi, '');
     // Remove orphaned closing tags (no matching opening tag)
-    result = result.replace(/<\/tool>/gi, '');
+    result = result.replace(/<\/tool(?:_call)?>/gi, '');
+    result = result.replace(/<\/parameter>/gi, '');
+    result = result.replace(/<\/?function>/gi, '');
     result = result.replace(/<\/invoke>/gi, '');
     result = result.replace(/<\/function_calls>/gi, '');
     result = result.replace(/<invoke(?:\s[^>]*)?>/gi, '');
@@ -1459,8 +1472,11 @@ function addTurnLimitCard(text, canAutoContinue, longSession) {
         doneHtml = `<div class="tl-done">${items}</div>`;
     }
 
+    const isMidTask = !!hintLine || doneLines.length > 0;
     const actionHtml = canAutoContinue
         ? `<span class="tl-status tl-continuing">Continuing…</span>`
+        : isMidTask
+        ? `<button class="tl-keep-going">Continue <span class="tl-countdown">(5)</span></button><button class="tl-stop-continue" title="Stop auto-continue">✕</button>`
         : `<button class="tl-keep-going">Keep going</button>`;
 
     div.innerHTML =
@@ -1479,14 +1495,44 @@ function addTurnLimitCard(text, canAutoContinue, longSession) {
 
     messagesEl.insertBefore(div, scrollBtn);
 
+    const doKeepGoing = () => {
+        const btn = div.querySelector('.tl-keep-going');
+        if (btn) { btn.disabled = true; btn.textContent = 'Continuing…'; }
+        const stopBtn = div.querySelector('.tl-stop-continue');
+        if (stopBtn) { stopBtn.remove(); }
+        setStreaming(true);
+        startAssistantMessage();
+        vscode.postMessage({ command: 'sendMessage', text: 'keep going', model: modelSelect.value, trustLevel: trustSelect.value, includeFile: false, includeSelection: false });
+    };
+
     const keepGoingBtn = div.querySelector('.tl-keep-going');
+    const stopContinueBtn = div.querySelector('.tl-stop-continue');
+    const countdownEl = div.querySelector('.tl-countdown');
+
     if (keepGoingBtn) {
-        keepGoingBtn.addEventListener('click', () => {
-            keepGoingBtn.disabled = true;
-            keepGoingBtn.textContent = 'Continuing…';
-            setStreaming(true);
-            vscode.postMessage({ command: 'chat', text: 'keep going', model: modelSelect.value });
-        });
+        if (isMidTask && !canAutoContinue && countdownEl) {
+            let remaining = 5;
+            const tick = setInterval(() => {
+                remaining--;
+                if (countdownEl && remaining > 0) {
+                    countdownEl.textContent = `(${remaining})`;
+                } else {
+                    clearInterval(tick);
+                    if (!keepGoingBtn.disabled) { doKeepGoing(); }
+                }
+            }, 1000);
+            keepGoingBtn.addEventListener('click', () => { clearInterval(tick); doKeepGoing(); });
+            if (stopContinueBtn) {
+                stopContinueBtn.addEventListener('click', () => {
+                    clearInterval(tick);
+                    keepGoingBtn.textContent = 'Keep going';
+                    if (countdownEl) { countdownEl.remove(); }
+                    stopContinueBtn.remove();
+                });
+            }
+        } else {
+            keepGoingBtn.addEventListener('click', () => doKeepGoing());
+        }
     }
 
     scrollBottom(true);
@@ -1861,17 +1907,24 @@ function addCommandBlock(id, cmd) {
         messagesEl.insertBefore(div, scrollBtn);
     }
 
-    // Click header to toggle output visibility.
-    // If user collapses during streaming, set userCollapsed so chunks don't re-expand it.
+    // Store references on the element so finalizeCommandBlock can access them.
     const header = div.querySelector('.cmd-header');
     const output = div.querySelector('.cmd-output');
     if (header && output) {
         header.style.cursor = 'pointer';
-        header.addEventListener('click', () => {
+        // Store toggle function on the block so finalizeCommandBlock reuses it.
+        div._toggleOutput = () => {
             const isHidden = output.style.display === 'none';
             output.style.display = isHidden ? 'block' : 'none';
             div.dataset.userCollapsed = isHidden ? '' : '1';
-        });
+            // Update arrow if present
+            const arrow = header.querySelector('.cmd-toggle');
+            if (arrow) { arrow.textContent = isHidden ? '▼' : '▶'; }
+            // Update preview if present
+            const preview = div.querySelector('.cmd-preview');
+            if (preview) { preview.style.display = isHidden ? 'none' : ''; }
+        };
+        header.addEventListener('click', () => div._toggleOutput && div._toggleOutput());
     }
     scrollBottom();
 }
@@ -1919,20 +1972,9 @@ function finalizeCommandBlock(id, exitCode) {
     if (header) {
         const badge = document.createElement('span');
         badge.className = 'cmd-exit';
-        // Show green check or red X with exit code
         badge.textContent = ok ? `✓ exit 0` : `✗ exit ${exitCode}`;
         badge.style.color = ok ? '#4ec94e' : '#f44747';
         header.appendChild(badge);
-
-        // Show line/char count hint when collapsed
-        if (hasOutput) {
-            const lines = output.textContent.split('\n').filter(l => l.trim()).length;
-            const hint = document.createElement('span');
-            hint.className = 'cmd-exit';
-            hint.textContent = `${lines} line${lines !== 1 ? 's' : ''} — click to view`;
-            hint.style.opacity = '0.5';
-            header.appendChild(hint);
-        }
     }
 
     // On success: collapse output now that the command is done (it was live-expanded during the run).
@@ -1942,29 +1984,33 @@ function finalizeCommandBlock(id, exitCode) {
         output.style.display = ok ? 'none' : 'block';
     }
 
-    // Show first line of output as a preview when collapsed (success only).
-    if (ok && hasOutput) {
-        const firstLine = output.textContent.split('\n').find(l => l.trim()) ?? '';
-        if (firstLine.trim()) {
-            const preview = document.createElement('div');
-            preview.className = 'cmd-preview';
-            preview.textContent = firstLine.trim();
-            preview.title = 'Click to expand full output';
-            // Toggle output on click, same as header
-            preview.addEventListener('click', () => {
-                const isHidden = output.style.display === 'none';
-                output.style.display = isHidden ? 'block' : 'none';
-                block.dataset.userCollapsed = isHidden ? '' : '1';
-                preview.style.display = isHidden ? 'none' : '';
-            });
-            // Hide preview when output is expanded (user opened it)
-            const origHeaderClick = block.querySelector('.cmd-header');
-            if (origHeaderClick) {
-                origHeaderClick.addEventListener('click', () => {
-                    preview.style.display = output.style.display === 'none' ? '' : 'none';
-                });
+    // Add toggle arrow + line count to header, then wire preview — reuse _toggleOutput set by addCommandBlock.
+    if (header && hasOutput) {
+        const lines = (output?.textContent ?? '').split('\n').filter(l => l.trim()).length;
+        const toggleArrow = document.createElement('span');
+        toggleArrow.className = 'cmd-toggle';
+        toggleArrow.style.cssText = 'margin-left:auto;font-size:0.75em;opacity:0.6;flex-shrink:0';
+        toggleArrow.textContent = output?.style.display === 'none' ? '▶' : '▼';
+        header.appendChild(toggleArrow);
+
+        const lineHint = document.createElement('span');
+        lineHint.className = 'cmd-exit';
+        lineHint.textContent = `${lines} line${lines !== 1 ? 's' : ''}`;
+        lineHint.style.opacity = '0.4';
+        header.appendChild(lineHint);
+
+        // Show first line of output as a preview strip when collapsed (success only).
+        if (ok) {
+            const firstLine = (output?.textContent ?? '').split('\n').find(l => l.trim()) ?? '';
+            if (firstLine.trim()) {
+                const preview = document.createElement('div');
+                preview.className = 'cmd-preview';
+                preview.textContent = firstLine.trim();
+                preview.title = 'Click to expand full output';
+                preview.style.display = output?.style.display === 'none' ? '' : 'none';
+                preview.addEventListener('click', () => block._toggleOutput && block._toggleOutput());
+                if (output) { block.insertBefore(preview, output); }
             }
-            block.insertBefore(preview, output);
         }
     }
 

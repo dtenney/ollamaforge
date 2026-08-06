@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy this file to <your-project>/.ollamapilot/mcp.json and configure the servers you want. OllamaPilot loads MCP servers from that location at startup.",
+  "_comment": "Copy this file to <your-project>/.ollamaforge/mcp.json and configure the servers you want. Ollama Forge loads MCP servers from that location at startup.",
   "servers": [
 
     {

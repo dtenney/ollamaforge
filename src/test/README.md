@@ -1,6 +1,6 @@
-# OllamaPilot Test Suite
+# Ollama Forge Test Suite
 
-Comprehensive test suite for OllamaPilot extension covering unit and integration tests.
+Comprehensive test suite for Ollama Forge extension covering unit and integration tests.
 
 ## Test Structure
 
@@ -92,7 +92,7 @@ import * as vscode from 'vscode';
 
 describe('Integration Test', () => {
   it('should test VS Code integration', async () => {
-    const ext = vscode.extensions.getExtension('dtenney.ollamapilot');
+    const ext = vscode.extensions.getExtension('dtenney.ollamaforge');
     assert.ok(ext);
   });
 });

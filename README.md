@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="images/logo.png" alt="Ollama Forge" width="180" />
+</p>
+
 # Ollama Forge
 
 A local AI coding agent for VS Code powered by Ollama. 100% local — no telemetry, no internet required, no subscriptions.

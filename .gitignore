@@ -3,3 +3,6 @@ dist/
 *.vsix
 .ollamaforge/
 coverage/
+
+# Ollama Forge runtime data (graphs, cache, memory) — machine-local, not for git
+.ollamapilot/

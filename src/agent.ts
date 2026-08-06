@@ -1444,6 +1444,12 @@ Backtick code blocks are NEVER executed. Only raw <tool>...</tool> XML blocks ar
 Split-tag formats like <tooltoolname> are NOT supported. Use ONLY <tool>...</tool>.
 *** END MOST IMPORTANT RULES ***
 
+INVESTIGATION DEPTH RULES -- apply when diagnosing issues or recommending system changes:
+- Before recommending to enable, start, restart, or deploy any service: verify the FULL call chain. (1) Does any live code actually import and call into this service? (2) Is the integration complete, or were the calling files never committed? (3) Do the logs show successful calls, or only connection errors? Connection errors in logs for a disabled service often mean the integration is incomplete, not that the service merely needs to be started.
+- When you find a service that is disabled/dead and a log references it: do NOT assume the service should be re-enabled. First search for all callers in the codebase and confirm they are reachable from the application's real entry point. A service with no live callers is dead code regardless of what old logs say.
+- When investigating a bug reported by a log: read the actual source files involved, not just grep matches. Comments and docstrings can claim functionality that was never implemented. Confirm that code paths are wired up end-to-end before recommending action.
+- When a previous developer left a feature in an incomplete state: say so explicitly. Distinguish between "the service is down and should be restarted" vs "the service is built but the integration into the app is missing."
+
 CRITICAL RULES:
 - When user says "Add to memory:" or "Save to memory:" -> IMMEDIATELY call memory_tier_write with the appropriate tier
 - When user provides MULTIPLE pieces of information -> call memory_tier_write MULTIPLE TIMES (once per concept)
@@ -2112,10 +2118,31 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
             }
             pos = jsonEnd;
         } else {
-            pos = toolStart + 6;
+            // Brace counting failed — JSON string not closed. This happens when Qwen emits
+            // mixed-format output like: <tool>{"name":"run_command","arguments":{"command":"ssh ... </parameter></function></tool_call>
+            // Try to recover using </tool_call>, </function>, or </parameter> as end boundaries.
+            const altEnds = ['</tool_call>', '</function>', '</parameter>'].map(t => text.indexOf(t, jsonStart)).filter(i => i !== -1);
+            if (altEnds.length > 0) {
+                const altEnd = Math.min(...altEnds);
+                const raw = text.slice(jsonStart, altEnd).trim();
+                const repaired = repairToolJson(raw);
+                if (repaired) {
+                    try {
+                        const reparsed = JSON.parse(repaired);
+                        addCall(reparsed, 'XML (tool_call-boundary repair)');
+                        pos = altEnd;
+                    } catch {
+                        pos = toolStart + 6;
+                    }
+                } else {
+                    pos = toolStart + 6;
+                }
+            } else {
+                pos = toolStart + 6;
+            }
         }
     }
-    
+
     // Try JSON inside markdown code blocks: ```json\n{...}\n```
     if (calls.length === 0) {
         const codeBlockRegex = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?```/gi;
@@ -2721,6 +2748,12 @@ export class Agent {
     private _asyncHandleCounter: number = 0;
     /** User note injected mid-run -- appended to history at the next tool boundary, then cleared */
     private _pendingUserNote: string | null = null;
+    /** Remaining items from a multi-item task list -- auto-advanced after each item completes */
+    private _pendingTaskItems: string[] = [];
+    /** Index (1-based) of the item currently being worked on */
+    private _currentTaskItemIndex: number = 0;
+    /** Total number of items in the original multi-item task list */
+    private _totalTaskItems: number = 0;
 
     // Fix 5a: Task state machine -- survives context compaction, drives completion tracking
     private _activeTask: {
@@ -3081,8 +3114,12 @@ export class Agent {
 
     /** Resolve confirmation AND auto-approve all future calls to this tool name */
     resolveConfirmationAll(toolName: string): void {
+        // Add to _trustedTools (persists across user turns) AND _autoApprovedTools (current run).
+        // Previously only _autoApprovedTools was set, which got cleared on each new user message,
+        // causing "Accept All" to stop working after the user sent the next message.
+        this._trustedTools.add(toolName);
         this._autoApprovedTools.add(toolName);
-        logInfo(`[agent] Auto-approving all future "${toolName}" calls this run`);
+        logInfo(`[agent] Permanently approved "${toolName}" for this session`);
         this.resolveConfirmation(true);
     }
 
@@ -3557,6 +3594,26 @@ export class Agent {
         this._preflightWriteGateFired = false; // Reset pre-flight write gate
         this._enumerationCallCount = 0;        // Reset enumeration loop counter
         this._sshInlineGuardFired = false;     // Reset SSH inline script guard
+        // Multi-item task list detection -- only on fresh user messages (not "keep going" continuations).
+        // Parse numbered/bulleted lists into _pendingTaskItems so the agent auto-advances
+        // through each item rather than stopping after the first one.
+        // Also skips messages that are already tagged [TASK N/M] (recursive invocations from this logic).
+        const isTaskContinuation = /^\[TASK \d+\/\d+\]/.test(userMessage);
+        if (!isConfirmation && !isTaskContinuation) {
+            const taskItems = Agent.parseMultiItemTaskList(userMessage);
+            if (taskItems.length >= 2) {
+                // New multi-item list found -- replace any stale pending items.
+                this._pendingTaskItems = taskItems.slice(1);
+                this._currentTaskItemIndex = 1;
+                this._totalTaskItems = taskItems.length;
+                logInfo(`[multi-task] Detected ${taskItems.length}-item task list. Item 1 of ${taskItems.length}: "${taskItems[0].slice(0, 80)}"`);
+            } else {
+                // Plain message -- clear any stale task list from a prior session.
+                this._pendingTaskItems = [];
+                this._currentTaskItemIndex = 0;
+                this._totalTaskItems = 0;
+            }
+        }
         (this as any)._sshInlineNudgePending = false;
         this._pythonOnelinerFailCount = 0;     // Reset python3 -c failure counter
         // Set schema-change confirmed if user's message looks like approval of a previously blocked schema change
@@ -6201,7 +6258,11 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 //   - explicit completion/task-done language in the response.
                 // This prevents the no-tool handler from firing on a good answer and
                 // prevents autoRetryCount from escalating across clean text turns.
-                const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|ready (?:to|for)|awaiting (?:your|hardware|next)|(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)|(?:^|\n)done[.!\n]|(?:^|\n)complete[.!\n]|(?:^|\n)finished[.!\n]|(?:successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed)))\b/i.test(resp);
+                // "is running/working/complete" only counts as completion when at end-of-sentence
+                // (followed by . ! \n or end of string) — not when mid-sentence describing a state
+                // e.g. "Bot is running with Whisper" should NOT match, "Bot is running." SHOULD.
+                const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|awaiting (?:your|hardware|next)|(?:^|\n)done[.!\n]|(?:^|\n)complete[.!\n]|(?:^|\n)finished[.!\n]|(?:successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed)))\b/i.test(resp)
+                    || /\b(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)[.!\s]*$/i.test(resp);
                 // Planning/narration phrases signal the model is about to act, not that it's done.
                 // "Let me explore...", "I'll check...", "Exciting! Let me make both edits." should never be a stop.
                 // We check anywhere in short responses (< 300 chars) because preamble like "Exciting project!"
@@ -6211,7 +6272,10 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     : /^(?:let me |i(?:'ll| will) (?:check|look|explore|read|find|search|examine|review|start|begin|now)|looking (?:at|for|into)|checking |searching |reading |exploring |now i(?:'ll| will| need| should)|i should |i need to |the user (?:is |wants |has |needs |asked ))/i.test(resp.trim());
                 // Mid-task phases (research/acting) should only stop on explicit completion language,
                 // not just on a long text answer — the model may be narrating its next step.
-                const isMidTask = this._taskPhase === 'research' || this._taskPhase === 'acting';
+                // Also treat as mid-task if tools were called this run but phase has already advanced
+                // to 'verifying' — the agent is still working, not done.
+                const isMidTask = this._taskPhase === 'research' || this._taskPhase === 'acting'
+                    || (this._taskPhase === 'verifying' && this._toolCallsThisRun.length > 0);
                 // If tools have been called this run, the agent is mid-task regardless of phase tracking.
                 // This catches cases where _taskPhase hasn't transitioned yet but real work has started.
                 const toolsCalledThisRun = this._toolCallsThisRun.length > 0;
@@ -6223,7 +6287,24 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 //      (model summarising completed work — only if response looks like a summary, not a plan)
                 // Case 3 is the tricky one: "Let me now..." after tools = plan, not summary.
                 // We require hasCompletionLanguage OR the response doesn't contain any forward-looking intent.
-                const hasForwardIntent = /\b(?:let me |i(?:'ll| will) |i(?:'m| am) going to |now i(?:'ll| will| need)|next[, ]|then[, ]|after that|first[, ].*then|going to )\b/i.test(resp);
+                // Also catch present-progressive action statements like "Running with the venv's interpreter instead."
+                // or "Using X approach" / "Switching to Y" — model stating what it's about to do without a tool call.
+                // Also catch "Need to find/check/look" — agent stating its next required action without a future-tense marker.
+                const hasForwardIntent = /\b(?:let me |i(?:'ll| will) |i(?:'m| am) going to |now i(?:'ll| will| need)|next[, ]|then[, ]|after that|first[, ].*then|going to |(?:running|using|switching|installing|applying|trying|attempting|executing) (?:with |the |this |a )?(?:\w+ ){0,4}instead\b)\b/i.test(resp)
+                    || /^(?:running |using |switching |installing |applying |trying |attempting |executing )/i.test(resp.trim())
+                    // Obligation without future tense: "need to", "have to", "must", "should" + action verb
+                    || /\b(?:need|have|must|also need|still need|will need) to (?:find|check|look|read|search|examine|trace|investigate|verify|confirm|test|run|install|fix|update|get|see|figure out|grep|cat|ssh|curl|ping|restart|reload|enable|disable|create|write|edit|remove|delete|move|copy)\b/i.test(resp)
+                    || /\bshould (?:find|check|look|read|trace|investigate|verify|test|try|run|fix)\b/i.test(resp)
+                    // "let's" constructions — model includes user as participant
+                    || /\blet'?s (?:check|look|try|run|find|read|see|examine|search|verify|test|fix|start|begin|go|do|use|get|explore|trace|grep|ssh|install|restart)\b/i.test(resp)
+                    // "Next step" / "The next thing" without comma
+                    || /\b(?:next step|the next (?:thing|step|task)|next up)\b/i.test(resp)
+                    // "Worth checking/looking" — hedged intent
+                    || /\bworth (?:checking|looking|reading|examining|investigating|verifying|testing|trying)\b/i.test(resp)
+                    // "About to" / "Time to" — imminent action
+                    || /\b(?:about to|time to) (?:check|look|find|read|run|search|examine|trace|investigate|verify|test|fix|install|try)\b/i.test(resp)
+                    // Response ends with ":" — model was about to show/enumerate something and stopped
+                    || /:\s*$/.test(resp.trim());
                 // A response that ends with a question to the user is always a legitimate stop —
                 // the model is handing control back and waiting for input.
                 const endsWithQuestion = /\?\s*$/.test(resp.trim());
@@ -6236,12 +6317,16 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     && endsWithQuestion
                     && !hasForwardIntent
                     && !toolCalls.length;
-                const isLegitimateStop = hasCompletionLanguage
+                // hasForwardIntent always wins — if the model stated intent to act next,
+                // it is never a legitimate stop regardless of completion language present elsewhere.
+                const isLegitimateStop = !hasForwardIntent && (
+                    hasCompletionLanguage
                     || hasConfirmationLanguage
                     || isConversationalStop
                     || endsWithQuestion
-                    || (turnHasText && !isPlanningNarration && !hasForwardIntent && !isMidTask && !toolsCalledThisRun)
-                    || (turnHasText && !isPlanningNarration && !hasForwardIntent && !isMidTask && toolsCalledThisRun);
+                    || (turnHasText && !isPlanningNarration && !isMidTask && !toolsCalledThisRun)
+                    || (turnHasText && !isPlanningNarration && !isMidTask && toolsCalledThisRun)
+                );
                 // Reset stall budget when the model gives a real answer — it wasn't stalling,
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
@@ -6320,10 +6405,17 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // If content has a <tool> block but zero calls were parsed (malformed/wrong args),
                 // treat it as no-tool and nudge — don't silently break.
                 const parsedToolBlock = responseHasToolBlock && toolCalls.length > 0;
+                // Detect responses that END with a planning statement: "Let me do that now.", "I'll install that."
+                // These always mean the model intends to call a tool next — bypass the retry cap for one nudge.
+                const lastSentence = resp.trim().split(/(?<=[.!])\s+/).pop() ?? resp.trim();
+                const endsWithPlanningStatement = /(?:let me (?:do|run|install|fix|try|check|apply|execute|use|call|now|clean|verify|confirm|check|update|restart|deploy|remove|delete|move|copy|push|pull|build|test)|i(?:'ll| will) (?:do|run|install|fix|try|apply|execute|now|clean|verify|check|update|restart|deploy)|(?:doing|running|installing|fixing|applying|trying|executing|cleaning|verifying) (?:that|this|it|up|them|those) (?:now|next)|(?:need|have|must|also need|still need) to (?:find|check|look|read|search|examine|trace|investigate|verify|confirm|test|run|install|fix|update|get|see|figure out|clean)[^.]*|let'?s (?:check|look|try|run|find|read|see|examine|verify|test|fix|clean|restart|deploy)|next step (?:is|will be)|worth (?:checking|looking|investigating)|about to (?:check|look|run|read)|time to (?:check|look|find|run))/i.test(lastSentence)
+                    || /:\s*$/.test(resp.trim());
                 if (!toolCalls.length && !isLegitimateStop && !parsedToolBlock) {
                     // Hard cap: if we've already nudged the max number of times, accept
                     // the response as-is rather than spinning forever.
-                    if (this.autoRetryCount >= this.effectiveMaxRetries) {
+                    // Exception: if the response ends with a clear planning statement ("Let me do that now"),
+                    // the model definitely intends to act — fire one bypass nudge regardless of retry count.
+                    if (this.autoRetryCount >= this.effectiveMaxRetries && !endsWithPlanningStatement) {
                         logInfo(`[agent] No-tool nudge suppressed — hit retry cap (${this.autoRetryCount}/${this.effectiveMaxRetries}), accepting response`);
                         break;
                     }
@@ -7345,6 +7437,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             post({ type: 'toolResult', id: toolId, name, success: false, preview: '(destructive command blocked -- user did not approve)' });
                             continue;
                         }
+                        // Destructive guard approval covers the run_command prompt too — don't ask twice.
+                        this._autoApprovedTools.add('run_command');
                     }
                 }
                 if (this._mergeMode && name === 'run_command') {
@@ -8839,7 +8933,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             const looksFinished = hasCompletionLanguage || isPureQA;
             // Track consecutive runs with no file writes to detect infinite auto-continue loops.
             // If the model has done 4+ auto-continue runs without writing any file, stop and ask the user.
-            const wroteFileThisRun = this._toolCallsThisRun.some(t => t.name === 'write_file' || t.name === 'edit_file' || t.name === 'edit_file_at_line');
+            // Count memory writes and run_command as "progress" so legitimate research/SSH/memory
+            // runs don't trip this counter — only pure stall loops with zero useful actions.
+            const wroteFileThisRun = this._toolCallsThisRun.some(t =>
+                t.name === 'write_file' || t.name === 'edit_file' || t.name === 'edit_file_at_line'
+                || t.name === 'memory_tier_write' || t.name === 'run_command'
+            );
             if (wroteFileThisRun) {
                 this._consecutiveNoWriteRuns = 0;
             } else {
@@ -8908,7 +9007,35 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             logInfo('[multi-plan] All steps complete');
         }
 
-        // â"€â"€ Deferred loop.done safety call â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        // ── Multi-item task list: auto-advance to next item ──────────────────────────
+        // When the user gave a list of unrelated tasks, advance to the next one after
+        // this item completes (whether via normal finish or turnLimit).
+        // Only advance if the run ended cleanly (not stopped by user) and there are items left.
+        if (!this._externalStop && this._pendingTaskItems.length > 0) {
+            const nextItem = this._pendingTaskItems.shift()!;
+            this._currentTaskItemIndex++;
+            const itemIdx = this._currentTaskItemIndex;
+            const totalItems = this._totalTaskItems;
+            logInfo(`[multi-task] Advancing to item ${itemIdx} of ${totalItems}: "${nextItem.slice(0, 80)}"`);
+            const nextModel = getConfig().model;
+            const progressNote = `[TASK ${itemIdx}/${totalItems}] ${nextItem}`;
+            setImmediate(() => {
+                if (this._externalStop) {
+                    logInfo('[multi-task] stop() called during task transition -- aborting');
+                    return;
+                }
+                this.run(progressNote, nextModel, post).catch(e => {
+                    logWarn(`[multi-task] Item ${itemIdx} failed: ${toErrorMessage(e)}`);
+                });
+            });
+        } else if (!this._externalStop && this._pendingTaskItems.length === 0 && this._totalTaskItems > 1 && this._currentTaskItemIndex === this._totalTaskItems) {
+            // All items in the multi-task list are done -- reset state
+            this._totalTaskItems = 0;
+            this._currentTaskItemIndex = 0;
+            logInfo('[multi-task] All task list items complete');
+        }
+
+        //â"€â"€ Deferred loop.done safety call â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         _loopExitReason = loopExhausted ? 'exhausted' : (this.stopRef.stop || this._externalStop) ? 'stop' : 'complete';
         _ensureStop();
     }
@@ -10847,6 +10974,15 @@ if errors:
                     }
                 }
 
+                // SSH root-scan guard (same rule as run_command): block `find /` in SSH commands.
+                if (/^\s*(ssh|scp|sftp)\b/i.test(cmd)) {
+                    const hasRootFindR = /\bfind\s+\/\s+/.test(cmd) || /\bfind\s+"\/"\s/.test(cmd) || /\bfind\s+'\/'\s/.test(cmd);
+                    if (hasRootFindR) {
+                        logWarn(`[ssh-root-scan-guard/shell_read] Blocked root filesystem scan: ${cmd.slice(0, 120)}`);
+                        return `[BLOCKED: SSH root filesystem scan]\n\nScanning the entire remote root filesystem with "find /" takes 60-120 seconds and produces unusably large output.\n\nSearch in specific directories instead:\n- find /etc /opt /var -name 'filename' 2>/dev/null\n- which program || find /usr/local /opt -name 'program*' -type f 2>/dev/null | head -10\n- systemctl show <service> --property=ExecStart\n\nDo NOT search from / -- use a known subdirectory.`;
+                    }
+                }
+
                 // Surface a visible note when the command intentionally sleeps.
                 { const sm = cmd.match(/\bsleep\s+(\d+)/); if (sm) { this.postFn({ type: 'commandChunk', id: _toolId, text: '[waiting ' + sm[1] + 's before checking again...]\n', stream: 'stderr' }); } }
 
@@ -11455,6 +11591,18 @@ if errors:
                     }
                 }
 
+                // SSH root-scan guard: block `find /` (bare root scan) in SSH commands.
+                // Scanning the root filesystem over SSH hangs for 60-120s and produces unusable output.
+                // Allow `find /etc`, `find /opt`, etc. -- only block scans starting at /.
+                if (/^\s*(ssh|scp|sftp)\b/i.test(cmd)) {
+                    const hasRootFind = /\bfind\s+\/\s+/.test(cmd) || /\bfind\s+"\/"\s/.test(cmd) || /\bfind\s+'\/'\s/.test(cmd);
+                    if (hasRootFind) {
+                        logWarn(`[ssh-root-scan-guard] Blocked root filesystem scan in SSH command: ${cmd.slice(0, 120)}`);
+                        this._guardEvents.push({ type: 'scope-guard', reason: 'SSH root filesystem scan', file: '' });
+                        return `[BLOCKED: SSH root filesystem scan]\n\nScanning the entire remote root filesystem with "find /" takes 60-120 seconds and produces unusably large output.\n\nInstead, search in specific directories:\n- Find a config file: ssh <host> "find /etc /opt /var -name 'sabnzbd.ini' 2>/dev/null"\n- Find an executable: ssh <host> "which sabnzbd || find /usr/local /opt -name 'sabnzbd*' -type f 2>/dev/null | head -10"\n- Find by service:   ssh <host> "systemctl show sabnzbd --property=ExecStart"\n\nDo NOT search from / -- use a known subdirectory (/etc, /opt, /var, /usr/local, /home/<user>, /srv).`;
+                    }
+                }
+
                 // In merge mode, Add-Content and Remove-Item are auto-approved (no user prompt needed)
                 const isMergeAutoApprove = this._mergeMode && (
                     /\bAdd-Content\b/i.test(cmd) || /\bRemove-Item\b/i.test(cmd)
@@ -11657,7 +11805,8 @@ if errors:
                 let output = `Semantic search results for "${query}" (${results.length} found):\n\n`;
                 results.forEach((entry, i) => {
                     const score = entry.relevanceScore ? ` (relevance: ${(entry.relevanceScore * 100).toFixed(0)}%)` : '';
-                    const tags = entry.tags && entry.tags.length ? ` [${entry.tags.join(', ')}]` : '';
+                    const _tagsArr2 = Array.isArray(entry.tags) ? entry.tags : (entry.tags ? [String(entry.tags)] : []);
+                    const tags = _tagsArr2.length ? ` [${_tagsArr2.join(', ')}]` : '';
                     output += `[${i + 1}] id=${entry.id} Tier ${entry.tier}${tags}${score}\n`;
                     output += `${entry.content}\n\n`;
                 });
@@ -12564,7 +12713,50 @@ ${sampleHtml}
         }
     }
 
-    // â"€â"€ SSH argument parser â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+    /**
+     * Parse a user message for a numbered or bulleted list of distinct tasks.
+     * Returns the items (trimmed) if 2+ items are found, otherwise [].
+     *
+     * Recognises:
+     *   1. Do X
+     *   2. Do Y        (numbered list)
+     *
+     *   - Do X
+     *   - Do Y         (hyphen/bullet list)
+     *
+     *   • Do X
+     *   • Do Y         (unicode bullet)
+     *
+     * Does NOT trigger for lists that are clearly sub-steps of a single task
+     * (very short items < 20 chars, or items that start with lowercase continuation words).
+     */
+    static parseMultiItemTaskList(msg: string): string[] {
+        const lines = msg.split('\n').map(l => l.trim()).filter(Boolean);
+
+        // Try numbered list: lines starting with "1.", "2.", etc.
+        const numberedItems: string[] = [];
+        for (const line of lines) {
+            const m = line.match(/^\d+[.)]\s+(.+)$/);
+            if (m) { numberedItems.push(m[1].trim()); }
+        }
+        if (numberedItems.length >= 2 && numberedItems.every(i => i.length >= 15)) {
+            return numberedItems;
+        }
+
+        // Try bulleted list: lines starting with -, *, or •
+        const bulletItems: string[] = [];
+        for (const line of lines) {
+            const m = line.match(/^[-*•]\s+(.+)$/);
+            if (m) { bulletItems.push(m[1].trim()); }
+        }
+        if (bulletItems.length >= 2 && bulletItems.every(i => i.length >= 15)) {
+            return bulletItems;
+        }
+
+        return [];
+    }
+
+    //â"€â"€ SSH argument parser â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     // Parse a shell command string into [executable, ...args] without invoking a
     // shell. This lets us spawn ssh/scp/sftp directly on Windows, bypassing
     // cmd.exe which doesn't understand single quotes and mangles forward slashes.

@@ -67,7 +67,7 @@ function stripToolBlocksFromText(text: string): string {
         result = result.slice(0, idx) + result.slice(endPos);
         pos = idx;
     }
-    result = result.replace(/<\/tool>/gi, '');
+    result = result.replace(/<\/tool(?:_call)?>/gi, '');
     // Strip <tool_edit>{...}</tool>, <tool_read>{...}</tool_read>, <tooledit>{...}</tooledit>, etc.
     result = result.replace(/<tool[\w_]+>[\s\S]*?<\/tool[\w_]*>/gi, '');
     result = result.replace(/<tool[\w_]+>[\s\S]*/gi, ''); // unclosed
@@ -76,6 +76,8 @@ function stripToolBlocksFromText(text: string): string {
     result = result.replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/gi, '');
     result = result.replace(/<\/?function_calls>/gi, '');
     result = result.replace(/<invoke(?:\s[^>]*)?>/gi, '').replace(/<\/invoke>/gi, '');
+    // Strip orphaned mixed-format tags (Qwen sometimes emits </parameter></function></tool_call>)
+    result = result.replace(/<\/?(?:parameter|function)>/gi, '');
     return result;
 }
 
@@ -833,14 +835,21 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     // Map: cmdId -> { cmd, outputBuf }
                     const _activeCmds = new Map<string, { cmd: string; outputBuf: string }>();
                     const trackedPost: PostFn = (m: object) => {
-                        // Intercept turnLimit: in normal mode override canAutoContinue→false so
-                        // the webview shows the "Keep going?" button instead of a spinner.
-                        // Trust/YOLO keeps canAutoContinue=true (spinner shown, auto-resumes).
+                        // Intercept turnLimit: always re-evaluate canAutoContinue based on trust level.
+                        // Normal mode → canAutoContinue=false (show "Keep going?" button).
+                        // Trust/YOLO → canAutoContinue=true (show "Continuing…" spinner, auto-resumes).
                         const _tlPm = m as { type: string; canAutoContinue?: boolean };
-                        if (_tlPm.type === 'turnLimit' && _tlPm.canAutoContinue) {
+                        if (_tlPm.type === 'turnLimit') {
                             const autoResuming = this._trustLevel === 'trust' || this._trustLevel === 'yolo';
                             if (runTab.id === this._activeTabId) {
                                 post({ ...(m as object), canAutoContinue: autoResuming });
+                            }
+                            // If Trust/YOLO is overriding a canAutoContinue:false from the agent,
+                            // synthesize the continueTask ourselves so the run actually resumes.
+                            // (The agent only emits continueTask when it decides canAutoContinue=true.)
+                            if (autoResuming && !_tlPm.canAutoContinue) {
+                                logInfo(`[provider] Trust/YOLO: synthesizing continueTask for agent-stopped turn limit`);
+                                trackedPost({ type: 'continueTask', prompt: 'keep going', model });
                             }
                             return;
                         }
@@ -941,7 +950,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 runTab.pendingMessage = {
                                     text:  continueText,
                                     model: continueModel,
-                                    raw:   { command: 'sendMessage', text: continueText, model: continueModel, includeFile: false, includeSelection: false },
+                                    raw:   { command: 'sendMessage', text: continueText, model: continueModel, trustLevel: this._trustLevel, includeFile: false, includeSelection: false },
                                 };
                             } else {
                                 // Normal mode: the turnLimit card already shows a "Keep going" button.

@@ -1023,7 +1023,8 @@ export class TieredMemoryManager {
             output += `\n## Tier ${tier}: ${this.getTierName(tier).toUpperCase()}\n\n`;
             
             entries.forEach((entry, i) => {
-                const tags = entry.tags && entry.tags.length ? ` [${entry.tags.join(', ')}]` : '';
+                const _tagsArr = Array.isArray(entry.tags) ? entry.tags : (entry.tags ? [String(entry.tags)] : []);
+                const tags = _tagsArr.length ? ` [${_tagsArr.join(', ')}]` : '';
                 const invalidFlag = entry.invalidated ? ' ⚠ INVALIDATED' : '';
                 const expiredFlag = (entry.validUntil && new Date(entry.validUntil).getTime() < Date.now()) ? ' ⚠ EXPIRED' : '';
                 output += `[${i + 1}] id=${entry.id}${tags}${invalidFlag}${expiredFlag} (accessed ${entry.accessCount}x, ${entry.createdAt.slice(0, 10)})\n`;
@@ -1049,10 +1050,21 @@ export class TieredMemoryManager {
 
     /** Read directly from workspaceState (only used for init and cache miss). */
     private readCoreFromStorage(): MemoryCore {
-        return this.context.workspaceState.get<MemoryCore>(
+        const core = this.context.workspaceState.get<MemoryCore>(
             TieredMemoryManager.STORAGE_KEY,
             this.emptyCore()
         );
+        // Normalize tags: old entries may have tags stored as a string instead of string[].
+        for (const tier of Object.values(core)) {
+            if (Array.isArray(tier)) {
+                for (const entry of tier as MemoryEntry[]) {
+                    if (entry.tags !== undefined && !Array.isArray(entry.tags)) {
+                        entry.tags = [String(entry.tags)];
+                    }
+                }
+            }
+        }
+        return core;
     }
 
     /** Get a deep copy of the core for write operations (safe to mutate). */

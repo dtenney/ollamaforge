@@ -1,4 +1,4 @@
-"""Generate VS Code Marketplace banner for OllamaPilot."""
+"""Generate VS Code Marketplace banner for Ollama Forge."""
 import argparse
 
 from PIL import Image, ImageDraw, ImageFont
@@ -36,7 +36,7 @@ except Exception:
     feature_font = title_font
 
 # Title
-title = "OllamaPilot"
+title = "Ollama Forge"
 bbox = draw.textbbox((0, 0), title, font=title_font)
 tw = bbox[2] - bbox[0]
 draw.text(((width - tw) // 2, 300), title, fill=text_color, font=title_font)

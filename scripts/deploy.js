@@ -6,7 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const extRoot = path.join(process.env.USERPROFILE, '.vscode/extensions/dtenney.ollamapilot-0.4.0');
+const extRoot = path.join(process.env.USERPROFILE, '.vscode/extensions/dtenney.ollamaforge-0.4.0');
 const srcRoot = path.join(__dirname, '..');
 
 // --- Copy bundled main.js ---
