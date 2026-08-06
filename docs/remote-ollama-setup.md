@@ -15,7 +15,7 @@ Connect Ollama Forge to an Ollama instance running on a dedicated server instead
 ┌─────────────────────┐         HTTP (LAN)         ┌─────────────────────────┐
 │  Dev Machine        │ ──────────────────────────► │  AI Server              │
 │  (Windows/Mac/Linux)│                             │  (Ubuntu + GPU)         │
-│                     │  ollamaForge.baseUrl:        │                         │
+│                     │  ollamaForge.serverUrl:        │                         │
 │  VS Code +          │  http://192.168.1.100:11434 │  Ollama                 │
 │  Ollama Forge        │                             │  RTX 3090/4090/5090     │
 │                     │ ◄────────────────────────── │  gemma4 / qwen3 / etc   │
@@ -77,7 +77,7 @@ In VS Code, set the remote URL:
 ```json
 // .vscode/settings.json (per-project)
 {
-  "ollamaForge.baseUrl": "http://192.168.1.100:11434"
+  "ollamaForge.serverUrl": "http://192.168.1.100:11434"
 }
 ```
 

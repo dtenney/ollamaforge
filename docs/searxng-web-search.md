@@ -182,7 +182,7 @@ sudo systemctl status searxng
 Then in VS Code:
 ```json
 {
-  "ollamaForge.baseUrl": "http://192.168.1.100:11434",
+  "ollamaForge.serverUrl": "http://192.168.1.100:11434",
   "ollamaForge.search.url": "http://192.168.1.100:8888"
 }
 ```
