@@ -7800,7 +7800,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             (this as any)._sshInlineNudgePending = false;
                             toolResult += `\n\n[NOTE: This worked, but inline ssh scripts are fragile and fail on BusyBox/ash targets. For anything beyond a short one-liner, prefer: write_file locally → scp to host → ssh host python3 /tmp/script.py. The script approach is easier to debug and retry.]`;
                         }
-                        post({ type: 'toolResult', id: toolId, name, success: true, preview: toolResult.slice(0, 400), fullResult: toolResult.slice(0, 8000) });
+                        // Detect tool-level error strings: tools that return "Error: ..." or
+                        // "Filtered: ..." or "Duplicate: ..." without throwing should still show ✗.
+                        const isToolErrorString = /^(?:Error|Filtered|Duplicate|content is required)\b/i.test(toolResult.trimStart());
+                        post({ type: 'toolResult', id: toolId, name, success: !isToolErrorString, preview: toolResult.slice(0, 400), fullResult: toolResult.slice(0, 8000) });
                         this.consecutiveFailures = 0;
                         this.autoRetryCount = 0; // Reset stall-retry budget after each tool call
                         batchToolsSucceeded++;
