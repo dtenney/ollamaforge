@@ -1096,24 +1096,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // ── Pre-warm model ───────────────────────────────────────────────────────
     // After a short delay, load the configured model into GPU memory so the
     // first real chat request responds without a cold-start penalty.
-    setTimeout(() => {
+    const preWarmTimer = setTimeout(() => {
         const cfg = getConfig();
         if (cfg.model) {
             logInfo(`[keep-alive] Pre-warming model: ${cfg.model}`);
             keepAliveModel(cfg.model);
         }
     }, 8_000); // 8s delay — let VS Code finish loading first
+    context.subscriptions.push({ dispose: () => clearTimeout(preWarmTimer) });
 
     // ── Auto-restore chat panel ──────────────────────────────────────────────
     // If the agent panel was visible when VS Code was last closed, re-focus it
     // automatically on the next startup so the user lands back in the same place.
     if (context.workspaceState.get<boolean>('ollamaForge.wasActive')) {
-        setTimeout(() => {
+        const restoreTimer = setTimeout(() => {
             vscode.commands.executeCommand('ollamaForge.chatView.focus').then(
                 () => logInfo('[restore] Chat panel re-focused after restart'),
                 (err) => logInfo(`[restore] Could not focus chat panel: ${err}`)
             );
         }, 1_500); // short delay — let the sidebar finish mounting first
+        context.subscriptions.push({ dispose: () => clearTimeout(restoreTimer) });
     }
 
     logInfo('Activated — view: ollamaForge.chatView');

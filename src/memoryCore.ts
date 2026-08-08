@@ -1108,10 +1108,14 @@ export class TieredMemoryManager {
         try {
             // Wait for previous lock with a 10s timeout so a hung background
             // save (e.g. embedding request that never returns) can't block the UI forever.
+            let timedOut = false;
             await Promise.race([
                 previousLock,
-                new Promise<void>(resolve => setTimeout(resolve, 10_000))
+                new Promise<void>(resolve => setTimeout(() => { timedOut = true; resolve(); }, 10_000))
             ]);
+            if (timedOut) {
+                logWarn('[memory] withLock: previous operation timed out after 10s — proceeding anyway');
+            }
             return await operation();
         } finally {
             releaseLock!();

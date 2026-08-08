@@ -2798,6 +2798,10 @@ export class Agent {
 
     /** Dispose all resources: managers, pending confirmations, child processes. */
     dispose(): void {
+        if (this._asyncHandles.size > 0) {
+            logWarn(`[agent] dispose(): discarding ${this._asyncHandles.size} in-flight async handle(s): ${[...this._asyncHandles.keys()].join(', ')}`);
+            this._asyncHandles.clear();
+        }
         this.diffViewManager.dispose();
         this.refactorManager.dispose();
         this.rejectPendingConfirmation();
