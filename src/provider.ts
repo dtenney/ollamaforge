@@ -533,6 +533,11 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
         this._messageListener?.dispose();
         this._messageListener = webviewView.webview.onDidReceiveMessage(async (raw: WebviewMsg) => {
+            // Guard: malformed message (missing or non-string command) — log and drop
+            if (!raw || typeof raw.command !== 'string') {
+                logWarn(`[webview→ext] Received malformed message: ${JSON.stringify(raw)}`);
+                return;
+            }
             // searchFiles fires on every keystroke — skip logging to avoid spam
             if (raw.command !== 'searchFiles') { logInfo(`[webview→ext] ${raw.command}`); }
 

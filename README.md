@@ -34,6 +34,25 @@ A 100% local AI coding agent for VS Code powered by Ollama. No telemetry, no int
 - [SearXNG](https://searxng.github.io/searxng/) for web search (fully self-hosted, no API key)
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) for image generation
 
+## Quick Start
+
+1. **Install Ollama** — download from [ollama.ai](https://ollama.ai) and run it
+2. **Pull a model** — in a terminal:
+   ```
+   ollama pull qwen2.5-coder:7b
+   ```
+   For larger machines (16GB+ VRAM): `ollama pull qwen3:14b`
+3. **Install Ollama Forge** — download `ollamaforge-<version>.vsix` from [Releases](https://github.com/dtenney/ollamaforge/releases), then:
+   ```
+   code --install-extension ollamaforge-<version>.vsix
+   ```
+4. **Open a project** in VS Code — the Ollama Forge icon appears in the sidebar
+5. **Configure the server** — if Ollama is on another machine, set `ollamaForge.serverUrl` in VS Code Settings (default: `http://localhost:11434`)
+6. **Select your model** from the dropdown at the top of the sidebar
+7. **Start chatting** — type a message, or open a file and ask the agent to explain or edit it
+
+That's it. No API keys, no accounts, no internet required.
+
 ## Installation
 
 1. Download `ollamaforge-<version>.vsix` from the [Releases](https://github.com/dtenney/ollamaforge/releases) page
@@ -51,6 +70,7 @@ A 100% local AI coding agent for VS Code powered by Ollama. No telemetry, no int
 
 See [docs/remote-ollama-setup.md](docs/remote-ollama-setup.md) for remote Ollama configuration.
 See [docs/searxng-web-search.md](docs/searxng-web-search.md) for web search setup.
+See [mcp.example.json](mcp.example.json) for MCP server configuration (filesystem, git, Postgres, sequential thinking, and more).
 
 ## Configuration
 
