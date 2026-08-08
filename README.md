@@ -40,7 +40,7 @@ A 100% local AI coding agent for VS Code powered by Ollama. No telemetry, no int
 2. In VS Code: **Extensions** → `...` → **Install from VSIX**
 3. Or via terminal:
    ```
-   code --install-extension ollamaforge-1.0.0.vsix
+   code --install-extension ollamaforge-<version>.vsix
    ```
 
 ## Setup
@@ -93,6 +93,20 @@ Access via the Command Palette (`Ctrl+Shift+P`):
 | `Ollama: Export Chat as Markdown` / `JSON` | Save the current chat session |
 | `Ollama: Export Agent Log for Review` | Export the agent's activity log |
 
+## Trust Levels
+
+The lock icon in the sidebar cycles through three modes that control how aggressively the agent acts without asking for confirmation.
+
+| Mode | Icon | Behavior |
+|---|---|---|
+| **Normal** | 🔒 | Every file edit and shell command requires your approval before it runs. Read-only tools (file reads, memory search, web search) are always auto-approved. |
+| **Trust** | 🔓 | File edits (`edit_file`, `write_file`) and shell commands (`run_command`) are auto-approved. The agent only pauses for genuinely destructive or ambiguous actions. Retry budget increases from 6 to 9 attempts per session. |
+| **YOLO** | ⚡ | All tools including destructive commands (`run_command_destructive`) are auto-approved. The agent runs fully autonomously end-to-end without stopping between steps. Retry budget increases to 12. Only use this when you trust the task fully. |
+
+**Per-tool approvals** — In Normal mode you can approve individual tools for the session ("Accept" on a confirmation prompt) or permanently ("Accept All"). These approvals persist across turns but are scoped: command tools (`run_command`, `run_command_destructive`) approved in Trust/YOLO mode are **not** carried into Normal mode.
+
+**Trust level persists per workspace** — your chosen level is saved in workspace state and restored when you reopen VS Code.
+
 ## Building from Source
 
 ```bash
@@ -102,6 +116,10 @@ npm install
 npm run bundle:prod
 npx vsce package
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 

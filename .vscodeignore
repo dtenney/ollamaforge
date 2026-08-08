@@ -64,7 +64,7 @@ dist/**
 # dist/highlight.bundle.js ← syntax highlighting vendor bundle
 # webview/**        ← chat UI (HTML + JS + vendor hljs)
 # images/**         ← logo, banner, sidebar icon, demo gif
-# docs/CHANGELOG.md ← user-facing release notes
+# CHANGELOG.md      ← user-facing release notes
 # package.json      ← manifest
 # README.md         ← Marketplace description
 # settings.example.json
