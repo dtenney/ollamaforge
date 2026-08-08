@@ -13,6 +13,8 @@ node_modules/**
 # Internal dev docs
 docs/internal/**
 CONTRIBUTING.md
+SECURITY.md
+.editorconfig
 MANUAL_TESTS.md
 CODE_REVIEW.md
 GAP_ANALYSIS.md
