@@ -1472,7 +1472,8 @@ function addTurnLimitCard(text, canAutoContinue, longSession) {
         doneHtml = `<div class="tl-done">${items}</div>`;
     }
 
-    const isMidTask = !!hintLine || doneLines.length > 0;
+    const hasRealSteps = doneLines.some(l => /^\s+\[ok\]/.test(l));
+    const isMidTask = !!hintLine || hasRealSteps;
     const actionHtml = canAutoContinue
         ? `<span class="tl-status tl-continuing">Continuing…</span>`
         : isMidTask

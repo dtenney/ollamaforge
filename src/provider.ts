@@ -650,7 +650,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     }
                     // Guard: Ollama is offline — block send and show actionable error
                     if (!model || model === 'No models') {
-                        post({ type: 'error', text: '⚠ Ollama is not running. Start it with `ollama serve`, then reload.' });
+                        post({ type: 'error', text: '⚠ No models available. Check that Ollama is running on the configured server (ollamaForge.serverUrl) and that models are loaded, then reload.' });
                         break;
                     }
                     // Resume-intent detection: if user says "continue"/"keep going"/etc.

@@ -28,7 +28,7 @@ VIBE_CODING_DESIGN.md
 SYNERGY_AUDIT.md
 CONTEXT_MANAGEMENT_TODO.md
 PYTHON_TOOLING_TODO.md
-.ollamapilot/**
+.ollamaforge/**
 
 # Build artefacts
 *.vsix

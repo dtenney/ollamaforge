@@ -6,7 +6,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const extRoot = path.join(process.env.USERPROFILE, '.vscode/extensions/dtenney.ollamaforge-0.4.0');
+const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+const extRoot = path.join(process.env.USERPROFILE, `.vscode/extensions/dtenney.ollamaforge-${pkg.version}`);
 const srcRoot = path.join(__dirname, '..');
 
 // --- Copy bundled main.js ---
