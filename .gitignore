@@ -5,3 +5,6 @@ coverage/
 
 # Ollama Forge runtime data (graphs, cache, memory) — machine-local, not for git
 .ollamaforge/
+
+# AI assistant local settings — machine-specific paths and credentials
+.claude/
