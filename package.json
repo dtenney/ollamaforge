@@ -45,7 +45,8 @@
     "test": "npm run compile && vscode-test",
     "test:unit": "npm run compile && mocha dist/test/unit/**/*.test.js",
     "test:harness": "npm run compile && mocha --require dist/test/vscode-mock.js --timeout 30000 dist/test/unit/agentHarness.test.js",
-    "test:coverage": "npm run compile && nyc mocha dist/test/unit/**/*.test.js"
+    "test:coverage": "npm run compile && nyc mocha dist/test/unit/**/*.test.js",
+    "self-check": "node scripts/self-check.js"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
