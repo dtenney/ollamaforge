@@ -10,7 +10,7 @@ TypeScript / Node.js VS Code Extension
 
 ## Entry Points
 
-- `src/extension.ts` — VS Code activation, command registration, view providers
+- `src/main.ts` — VS Code activation, command registration, view providers
 - `src/agent.ts` — core agent loop, tool execution, prompt construction
 - `webview/webview.html` + `webview/webview.js` — chat UI
 
@@ -40,7 +40,7 @@ npm run bundle:prod
 
 ```
 src/
-├── extension.ts           # Activation, command wiring, view providers
+├── main.ts              # Activation, command wiring, view providers
 ├── agent.ts               # Agent loop, tool definitions, prompt builder
 ├── provider.ts            # Webview message handler, chat session glue
 ├── config.ts              # Settings schema, model presets, getConfig()
