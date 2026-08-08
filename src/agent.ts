@@ -8948,7 +8948,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // or when the agent used zero tools this whole run AND produced a long standalone
             // answer (pure Q&A, not a mid-task status update).
             const usedToolsThisRun = this._toolCallsThisRun.length > 0;
-            const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|ready (?:to|for)|awaiting (?:your|hardware|next))\b/i.test(lastAssistantText);
+            const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|ready (?:to|for)|awaiting (?:your|hardware|next)|session (?:complete|done|finished|summary)|reach out (?:when|if)|nothing else to (?:act|do|work)|let me know (?:when|if)|(?:here|this) (?:concludes|completes|wraps))\b/i.test(lastAssistantText);
             // Pure Q&A detection: zero tools used + response is substantial (>400 chars = real answer, not a status note)
             // A short text-only turn mid-task ("Checking now...") should still auto-continue.
             const isPureQA = !usedToolsThisRun && !lastToolCall && lastAssistantText.length > 400;
