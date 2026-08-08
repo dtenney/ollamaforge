@@ -8953,29 +8953,31 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // A short text-only turn mid-task ("Checking now...") should still auto-continue.
             const isPureQA = !usedToolsThisRun && !lastToolCall && lastAssistantText.length > 400;
             const looksFinished = hasCompletionLanguage || isPureQA;
-            // Track consecutive runs with no file writes to detect infinite auto-continue loops.
-            // If the model has done 4+ auto-continue runs without writing any file, stop and ask the user.
-            // Count memory writes and run_command as "progress" so legitimate research/SSH/memory
-            // runs don't trip this counter — only pure stall loops with zero useful actions.
-            const wroteFileThisRun = this._toolCallsThisRun.some(t =>
+            // Track consecutive runs with no meaningful progress to detect infinite auto-continue loops.
+            // "Progress" = any tool that changes state or actively investigates (file writes, commands,
+            // shell reads, web fetches, memory writes). Only pure no-op turns (zero tools, or only
+            // passive reads with no forward motion) increment the stall counter.
+            const madeProgressThisRun = this._toolCallsThisRun.some(t =>
                 t.name === 'write_file' || t.name === 'edit_file' || t.name === 'edit_file_at_line'
                 || t.name === 'memory_tier_write' || t.name === 'run_command'
+                || t.name === 'shell_read' || t.name === 'web_search' || t.name === 'web_fetch'
+                || t.name === 'run_command_pip' || t.name === 'run_command_destructive'
             );
-            if (wroteFileThisRun) {
+            if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
             } else {
                 this._consecutiveNoWriteRuns++;
             }
             const tooManyNoWriteRuns = this._consecutiveNoWriteRuns >= 4;
             if (tooManyNoWriteRuns) {
-                logInfo(`[agent] Suppressing auto-continue: ${this._consecutiveNoWriteRuns} consecutive runs with no file writes`);
+                logInfo(`[agent] Suppressing auto-continue: ${this._consecutiveNoWriteRuns} consecutive runs with no progress`);
             }
             const canAutoContinue = !looksFinished && !this._externalStop && !tooManyNoWriteRuns;
             if (canAutoContinue) {
                 // Leave the footer blank — provider decides whether to auto-continue (trust/yolo)
                 // or show a "Keep going?" prompt (normal). The turnLimit card handles the UX.
             } else if (tooManyNoWriteRuns) {
-                summaryLines.push(`\nStopped: ${this._consecutiveNoWriteRuns} consecutive runs without writing any files. The model may be stuck planning. Try: "write the file now" or describe the specific file to create.`);
+                summaryLines.push(`\nStopped after ${this._consecutiveNoWriteRuns} consecutive turns with no tool use. The model may be reasoning in circles. Try: "keep going" to resume, or be more specific about the next step.`);
             } else {
                 summaryLines.push(`\nTo continue, describe what to do next or say "keep going".`);
             }
