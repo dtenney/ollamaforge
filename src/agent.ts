@@ -5412,7 +5412,17 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // Pull last assistant message snippet as "last action"
                     const lastAsstMsg = this.history.filter(m => m.role === 'assistant' && typeof m.content === 'string' && (m.content as string).trim().length > 20).slice(-1)[0];
                     if (lastAsstMsg) {
-                        const snippet = (lastAsstMsg.content as string).replace(/<tool>[\s\S]*?<\/tool>/g, '').trim().slice(0, 200);
+                        const snippet = (lastAsstMsg.content as string)
+                            // Strip well-formed tool call blocks
+                            .replace(/<tool>[\s\S]*?<\/tool>/g, '')
+                            // Strip malformed/truncated tool fragments (open tag without close, or broken JSON inside)
+                            .replace(/<tool>[\s\S]*/g, '')
+                            // Strip [SYSTEM:...] injections that may have been appended to assistant turns
+                            .replace(/\[SYSTEM:[\s\S]*?\]/g, '')
+                            // Strip think blocks
+                            .replace(/<think>[\s\S]*?<\/think>/g, '')
+                            .trim()
+                            .slice(0, 200);
                         if (snippet) { compactSummaryLines.push(`**Last action:** ${snippet}`); }
                     }
                     compactSummaryLines.push(`*(${messagesRemoved} old message${messagesRemoved !== 1 ? 's' : ''} removed -- continuing from here)*`);
@@ -8905,7 +8915,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
 
             // What may still be open -- infer from last tool call and assistant message
             const lastAssistant = [...this.history].reverse().find(m => m.role === 'assistant');
-            const lastAssistantText = typeof lastAssistant?.content === 'string' ? lastAssistant.content : '';
+            const lastAssistantText = (typeof lastAssistant?.content === 'string' ? lastAssistant.content : '')
+                .replace(/<tool>[\s\S]*?<\/tool>/g, '')
+                .replace(/<tool>[\s\S]*/g, '')
+                .replace(/\[SYSTEM:[\s\S]*?\]/g, '')
+                .replace(/<think>[\s\S]*?<\/think>/g, '')
+                .trim();
             const openItemMatch = lastAssistantText.match(/(?:still need|next step|todo|remaining|not yet done|now (?:fixing|checking|updating))[^\n.]{0,120}/i);
             if (openItemMatch) {
                 summaryLines.push(`\n**Still open:** ${openItemMatch[0].trim()}`);
