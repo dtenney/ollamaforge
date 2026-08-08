@@ -18,7 +18,7 @@
             "name": "Unit Tests",
             "type": "node",
             "request": "launch",
-            "program": "${workspaceFolder}/node_modules/.bin/mocha",
+            "program": "${workspaceFolder}/node_modules/mocha/bin/mocha.js",
             "args": [
                 "--require", "dist/test/vscode-mock.js",
                 "--ignore", "dist/test/unit/agentHarness.test.js",
@@ -37,7 +37,7 @@
             "name": "Agent Harness Tests",
             "type": "node",
             "request": "launch",
-            "program": "${workspaceFolder}/node_modules/.bin/mocha",
+            "program": "${workspaceFolder}/node_modules/mocha/bin/mocha.js",
             "args": [
                 "--require", "dist/test/vscode-mock.js",
                 "--timeout", "30000",

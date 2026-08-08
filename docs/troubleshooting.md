@@ -52,9 +52,9 @@ The agent has a per-session tool-call limit (6 in Normal, 9 in Trust, 12 in YOLO
 
 **"Qdrant not reachable"** or embedding failures:
 
-1. Check Qdrant is running:
+1. Check Qdrant is running (replace `<host>` with your Qdrant host):
    ```
-   curl http://192.168.0.29:6333/healthz
+   curl http://<host>:6333/healthz
    ```
 2. Verify `ollamaForge.memory.qdrantUrl` points to the correct host/port
 3. Check `ollamaForge.memory.embeddingUrl` points to your Ollama instance (not a bare hostname — must include `http://` and port)
