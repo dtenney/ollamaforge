@@ -4,6 +4,9 @@
 
 # Ollama Forge
 
+[![CI](https://github.com/dtenney/ollamaforge/actions/workflows/ci.yml/badge.svg)](https://github.com/dtenney/ollamaforge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.txt)
+
 A 100% local AI coding agent for VS Code powered by Ollama. No telemetry, no internet required, no subscriptions.
 
 ## Features
@@ -71,6 +74,7 @@ That's it. No API keys, no accounts, no internet required.
 See [docs/remote-ollama-setup.md](docs/remote-ollama-setup.md) for remote Ollama configuration.
 See [docs/searxng-web-search.md](docs/searxng-web-search.md) for web search setup.
 See [mcp.example.json](mcp.example.json) for MCP server configuration (filesystem, git, Postgres, sequential thinking, and more).
+See [docs/troubleshooting.md](docs/troubleshooting.md) for common issues (connection errors, cold-start, memory, web search).
 
 ## Configuration
 

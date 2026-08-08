@@ -1,0 +1,38 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      dev-tooling:
+        patterns:
+          - "typescript"
+          - "mocha"
+          - "sinon"
+          - "@types/*"
+          - "esbuild"
+          - "@vscode/*"
+          - "nyc"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # better-sqlite3 and tree-sitter ship native binaries — major bumps
+      # need manual testing against the packaged .node files in dist/
+      - dependency-name: "better-sqlite3"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tree-sitter"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tree-sitter-typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tree-sitter-python"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
