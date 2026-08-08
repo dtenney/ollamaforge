@@ -43,9 +43,9 @@
     "package": "npm run compile && npx vsce package",
     "vscode:prepublish": "npm run bundle:prod",
     "test": "npm run compile && vscode-test",
-    "test:unit": "npm run compile && mocha --require dist/test/vscode-mock.js --ignore dist/test/unit/agentHarness.test.js dist/test/unit/**/*.test.js",
-    "test:harness": "npm run compile && mocha --require dist/test/vscode-mock.js --timeout 30000 dist/test/unit/agentHarness.test.js",
-    "test:coverage": "npm run compile && nyc mocha --require dist/test/vscode-mock.js dist/test/unit/**/*.test.js",
+    "test:unit": "npm run compile && mocha --require dist/test/vscode-mock.js --ignore \"dist/test/unit/agentHarness.test.js\" \"dist/test/unit/**/*.test.js\"",
+    "test:harness": "npm run compile && mocha --require dist/test/vscode-mock.js --timeout 30000 \"dist/test/unit/agentHarness.test.js\"",
+    "test:coverage": "npm run compile && nyc mocha --require dist/test/vscode-mock.js \"dist/test/unit/**/*.test.js\"",
     "self-check": "node scripts/self-check.js"
   },
   "devDependencies": {
