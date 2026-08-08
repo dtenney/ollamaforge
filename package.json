@@ -1,7 +1,7 @@
 {
   "name": "ollamaforge",
   "displayName": "Ollama Forge",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Local AI coding agent powered by Ollama — memory, code graph, autonomous agent, MCP support. 100% local, no telemetry, no internet required.",
   "publisher": "dtenney",
   "author": {
