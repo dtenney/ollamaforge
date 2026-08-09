@@ -9266,8 +9266,10 @@ If the code looks correct, respond with exactly: OK`;
             // â"€â"€ edit_file â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'edit_file': {
                 let rel              = String(args.path ?? '');
-                const oldString      = String(args.old_string ?? '');
-                const newString      = String(args.new_string ?? '');
+                // Normalize CRLF in both strings — LLMs sometimes embed \r\n in JSON args,
+                // causing old_string to not match file content that has pure \n line endings.
+                const oldString      = String(args.old_string ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                const newString      = String(args.new_string ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
                 const forceOverwrite = Boolean(args.force_overwrite);
 
                 // Strip markdown bold markers from path arg (but not Python __dunder__ names)
@@ -9954,7 +9956,10 @@ If the code looks correct, respond with exactly: OK`;
                 if ((rel.startsWith('"') && rel.endsWith('"')) || (rel.startsWith("'") && rel.endsWith("'"))) {
                     rel = rel.slice(1, -1).trim();
                 }
-                const content = String(args.content ?? '');
+                // Normalize line endings: LLMs sometimes emit \r\n in JSON strings,
+                // which causes mixed-ending files that break Python string matching and
+                // diff tools. Normalize to \n unconditionally for all written files.
+                const content = String(args.content ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
                 const doBackup = args.backup !== false;
 
                 if (!rel)     { throw new Error('path is required'); }
@@ -10205,7 +10210,8 @@ if errors:
                 const startLine  = Math.round(Number(args.start_line ?? 0));
                 const endLine    = Math.round(Number(args.end_line ?? 0));
                 // Accept new_string as an alias for new_content (models sometimes confuse the param name)
-                const newContent = String(args.new_content ?? args.new_string ?? '');
+                // Normalize CRLF so inserted lines don't introduce mixed endings.
+                const newContent = String(args.new_content ?? args.new_string ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
                 if (!rel2)        { throw new Error('path is required'); }
                 if (!startLine)   { throw new Error('start_line is required'); }

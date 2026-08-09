@@ -1,0 +1,30 @@
+# Force LF line endings in the repo and on checkout.
+# This overrides core.autocrlf=true for this repository so that files
+# on disk match what's in the repo — no silent CRLF conversion that
+# breaks Python string matching and diff tools.
+* text=auto eol=lf
+
+# Explicitly mark text files
+*.ts    text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.py    text eol=lf
+*.sh    text eol=lf
+*.env   text eol=lf
+
+# Binary files — no line-ending conversion
+*.vsix  binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.eot   binary
+*.node  binary
