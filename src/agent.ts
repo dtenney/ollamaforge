@@ -1294,6 +1294,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Dependency/install spirals: stop at 3.** If you are installing dependencies one at a time and each install either fails or reveals another missing dependency, STOP after 3 rounds. Do not keep chasing the chain. Instead: (1) collect the full list of what failed, (2) check if there is a bulk install script or requirements file you haven't tried, (3) search the web for the known incompatibility (e.g. "package X Python 3.13"), (4) tell the user exactly what is blocking and ask whether to continue or switch approach. Never install more than 3 packages in a row without re-validating that the root import now works.
 **Configuration spirals: stop at 2.** If you write a config file and the service fails to start or rejects it twice, do NOT keep tweaking the config from memory or guesswork. Stop immediately, fetch the official documentation or a working example from the web (web_search or web_fetch the GitHub README/docs), and only rewrite the config once you have confirmed the correct format from a real source.
 **One question at a time.** If you must ask the user something, ask the single most important question. Never ask for information you can discover yourself with a tool.
+**Clean up temp scripts when done.** Any helper scripts you wrote to accomplish the task (files in scripts/, /tmp/, or named like stage_*.py, check_*.py, fix_*.py, validate_*.py, migrate_*.py, convert_*.py) are temporary. Delete them with run_command before declaring the task complete, unless the user explicitly asked you to keep the script.
 
 ## File editing
 - New file or full rewrite (<30 lines): write_file.
@@ -9063,6 +9064,35 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         }
 
         //â"€â"€ Deferred loop.done safety call â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        // ── Auto-cleanup: delete temp scripts written this run ───────────────────────────────────
+        // Any helper script the agent created to accomplish the task is ephemeral.
+        // Delete it automatically so the workspace isn't littered after the session ends.
+        // Skip if the user explicitly asked to keep scripts.
+        const keepScriptKeywords = /\b(save|keep|don'?t delete|preserve|reuse|rerun)\b/i;
+        const userWantsToKeep = keepScriptKeywords.test(this._currentTaskMessage ?? '');
+        if (!userWantsToKeep && !this._externalStop && this._runOutcome === 'done') {
+            // Match: files in scripts/ or tmp/, or named like stage_*.py / check_*.py / fix_*.py etc.
+            const tempScriptPattern = /^(?:scripts\/|tmp\/|\/tmp\/).*\.(py|sh|bash|js|ps1)$|(?:^|\/)(?:stage_\d+_|check_|fix_|validate_|migrate_|convert_|test_|clean_|sync_|fetch_|update_|generate_)[^/]+\.(py|sh|bash|js|ps1)$/i;
+            const deleted: string[] = [];
+            for (const rel of this._filesChangedThisRun) {
+                const relFwd = rel.replace(/\\/g, '/');
+                if (!tempScriptPattern.test(relFwd)) { continue; }
+                try {
+                    const abs = path.isAbsolute(rel) ? rel : path.join(this.workspaceRoot, rel);
+                    if (fs.existsSync(abs)) {
+                        fs.unlinkSync(abs);
+                        deleted.push(relFwd);
+                        logInfo(`[cleanup] Deleted temp script: ${relFwd}`);
+                    }
+                } catch (e) {
+                    logWarn(`[cleanup] Failed to delete temp script ${rel}: ${toErrorMessage(e)}`);
+                }
+            }
+            if (deleted.length > 0) {
+                post({ type: 'chunk', content: `\n\n*Cleaned up ${deleted.length} temp script${deleted.length > 1 ? 's' : ''}: ${deleted.join(', ')}*` });
+            }
+        }
+
         _loopExitReason = loopExhausted ? 'exhausted' : (this.stopRef.stop || this._externalStop) ? 'stop' : 'complete';
         _ensureStop();
     }
