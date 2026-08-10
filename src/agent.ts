@@ -1295,6 +1295,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Configuration spirals: stop at 2.** If you write a config file and the service fails to start or rejects it twice, do NOT keep tweaking the config from memory or guesswork. Stop immediately, fetch the official documentation or a working example from the web (web_search or web_fetch the GitHub README/docs), and only rewrite the config once you have confirmed the correct format from a real source.
 **One question at a time.** If you must ask the user something, ask the single most important question. Never ask for information you can discover yourself with a tool.
 **Clean up temp scripts when done.** Any helper scripts you wrote to accomplish the task (files in scripts/, /tmp/, or named like stage_*.py, check_*.py, fix_*.py, validate_*.py, migrate_*.py, convert_*.py) are temporary. Delete them with run_command before declaring the task complete, unless the user explicitly asked you to keep the script.
+**Don't run long scripts — hand them to the user.** Before running a Python script with run_command, ask yourself: will this finish in under 60 seconds? If it crawls files (os.walk, glob **), reads large datasets (pd.read_csv, iterrows), makes network calls in a loop (requests, paramiko, scp), or touches a large database (cursor.execute over many rows), it will timeout. Instead: (1) tell the user the script is ready and give them the exact command to run themselves, OR (2) add a --limit N flag and run only a small sample to verify it works, then hand the full run to the user. Never silently let a long-running script time out and then retry it.
 
 ## File editing
 - New file or full rewrite (<30 lines): write_file.
@@ -8230,9 +8231,36 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             const isTimeout = toolResult.includes('timed out after');
                             if (isTimeout) {
                                 const isPythonScript = /^\s*python3?\s+\S+\.py\b/.test(cmdStr);
-                                nudge = isPythonScript
-                                    ? `The script timed out (exit -1, no output). It hung silently -- a subprocess inside it (likely scp or ssh) is waiting for a password or host-key prompt that never comes. Do NOT re-run the script. Instead:\n1. Read the script to find which subprocess call has no timeout arg\n2. Add timeout=30 to each subprocess.run() call\n3. Print stderr: capture_output=True, then print(result.stderr) on failure\n4. Then run the script again -- you will see the real error message.`
-                                    : `The command timed out after ${toolResult.includes('120') ? '120' : '60'}s with no output. It is hanging waiting for input or a connection. Do NOT retry the same command. Diagnose: run a simpler version of the command with a short explicit timeout, or check if a password prompt is blocking it.`;
+                                // Try to read the script to distinguish a long-running data script
+                                // (os.walk, pd.read_csv, DB cursor, network loop) from a hung subprocess.
+                                let timedOutScriptSrc = '';
+                                if (isPythonScript) {
+                                    try {
+                                        const tScriptMatch = cmdStr.match(/^\s*python3?\s+([\S]+\.py)/);
+                                        const tScriptRel = tScriptMatch?.[1];
+                                        if (tScriptRel) {
+                                            const tScriptAbs = path.isAbsolute(tScriptRel) ? tScriptRel : path.join(this.workspaceRoot, tScriptRel);
+                                            timedOutScriptSrc = fs.readFileSync(tScriptAbs, 'utf8');
+                                        }
+                                    } catch { /* ignore */ }
+                                }
+                                const shutil_or_archive_re = /shutil\.copy|shutil\.move|shutil\.copytree|tarfile|zipfile\.ZipFile/i;
+                                const isLongRunningDataScript = timedOutScriptSrc && (
+                                    /\bos\.walk\s*\(|glob\.\w+\(.*\*\*|scandir|listdir.*for\b/i.test(timedOutScriptSrc)
+                                    || /\bpd\.read_csv|pd\.read_excel|\.iterrows\(\)|\.itertuples\(\)/i.test(timedOutScriptSrc)
+                                    || /\bcursor\.execute|session\.query|\.bulk_|executemany/i.test(timedOutScriptSrc)
+                                    || shutil_or_archive_re.test(timedOutScriptSrc)
+                                );
+                                const hasNetworkLoop = timedOutScriptSrc && /for\b.+in\b.+:\s*\n(?:[\s\S]{0,80}\n){0,5}[\s\S]{0,80}(?:requests\.|urllib|paramiko|scp|sftp)/i.test(timedOutScriptSrc);
+                                if (isLongRunningDataScript || hasNetworkLoop) {
+                                    // This is a bulk data/network script that genuinely needs minutes.
+                                    // Hand control back to the user with a copy-paste command.
+                                    nudge = `The script timed out because it's processing a large dataset or making many network calls — this is expected and the script is likely correct.\n\nDo NOT retry. Tell the user:\n"This script will take several minutes. Please run it yourself when ready:\n\`${cmdStr.trim()}\`\n\nI'll continue preparing anything else while you do."\n\nDo not modify the script. Do not re-run it.`;
+                                } else {
+                                    nudge = isPythonScript
+                                        ? `The script timed out (exit -1, no output). It hung silently -- a subprocess inside it (likely scp or ssh) is waiting for a password or host-key prompt that never comes. Do NOT re-run the script. Instead:\n1. Read the script to find which subprocess call has no timeout arg\n2. Add timeout=30 to each subprocess.run() call\n3. Print stderr: capture_output=True, then print(result.stderr) on failure\n4. Then run the script again -- you will see the real error message.`
+                                        : `The command timed out after ${toolResult.includes('120') ? '120' : '60'}s with no output. It is hanging waiting for input or a connection. Do NOT retry the same command. Diagnose: run a simpler version of the command with a short explicit timeout, or check if a password prompt is blocking it.`;
+                                }
                             } else if (this._mergeMode && /\bAdd-Content\b/i.test(cmdStr)) {
                                 this._mergeConsecutiveEditFailures = (this._mergeConsecutiveEditFailures ?? 0) + 1;
                                 nudge = `Add-Content failed (exit 1). The here-string likely has quoting issues. Try wrapping the content differently, or use a temp file approach. Do NOT delete the source file yet -- the content was NOT appended.`;
@@ -11677,6 +11705,62 @@ if errors:
                 );
                 const accepted = isMergeAutoApprove || isAutoApprovedCmd || await this.requestConfirmation('run', cmd, 'run_command');
                 if (!accepted) { return 'Command cancelled by user.'; }
+
+                // ── Long-running script pre-flight guard ──────────────────────────────────
+                // Detect scripts that are likely to run longer than the 60s hard timeout
+                // (data migrations, full-corpus crawls, bulk syncs, backups).
+                // Instead of blocking silently, ask the user to run manually and give the
+                // exact command, or offer a small-sample dry-run the agent CAN execute.
+                {
+                    const isPythonRun = /^\s*python3?\s+\S+\.py\b/.test(cmd);
+                    if (isPythonRun) {
+                        // Try to read the script to count rows/items or detect long-running patterns
+                        const scriptPathMatch = cmd.match(/^\s*python3?\s+([\S]+\.py)/);
+                        const scriptRel = scriptPathMatch?.[1];
+                        if (scriptRel) {
+                            let scriptSrc = '';
+                            try {
+                                const scriptAbs = path.isAbsolute(scriptRel)
+                                    ? scriptRel
+                                    : path.join(root, scriptRel);
+                                scriptSrc = fs.readFileSync(scriptAbs, 'utf8');
+                            } catch { /* unreadable — skip guard */ }
+
+                            if (scriptSrc) {
+                                // Signals the script will take a very long time:
+                                // - processes a large file or entire directory tree
+                                // - has no --limit / --dry-run / --sample argument
+                                // - does network I/O in a loop (requests, urllib, paramiko, scp)
+                                // - does heavy DB work (thousands of rows, full-table scans)
+                                // - bulk archive / compression / export patterns
+                                const hasLongRunningPattern =
+                                    /\bos\.walk\s*\(|glob\.\w+\(.*\*\*|scandir|listdir.*for\b/i.test(scriptSrc)
+                                    || /for\b.+in\b.+:\s*\n(?:[\s\S]{0,40}\n){0,3}[\s\S]{0,40}(?:requests\.|urllib|subprocess|paramiko|scp|sftp)/i.test(scriptSrc)
+                                    || /\bpd\.read_csv|pd\.read_excel|\.iterrows\(\)|\.itertuples\(\)/i.test(scriptSrc)
+                                    || /\bcursor\.execute|session\.query|\.bulk_|executemany/i.test(scriptSrc)
+                                    || /shutil\.copy|shutil\.move|shutil\.copytree|tarfile|zipfile\.ZipFile/i.test(scriptSrc);
+
+                                const hasSampleMode =
+                                    /\b(--limit|--dry.?run|--sample|--max|--count|DRY_RUN|LIMIT|SAMPLE)\b/i.test(scriptSrc);
+
+                                // Also detect large explicit item counts in the task message
+                                const taskMsg = this._currentTaskMessage ?? '';
+                                const bigCountMatch = taskMsg.match(/\b(\d{3,})\s*(file|row|record|item|host|server|device|image|url)/i);
+                                const impliedLargeScope = bigCountMatch && parseInt(bigCountMatch[1]) > 50;
+
+                                if (hasLongRunningPattern && !hasSampleMode) {
+                                    const scriptBasename = path.basename(scriptRel);
+                                    const cmdToCopy = cmd.trim();
+                                    logWarn(`[long-run-guard] Script "${scriptBasename}" looks long-running and has no --limit/--dry-run mode`);
+                                    return `[LONG-RUNNING SCRIPT — not executed]\n\nThe script "${scriptBasename}" performs bulk operations (file crawl / network loop / database scan) that will likely exceed the 60-second timeout.\n\nOptions:\n1. **Run it yourself**: copy and paste this command into your terminal:\n   \`${cmdToCopy}\`\n\n2. **Test with a small sample first**: I can add a \`--limit N\` flag (e.g. \`--limit 10\`) so the script processes only the first 10 items. Say "add a --limit flag" and I'll modify the script.\n\n3. **Background run**: If you want me to kick it off and move on, say "run it anyway" and I'll execute it (it may time out).\n\nWhat would you like to do?`;
+                                } else if (impliedLargeScope && /requests\.|urllib|subprocess|scp|sftp|ssh/i.test(scriptSrc)) {
+                                    const cmdToCopy = cmd.trim();
+                                    return `[LONG-RUNNING SCRIPT — not executed]\n\nThe task mentions ${bigCountMatch![1]} ${bigCountMatch![2]}s and the script makes network calls in a loop. Processing this many items will take several minutes.\n\nPlease run this yourself when ready:\n   \`${cmdToCopy}\`\n\nAlternatively, say "run the first 10 only" and I'll add a --limit flag.`;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Surface a visible note when the command intentionally sleeps,
                 // so the user sees "waiting 30s..." instead of a frozen spinner.
