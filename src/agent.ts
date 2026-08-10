@@ -5533,23 +5533,28 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 let _spiralBuf = '';
                 let _spiralAborted = false;
                 let _inToolBlock = false; // track whether we're streaming inside a <tool>...</tool> block
+                let _toolOpenCount = 0;   // incremental counter -- avoids rescanning full buffer each token
+                let _toolCloseCount = 0;
+                let _spiralCheckCounter = 0; // throttle: only run expensive checks every N tokens
+                const SPIRAL_CHECK_INTERVAL = 8; // check every 8 tokens (~50-100 chars at typical token size)
                 const checkSpiralMidStream = (text: string): boolean => {
                     if (_spiralAborted) { return true; }
                     _spiralBuf += text;
 
-                    // Track whether we're inside a <tool> block -- tool argument content
-                    // (config files, markdown, lists) legitimately contains repeated lines
-                    // and must never trigger the spiral abort.
-                    const fullSoFar = _spiralBuf;
-                    const openCount = (fullSoFar.match(/<tool>/g) ?? []).length;
-                    const closeCount = (fullSoFar.match(/<\/tool>/g) ?? []).length;
-                    _inToolBlock = openCount > closeCount;
+                    // Track <tool> depth incrementally instead of rescanning the whole buffer.
+                    if (text.includes('<tool>'))  { _toolOpenCount  += (text.match(/<tool>/g)  ?? []).length; }
+                    if (text.includes('</tool>')) { _toolCloseCount += (text.match(/<\/tool>/g) ?? []).length; }
+                    _inToolBlock = _toolOpenCount > _toolCloseCount;
                     if (_inToolBlock) { return false; }
 
                     // Wait for enough model-generated content before checking -- tool output
                     // echoed in the first ~1000 chars can contain repeated tokens in filenames
                     // (e.g. "handshake_partial.220_partial.220...") and must not trigger abort.
                     if (_spiralBuf.length < 800) { return false; }
+
+                    // Throttle: run expensive checks only every SPIRAL_CHECK_INTERVAL tokens.
+                    if ((++_spiralCheckCounter % SPIRAL_CHECK_INTERVAL) !== 0) { return false; }
+
                     // Check for inline repetition only in the tail -- avoids false-positives on
                     // tool-result data echoed near the start of the response.
                     const tail = _spiralBuf.slice(-600);

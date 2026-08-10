@@ -219,6 +219,11 @@ export function streamChatRequest(
                 const REPETITION_THRESHOLD = 6;     // times seen in content = abort
                 const THINK_REPETITION_PHRASE = 60; // longer phrase for thinking -- model restates plan in slightly varied ways
                 const THINK_REPETITION_THRESHOLD = 8; // more occurrences needed in thinking before abort
+                // Throttle repetition/spiral checks — running them every token burns CPU.
+                // A loop manifests over hundreds of chars, so checking every 10 tokens is plenty.
+                let _repCheckCounter = 0;
+                let _thinkCheckCounter = 0;
+                const REP_CHECK_INTERVAL = 10;
 
                 // Hard cap on thinking block size — prevents list-continuation spirals
                 // (e.g. "27. Check ... 28. Check ... 29. Check ...") that evade phrase detection.
@@ -372,7 +377,7 @@ export function streamChatRequest(
                                 // Thinking block guards: repetition, list spiral, hard size cap
                                 // Disabled for sub-agent calls (e.g. critic) that legitimately
                                 // include code in their thinking when reviewing a file.
-                                if (!resolved && !options?.disableThinkingGuards) {
+                                if (!resolved && !options?.disableThinkingGuards && (++_thinkCheckCounter % REP_CHECK_INTERVAL) === 0) {
                                     const thinkingLoop = isRepeating(fullThinking, THINK_REPETITION_PHRASE, THINK_REPETITION_THRESHOLD);
                                     const thinkingSpiral = !thinkingLoop && isListSpiral(fullThinking);
                                     const thinkingOverflow = fullThinking.length > MAX_THINKING_CHARS;
@@ -452,8 +457,10 @@ export function streamChatRequest(
                                     const lastToolClose = fullContent.lastIndexOf('</tool>');
                                     insideToolBlock = lastToolOpen > lastToolClose;
                                 }
-                                // Repetition guard: abort stream if model enters a token loop
-                                if (!resolved && !insideToolBlock && isRepeating(fullContent)) {
+                                // Repetition guard: abort stream if model enters a token loop.
+                                // Throttled to every REP_CHECK_INTERVAL tokens — a true loop takes
+                                // hundreds of chars to manifest, so checking every token is wasteful.
+                                if (!resolved && !insideToolBlock && (++_repCheckCounter % REP_CHECK_INTERVAL) === 0 && isRepeating(fullContent)) {
                                     logWarn(`[stream] Repetition loop detected after ${fullContent.length} chars — aborting stream`);
                                     resolved = true;
                                     stopRef.stop = true;
