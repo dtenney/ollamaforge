@@ -5538,7 +5538,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 let _toolOpenCount = 0;   // incremental counter -- avoids rescanning full buffer each token
                 let _toolCloseCount = 0;
                 let _spiralCheckCounter = 0; // throttle: only run expensive checks every N tokens
-                const SPIRAL_CHECK_INTERVAL = 8; // check every 8 tokens (~50-100 chars at typical token size)
+                const SPIRAL_CHECK_INTERVAL = 25; // check every 25 tokens (~150 chars) — reduce CPU during streaming
                 const checkSpiralMidStream = (text: string): boolean => {
                     if (_spiralAborted) { return true; }
                     _spiralBuf += text;

@@ -223,7 +223,11 @@ export function streamChatRequest(
                 // A loop manifests over hundreds of chars, so checking every 10 tokens is plenty.
                 let _repCheckCounter = 0;
                 let _thinkCheckCounter = 0;
-                const REP_CHECK_INTERVAL = 10;
+                const REP_CHECK_INTERVAL = 30; // every 30 tokens (~150 chars) — loops take hundreds of chars to manifest
+
+                // Hoist once-per-request checks out of the per-check isListSpiral hot path.
+                const PROCUREMENT_RE = /\b(url|link|purchase|procure|buy|order|amazon|aliexpress|shop|price|cost)\b/i;
+                const _isProcurementTask = messages.some(m => m.role === 'user' && PROCUREMENT_RE.test(typeof m.content === 'string' ? m.content : ''));
 
                 // Hard cap on thinking block size — prevents list-continuation spirals
                 // (e.g. "27. Check ... 28. Check ... 29. Check ...") that evade phrase detection.
@@ -263,10 +267,8 @@ export function streamChatRequest(
                     // pre-action planning spirals that never resolve to a tool call.
                     // Exempt: thinking contains a concrete file path — model has identified its target and is about to act.
                     const hasConcreteTarget = /scripts\/\w+\.(py|sh|js|ts)\b|loot\/\w+|\.ollamaforge\//.test(thinking);
-                    // Procurement/shopping tasks legitimately enumerate many search targets (find URLs for 15 items).
-                    // Check ALL user messages (not just last) — context trimming may move the procurement request earlier.
-                    const PROCUREMENT_RE = /\b(url|link|purchase|procure|buy|order|amazon|aliexpress|shop|price|cost)\b/i;
-                    const isProcurementTask = messages.some(m => m.role === 'user' && PROCUREMENT_RE.test(typeof m.content === 'string' ? m.content : ''));
+                    // isProcurementTask hoisted above — computed once per request, not per check.
+                    const isProcurementTask = _isProcurementTask;
                     const nums = [...tail.matchAll(/^\s*(\d+)\.\s+/mg)].map(m => parseInt(m[1]));
                     if (nums.length >= 10 && !hasConcreteTarget && !isProcurementTask) {
                         let consecutive = 0;
@@ -293,7 +295,11 @@ export function streamChatRequest(
                     // Triggered when 5+ checkbox items appear in the tail AND similar items appeared
                     // earlier in thinking (i.e. the model is cycling through the same list again).
                     const tailCheckboxLines = [...tail.matchAll(/^\s*[-*]?\s*\[[ xX]\]\s+.+/gm)];
-                    const earlyCheckboxLines = [...thinking.slice(0, -1200).matchAll(/^\s*[-*]?\s*\[[ xX]\]\s+.+/gm)];
+                    // Only scan early thinking for checkboxes when the tail already has enough — avoids
+                    // an expensive full-buffer matchAll on every check when there's nothing to compare.
+                    const earlyCheckboxLines = tailCheckboxLines.length >= 5
+                        ? [...thinking.slice(0, -1200).matchAll(/^\s*[-*]?\s*\[[ xX]\]\s+.+/gm)]
+                        : [];
                     if (tailCheckboxLines.length >= 5 && earlyCheckboxLines.length >= 5 && !hasConcreteTarget) {
                         logWarn('[stream] isListSpiral: pattern 1d (checkbox checklist re-enumeration)');
                         return true;
