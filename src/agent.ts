@@ -7442,9 +7442,17 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     // explicit user confirmation before execution -- regardless of
                     // merge mode or auto-approval. The user must see what will be
                     // deleted and consciously approve it.
-                    const isDestructiveCmd = /(?:^|[;&|])\s*rm\s+(?!-[a-z]*r[a-z]*\s+\/(?!home|Users|tmp)\b)|\brm\s+-[a-z]*f\b|\brmdir\b|\btruncate\b|\bshred\b|\bdel\s+\/[fqs]/i.test(cmdStr0)
+                    // Read-only commands that can never be destructive — exempt before regex
+                    // matching to prevent false positives (e.g. "du -sh ... 2>/dev/null" was
+                    // triggering the redirect-to-data-file heuristic).
+                    const isReadOnlyCmd = /^\s*(du|df|ls|ll|dir|cat|head|tail|grep|find|stat|file|wc|diff|echo|pwd|id|who|uptime|uname|hostname|ps|top|lsof|netstat|ss|ifconfig|ping)\b/i.test(cmdStr0)
+                        || /\bssh\b[^"]*"\s*(du|df|ls|cat|head|tail|grep|find|stat|wc|diff|echo|ps|lsof|netstat|ss|ifconfig)\b/i.test(cmdStr0);
+
+                    const isDestructiveCmd = !isReadOnlyCmd && (
+                        /(?:^|[;&|])\s*rm\s+(?!-[a-z]*r[a-z]*\s+\/(?!home|Users|tmp)\b)|\brm\s+-[a-z]*f\b|\brmdir\b|\btruncate\b|\bshred\b|\bdel\s+\/[fqs]/i.test(cmdStr0)
                         || /\bRemove-Item\b|\bClear-Content\b/i.test(cmdStr0)
-                        || />\s*[\w\\/:.]+\.(db|sqlite|sqlite3|json|csv|log|conf|cfg|env)\b/.test(cmdStr0); // overwrite redirect to data file
+                        || /(?<![0-9])>\s*[\w\\/:.]+\.(db|sqlite|sqlite3|json|csv|log|conf|cfg|env)\b/.test(cmdStr0) // overwrite redirect, not 2>/dev/null
+                    );
                     if (isDestructiveCmd && !this._isToolApproved('run_command_destructive')) {
                         logInfo(`[destructive-guard] Destructive command requires confirmation: ${cmdStr0.slice(0, 80)}`);
                         const confirmed = await this.requestConfirmation(
