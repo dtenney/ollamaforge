@@ -2991,10 +2991,22 @@ export class Agent {
         // Summarize dropped messages -- structured extraction instead of vague 2-sentence summary
         if (removedCount >= 2) {
             const dropped = this.history.slice(0, removedCount);
-            const summaryText = dropped
+            const allDroppedText = dropped
                 .filter(m => m.role === 'user' || m.role === 'assistant')
                 .map(m => `${m.role}: ${m.content.slice(0, 500)}`)
                 .join('\n');
+
+            // Bias the summary input toward recent dropped messages — the newest context
+            // is most important for knowing what to do next after compaction.
+            // Strategy: take up to 1500 chars from the oldest dropped content (task origin)
+            // and up to 4500 chars from the newest dropped content (recent progress).
+            const HEAD_CHARS = 1500;
+            const TAIL_CHARS = 4500;
+            const summaryText = allDroppedText.length <= HEAD_CHARS + TAIL_CHARS
+                ? allDroppedText
+                : allDroppedText.slice(0, HEAD_CHARS)
+                    + '\n...[middle omitted — focusing on recent context]...\n'
+                    + allDroppedText.slice(-TAIL_CHARS);
 
             if (summaryText.trim()) {
                 try {
@@ -3008,16 +3020,17 @@ export class Agent {
                                     'You are a context extractor. Extract structured facts from this conversation.',
                                     'Output ONLY a JSON object with these keys (omit any key with an empty value):',
                                     '  task: string -- one sentence describing what was being worked on',
+                                    '  next_step: string -- the single most important thing to do next; be specific (e.g. "Edit src/foo.ts line 42 to fix the null check")',
+                                    '  pending_items: string[] -- remaining items not yet done, in order of priority',
                                     '  files_confirmed: string[] -- real file paths that were found and confirmed correct',
                                     '  files_ruled_out: string[] -- stub files, wrong paths, files that do not exist',
                                     '  decisions: string[] -- key decisions made (e.g. "column already exists, skip adding it")',
                                     '  edits_made: string[] -- describe each successful file edit',
                                     '  blockers: string[] -- anything that failed or was unclear',
-                                    '  next_step: string -- what should happen next if the task is not done',
                                     'Output ONLY the JSON. No explanation, no markdown fences.',
                                 ].join('\n'),
                             },
-                            { role: 'user', content: summaryText.slice(0, 6000) },
+                            { role: 'user', content: summaryText },
                         ],
                         [],
                         (token) => { rawSummary += token; onToken?.(token); },
@@ -3031,8 +3044,14 @@ export class Agent {
                         if (jsonMatch) { structured = JSON.parse(jsonMatch[0]); }
                     } catch { /* fall through to plain summary */ }
 
+                    // next_step and pending_items lead — they're what the agent needs most
+                    // immediately after compaction to continue without losing direction.
                     const lines: string[] = ['[Earlier conversation summary]'];
                     if (structured.task) { lines.push(`Task: ${structured.task}`); }
+                    if (structured.next_step) { lines.push(`⚡ Next step: ${structured.next_step}`); }
+                    if (Array.isArray(structured.pending_items) && structured.pending_items.length) {
+                        lines.push(`Pending: ${(structured.pending_items as string[]).join(' | ')}`);
+                    }
                     if (Array.isArray(structured.files_confirmed) && structured.files_confirmed.length) {
                         lines.push(`Files confirmed: ${(structured.files_confirmed as string[]).join(', ')}`);
                     }
@@ -3045,7 +3064,6 @@ export class Agent {
                     if (Array.isArray(structured.edits_made) && structured.edits_made.length) {
                         lines.push(`Edits made: ${(structured.edits_made as string[]).join(' | ')}`);
                     }
-                    if (structured.next_step) { lines.push(`Next step: ${structured.next_step}`); }
                     if (Array.isArray(structured.blockers) && structured.blockers.length) {
                         lines.push(`Blockers: ${(structured.blockers as string[]).join(' | ')}`);
                     }
