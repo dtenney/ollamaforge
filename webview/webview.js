@@ -24,7 +24,6 @@ const welcomeEl        = /** @type {HTMLDivElement}     */ (document.getElementB
 const promptEl         = /** @type {HTMLTextAreaElement} */ (document.getElementById('prompt'));
 const sendBtn          = /** @type {HTMLButtonElement}  */ (document.getElementById('send-btn'));
 const stopBtn          = /** @type {HTMLButtonElement}  */ (document.getElementById('stop-btn'));
-const newChatBtn       = /** @type {HTMLButtonElement}  */ (document.getElementById('new-chat-btn'));
 const presetSelect     = /** @type {HTMLSelectElement}  */ (document.getElementById('preset-select'));
 const modelSelect      = /** @type {HTMLSelectElement}  */ (document.getElementById('model-select'));
 const trustSelect      = /** @type {HTMLSelectElement}  */ (document.getElementById('trust-select'));
@@ -2422,12 +2421,6 @@ sendBtn.addEventListener('click', sendMessage);
 stopBtn.addEventListener('click', () => {
     vscode.postMessage({ command: 'stopGeneration' });
     setStreaming(false);
-});
-
-newChatBtn.addEventListener('click', () => {
-    if (streaming) { return; }
-    vscode.postMessage({ command: 'newChat' });
-    clearChat();
 });
 
 promptEl.addEventListener('keydown', (e) => {
