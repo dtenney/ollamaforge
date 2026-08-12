@@ -14632,9 +14632,27 @@ ${sampleHtml}
     }
 
     private friendlyError(raw: string): string {
-        if (raw.includes('ECONNREFUSED')) { return 'Ollama is not running. Run: ollama serve'; }
-        if (raw.includes('timed out'))    { return 'Request timed out. The model may be loading or overloaded.'; }
-        if (raw.includes('404'))          { return 'Model not found. Run: ollama pull <model-name>'; }
+        if (raw.includes('ECONNREFUSED')) { return 'Ollama is not running. Run: `ollama serve`'; }
+        if (raw.includes('timed out'))    { return 'Request timed out — the model may be loading or Ollama is overloaded. Try again in a moment.'; }
+        if (raw.includes('404'))          { return 'Model not found on the Ollama server. Run: `ollama pull <model-name>`'; }
+        // HTTP 500 — extract the inner error message from the JSON body if present
+        if (raw.includes('HTTP 500')) {
+            try {
+                const jsonStart = raw.indexOf('{');
+                if (jsonStart >= 0) {
+                    const parsed = JSON.parse(raw.slice(jsonStart));
+                    const inner: string = parsed.error ?? parsed.message ?? '';
+                    if (inner.includes('llama-server binary not found')) {
+                        return '⚠ Ollama server error: the llama-server binary is missing on the host. The Ollama installation is incomplete or was updated without rebuilding.\n\nOn the server, run:\n```\nsystemctl stop ollama\ncurl -fsSL https://ollama.com/install.sh | sh\nsystemctl start ollama\n```';
+                    }
+                    if (inner.includes('error starting llama-server') || inner.includes('llama-server')) {
+                        return `⚠ Ollama server error: could not start the model runner.\n\n${inner}`;
+                    }
+                    if (inner) { return `⚠ Ollama server error: ${inner}`; }
+                }
+            } catch { /* fall through to raw */ }
+            return `⚠ Ollama returned an error (HTTP 500). Check the Ollama service on your server — it may need to be restarted or reinstalled.`;
+        }
         return raw;
     }
 
