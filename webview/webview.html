@@ -593,6 +593,7 @@
       border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
       background: var(--vscode-sideBar-background, #1e1e1e);
       padding: 7px 10px 8px;
+      position: relative; /* anchor for absolutely-positioned commands panel */
     }
     #input-box {
       background: var(--vscode-input-background, #3c3c3c);
@@ -1233,12 +1234,18 @@
 
     /* ── Commands panel ──────────────────────────────────────────────────── */
     #commands-panel {
+      position: absolute;
+      bottom: 100%;   /* opens upward above the input container */
+      left: 10px;
+      right: 10px;
       background: var(--vscode-editorSuggestWidget-background, #252526);
       border: 1px solid var(--vscode-editorSuggestWidget-border, #454545);
       border-radius: 5px;
       margin-bottom: 4px;
-      overflow: hidden;
+      max-height: 320px;
+      overflow-y: auto;
       box-shadow: 0 -4px 12px rgba(0,0,0,0.35);
+      z-index: 100;
     }
     #commands-panel-header {
       font-size: 10px;
