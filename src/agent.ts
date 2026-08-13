@@ -1301,7 +1301,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 ## File editing
 - New file or full rewrite (<30 lines): write_file.
 - Modify any existing file (any type -- .py, .ts, .scad, .yaml, .json, .html, .css, etc.): call read_file first. Use the exact content returned by read_file as the basis for old_string in edit_file, or as the basis for write_file content. Never write from memory -- not for any file type.
-- edit_file fails: the tool result includes the relevant file section automatically. Use the line numbers shown and switch to edit_file_at_line. Do not retry edit_file with a different old_string guess.
+- edit_file fails: the tool result includes the relevant file section automatically. Use the line numbers shown and switch to edit_file_at_line. Do not retry edit_file with a different old_string guess. NEVER write a Python script to make file edits — use write_file with the full corrected content instead.
 - After writing any source file: verify syntax once -- Python: "python3 -m py_compile <file>"; TypeScript/JS: "tsc --noEmit"; OpenSCAD: "openscad -o /tmp/check.stl <file>"; other types: use get_diagnostics. Fix any error before moving on. Do NOT re-verify the same file if you already verified it this session.
 - OpenSCAD internal threads: bore at MAJOR_R using difference(), then OUTSIDE the difference block union annular ridge cylinders at MINOR_R. NEVER place thread rings inside difference() -- they will be subtracted (removed), not added. Pattern: \`difference() { cube([...]); translate([cx,cy,cz]) rotate([0,90,0]) cylinder(h=depth+1, r=MAJOR_R, center=true); }\` then separately \`for (i=[0:n-1]) { translate([cx, cy, cz_i]) rotate([0,90,0]) cylinder(h=pitch*0.55, r=MINOR_R, center=true); }\` where MINOR_R < MAJOR_R and the ridge cylinders sit inside the bore.
 - Merging files: copy ACTUAL method bodies verbatim from the source file. Do NOT use placeholder comments like "# Implementation from X.py" or bare pass statements. Read the source first, copy real code.
@@ -2126,8 +2126,10 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
         } else {
             // Brace counting failed — JSON string not closed. This happens when Qwen emits
             // mixed-format output like: <tool>{"name":"run_command","arguments":{"command":"ssh ... </parameter></function></tool_call>
-            // Try to recover using </tool_call>, </function>, or </parameter> as end boundaries.
-            const altEnds = ['</tool_call>', '</function>', '</parameter>'].map(t => text.indexOf(t, jsonStart)).filter(i => i !== -1);
+            // Also happens when write_file content contains unescaped quotes in Python f-strings
+            // which fool the inString tracker and cause early exit with braceCount !== 0.
+            // Try to recover using </tool>, </tool_call>, </function>, or </parameter> as end boundaries.
+            const altEnds = ['</tool>', '</tool_call>', '</function>', '</parameter>'].map(t => text.indexOf(t, jsonStart)).filter(i => i !== -1);
             if (altEnds.length > 0) {
                 const altEnd = Math.min(...altEnds);
                 const raw = text.slice(jsonStart, altEnd).trim();
@@ -2194,6 +2196,31 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
         }
     }
     
+    // Handle <function=toolname> <parameter=key> value </parameter> ... </function> format.
+    // Some models (e.g. qwen3 drifting) emit this OpenAI-style function call format.
+    if (calls.length === 0) {
+        const FUNC_RE = /<function=(\w+)>([\s\S]*?)<\/function>/gi;
+        const PARAM_RE = /<parameter=(\w+)>([\s\S]*?)<\/parameter>/gi;
+        let fm: RegExpExecArray | null;
+        while ((fm = FUNC_RE.exec(text)) !== null) {
+            const toolName = fm[1];
+            const body = fm[2];
+            const args: Record<string, unknown> = {};
+            let pm: RegExpExecArray | null;
+            PARAM_RE.lastIndex = 0;
+            while ((pm = PARAM_RE.exec(body)) !== null) {
+                const key = pm[1];
+                const val = pm[2].trim();
+                // Try to parse as JSON, fall back to raw string
+                try { args[key] = JSON.parse(val); } catch { args[key] = val; }
+            }
+            addCall({ name: toolName, arguments: args }, '<function=> format');
+        }
+        if (calls.length > 0) {
+            logInfo(`[parseTextToolCalls] Recovered ${calls.length} tool call(s) from <function=> format`);
+        }
+    }
+
     // Last resort: detect bare "tool_name {json_args}" or "tool_name {"key": ...}" lines
     // This catches when the model writes e.g. `run_command {"command": "mkdir app/routes"}` as plain text
     if (calls.length === 0) {
@@ -2553,12 +2580,16 @@ export class Agent {
     private readonly MAX_FILE_EDIT_FAILURES = 3;
     /** Files where edit_file is hard-blocked after too many failures -- model must use write_file */
     private _editFileHardBlocked = new Set<string>();
-    /** Track the new_string of the last successful edit per file -- used to detect revert-and-redo spirals */
+    /** Track the new_string of the last successful edit per file -- used to detect revert-and-redo spirals.
+     *  Capped at 200 entries (oldest evicted) to prevent unbounded growth in long sweep sessions. */
     private _lastEditNewStringByFile = new Map<string, string>();
     private _lastEditOldStringByFile = new Map<string, string>();
+    private readonly MAX_EDIT_STRING_CACHE = 200;
     /** Source files validated by an external build/compile/export tool this session.
-     *  Edits to these files are soft-blocked until the user requests a change. */
+     *  Edits to these files are soft-blocked until the user requests a change.
+     *  Capped at 200 entries to prevent unbounded growth. */
     private _validatedSourceFiles = new Set<string>();
+    private readonly MAX_VALIDATED_FILES = 200;
     /** Track files that have been read this session via shell_read or cat -- used to enforce read-before-edit.
      *  Capped at 500 entries (oldest evicted) to prevent unbounded growth in long sessions. */
     private _filesReadThisSession = new Set<string>();
@@ -2581,6 +2612,28 @@ export class Agent {
             if (first !== undefined) { this._filesReadThisSession.delete(first); }
         }
         this._filesReadThisSession.add(path);
+    }
+
+    /** Record last edit strings for a file, evicting oldest entries when the cap is reached. */
+    private _trackEditStrings(normPath: string, newString: string, oldString: string): void {
+        if (this._lastEditNewStringByFile.size >= this.MAX_EDIT_STRING_CACHE) {
+            const first = this._lastEditNewStringByFile.keys().next().value;
+            if (first !== undefined) {
+                this._lastEditNewStringByFile.delete(first);
+                this._lastEditOldStringByFile.delete(first);
+            }
+        }
+        this._lastEditNewStringByFile.set(normPath, newString);
+        this._lastEditOldStringByFile.set(normPath, oldString);
+    }
+
+    /** Add a file to the validated sources set, evicting the oldest entry when the cap is reached. */
+    private _trackValidatedSource(normPath: string): void {
+        if (this._validatedSourceFiles.size >= this.MAX_VALIDATED_FILES) {
+            const first = this._validatedSourceFiles.values().next().value;
+            if (first !== undefined) { this._validatedSourceFiles.delete(first); }
+        }
+        this._validatedSourceFiles.add(normPath);
     }
 
     /** Track consecutive turns where model produced tool-call-like output but nothing could be parsed.
@@ -3107,7 +3160,10 @@ export class Agent {
         if (!this._lastFileOp) { return null; }
         const op = this._lastFileOp;
         this._lastFileOp = null;
-        const full = path.resolve(this.workspaceRoot, op.path);
+        // Re-validate path even though it was checked when stored — defense in depth.
+        let full: string;
+        try { full = this.safePath(this.workspaceRoot, op.path); }
+        catch { return null; }
         try {
             if (op.action === 'created') {
                 if (fs.existsSync(full)) { fs.unlinkSync(full); }
@@ -8040,7 +8096,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             const reason = fileFailCount >= this.MAX_FILE_EDIT_FAILURES
                                 ? `You have made ${fileFailCount} failed edit_file attempts on "${args.path}" with different old_string values.`
                                 : `You have tried to edit "${args.path}" with the same old_string ${editFailCount} times and it keeps failing.`;
-                            const editHint = `${reason}\n\nThe file content was already shown below on your first failure. Use those exact lines as old_string, or switch to write_file to rewrite the file entirely after reading it with read_file.${sweepHint}`;
+                            const editHint = `${reason}\n\nThe file content was already shown below on your first failure. Use those exact lines as old_string, or switch to write_file to rewrite the file entirely after reading it with read_file. DO NOT write a Python script to make this edit — use write_file directly with the full corrected file content.${sweepHint}`;
                             logWarn(`[agent] edit_file failure threshold reached (${editFailCount}x same-sig, ${fileFailCount}x file) on "${args.path}" -- hard-blocking`);
                             this._editFileHardBlocked.add(filePath);
                             if (isTextMode) {
@@ -9341,7 +9397,7 @@ If the code looks correct, respond with exactly: OK`;
 
                 // Soft-redirect: if this file has had too many edit_file failures, suggest write_file
                 if (!forceOverwrite && this._editFileHardBlocked.has(rel.replace(/\\/g, '/'))) {
-                    return `edit_file has failed repeatedly on "${rel}". Use write_file instead: call read_file to get the current content, then write_file with the complete corrected content.`;
+                    return `edit_file has failed repeatedly on "${rel}". Use write_file instead: call read_file to get the current content, then write_file with the complete corrected content. DO NOT write a Python script to work around this — write_file is the correct fallback.`;
                 }
 
                 // Validated-source-file guard: if this file was successfully compiled/exported this
@@ -9521,8 +9577,7 @@ If the code looks correct, respond with exactly: OK`;
                                     this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                                     this.postFn({ type: 'fileChanged', path: rel, action: 'edited' });
                                     if (!this._filesChangedThisRun.includes(rel)) { this._filesChangedThisRun.push(rel); }
-                                    this._lastEditNewStringByFile.set(rel.replace(/\\/g, '/'), newString);
-                                    this._lastEditOldStringByFile.set(rel.replace(/\\/g, '/'), oldString);
+                                    this._trackEditStrings(rel.replace(/\\/g, '/'), newString, oldString);
                                     const editResult2 = `Edited: ${rel} -- ${oldLines.length} line(s) replaced (indentation auto-corrected)`;
                                     const editDiags2 = this.getDiagnostics(root, rel);
                                     if (editDiags2 !== 'No errors or warnings found.') {
@@ -9697,8 +9752,7 @@ If the code looks correct, respond with exactly: OK`;
                 this._readOnlyTurnsSinceLastEdit = 0;
                 this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                 // Track new_string and old_string for revert-spiral detection
-                this._lastEditNewStringByFile.set(rel.replace(/\\/g, '/'), newString);
-                this._lastEditOldStringByFile.set(rel.replace(/\\/g, '/'), oldString);
+                this._trackEditStrings(rel.replace(/\\/g, '/'), newString, oldString);
                 // Editing a validated file means the content changed -- clear the validation
                 this._validatedSourceFiles.delete(rel.replace(/\\/g, '/'));
                 this.postFn({ type: 'fileChanged', path: rel, action: 'edited' });
@@ -10601,9 +10655,9 @@ if errors:
                                 this.runShellRead(cmd, root, `${_toolId}_gc_retry${ri}`, gcPerCmdLimit)
                             )
                         );
-                        // Patch the settled array with the retry results
+                        // Patch the settled array with the retry results (copy once, outside the loop)
+                        gcSettled = [...gcSettled] as typeof gcSettled;
                         rerunSlots.forEach(({ idx }, ri) => {
-                            gcSettled = [...gcSettled] as typeof gcSettled;
                             (gcSettled as PromiseSettledResult<string>[])[idx] = rerunResults[ri];
                         });
                     }
@@ -10663,8 +10717,26 @@ if errors:
                 let rfPath: string;
                 try {
                     rfPath = this.safePath(this.workspaceRoot, rfPathRaw);
-                } catch (e) {
-                    return `[read_file] Access denied: ${e instanceof Error ? e.message : String(e)}`;
+                } catch {
+                    // Path is outside the workspace — resolve it absolutely and check if it is an
+                    // OS-protected location (hard block) or a regular external file (ask user).
+                    const rfAbsolute = path.resolve(this.workspaceRoot, rfPathRaw);
+                    if (Agent.isOsProtectedPath(rfAbsolute)) {
+                        return `[read_file] Access denied: "${rfPathRaw}" is in an OS-protected directory and cannot be read.`;
+                    }
+                    // SSH paths and remote URIs are not local paths — skip the prompt.
+                    const isRemote = /^[a-z][a-z0-9+\-.]*:\/\//i.test(rfPathRaw);
+                    if (!isRemote) {
+                        const approved = await this.requestConfirmation(
+                            'read_outside_workspace',
+                            `Read file outside workspace: \`${rfAbsolute}\`\n\nThis file is not inside the workspace root. Allow?`,
+                            'read_file_outside'
+                        );
+                        if (!approved) {
+                            return `[read_file] Access denied: user did not allow reading "${rfPathRaw}" (outside workspace).`;
+                        }
+                    }
+                    rfPath = rfAbsolute;
                 }
                 logInfo(`[read_file] workspaceRoot=${this.workspaceRoot} | raw=${rfPathRaw} | resolved=${rfPath}`);
                 try {
@@ -11108,6 +11180,44 @@ if errors:
 
                 // Surface a visible note when the command intentionally sleeps.
                 { const sm = cmd.match(/\bsleep\s+(\d+)/); if (sm) { this.postFn({ type: 'commandChunk', id: _toolId, text: '[waiting ' + sm[1] + 's before checking again...]\n', stream: 'stderr' }); } }
+
+                // ── Out-of-workspace read guard ──────────────────────────────────────────
+                // If the command reads a local absolute path outside the workspace, ask the
+                // user for permission. SSH commands are exempt — the remote host enforces its
+                // own access controls and blocking them here would break SSH workflows.
+                {
+                    const isSshShellRead = /^\s*(ssh|scp|sftp)\b/i.test(cmd);
+                    if (!isSshShellRead) {
+                        // Extract the first absolute path argument from common read commands
+                        // (cat, head, tail, grep, less, wc, diff, stat, file).
+                        const absPathMatch = cmd.match(/(?:^|\s)["']?(\/[^\s"'|;&>]+|[A-Za-z]:\\[^\s"'|;&>]+)["']?/);
+                        if (absPathMatch) {
+                            const candidatePath = absPathMatch[1].replace(/\\/g, '/');
+                            const candidateNorm = candidatePath.toLowerCase();
+                            const rootNorm = (process.platform === 'win32'
+                                ? this.workspaceRoot.toLowerCase()
+                                : this.workspaceRoot).replace(/\\/g, '/');
+                            const rootNormWithSep = rootNorm.endsWith('/') ? rootNorm : rootNorm + '/';
+                            const isOutsideWorkspace = candidateNorm !== rootNorm && !candidateNorm.startsWith(rootNormWithSep);
+                            if (isOutsideWorkspace) {
+                                if (Agent.isOsProtectedPath(candidatePath)) {
+                                    return `[shell_read] Access denied: "${candidatePath}" is in an OS-protected directory.`;
+                                }
+                                if (!this._isToolApproved('shell_read_outside')) {
+                                    logInfo(`[shell_read] Out-of-workspace read requires confirmation: ${candidatePath}`);
+                                    const approved = await this.requestConfirmation(
+                                        'read_outside_workspace',
+                                        `Read outside workspace: \`${candidatePath}\`\n\nThis path is not inside the workspace root. Allow?`,
+                                        'shell_read_outside'
+                                    );
+                                    if (!approved) {
+                                        return `[shell_read] Access denied: user did not allow reading "${candidatePath}" (outside workspace).`;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 const shellResult = await this.runShellRead(cmd, root, _toolId);
 
@@ -13155,7 +13265,7 @@ ${sampleHtml}
                             || [...this._lastEditNewStringByFile.keys()].some(k => k.endsWith('/' + srcBasename) || k === srcBasename)
                             || [...this._writtenPathsThisSession].some(k => k.endsWith('/' + srcBasename) || k === srcBasename);
                         if (!this._validatedSourceFiles.has(srcNorm) && !wasEditedThisSession) {
-                            this._validatedSourceFiles.add(srcNorm);
+                            this._trackValidatedSource(srcNorm);
                             logInfo(`[agent] Source file validated by build tool: ${srcNorm}`);
                         } else if (wasEditedThisSession) {
                             logInfo(`[agent] Skipping validation lock for "${srcNorm}" — file was edited this session (still in progress)`);
@@ -14017,6 +14127,22 @@ ${sampleHtml}
             suggestions.push(`  - ${m}${found ? '\n' + found : ''}`);
         }
         return `Edit blocked: the following module(s) do not exist on disk:\n${suggestions.join('\n')}\nFix the import path and retry edit_file immediately -- do NOT ask the user.`;
+    }
+
+    /** Returns true if the path points to an OS-protected location that should never be readable by the agent.
+     *  These are hard-blocked regardless of user approval. */
+    private static isOsProtectedPath(full: string): boolean {
+        const norm = full.replace(/\\/g, '/').toLowerCase();
+        const BLOCKED = [
+            // Unix system dirs
+            '/etc/', '/proc/', '/sys/', '/dev/',
+            '/private/etc/', '/private/var/',        // macOS
+            '/boot/', '/lib/', '/lib64/', '/usr/lib/',
+            // Windows system dirs
+            '/windows/system32/', '/windows/syswow64/',
+            '/windows/winsxs/', '/windows/servicing/',
+        ];
+        return BLOCKED.some(b => norm.startsWith(b) || norm === b.slice(0, -1));
     }
 
     private safePath(root: string, rel: string): string {

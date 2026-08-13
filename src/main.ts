@@ -89,31 +89,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             let embeddingService: EmbeddingService | undefined;
             
             // Try to initialize Qdrant and embeddings for Tier 4-5
-            try {
-                embeddingService = new EmbeddingService(memoryConfig);
-                const vectorSize = embeddingService.getEmbeddingDimension();
-                qdrantClient = new QdrantClient(memoryConfig, workspaceName, vectorSize);
-                await qdrantClient.initialize();
-                
-                // Validate collection dimensions match embedding model
-                const collectionInfo = await qdrantClient.getCollectionInfo();
-                if (collectionInfo && collectionInfo.vectorSize !== vectorSize) {
-                    logError(`[memory] Dimension mismatch detected: collection is ${collectionInfo.vectorSize}D but model produces ${vectorSize}D`);
-                    logInfo(`[memory] Recreating collection with correct dimensions...`);
-                    await qdrantClient.deleteCollection();
+            // Retry up to 3 times with 2s delay — Qdrant may be slow to respond at startup.
+            const QDRANT_RETRIES = 3;
+            const QDRANT_RETRY_DELAY_MS = 2000;
+            let qdrantInitError: unknown = null;
+            for (let attempt = 1; attempt <= QDRANT_RETRIES; attempt++) {
+                try {
+                    embeddingService = new EmbeddingService(memoryConfig);
+                    const vectorSize = embeddingService.getEmbeddingDimension();
+                    qdrantClient = new QdrantClient(memoryConfig, workspaceName, vectorSize);
                     await qdrantClient.initialize();
-                    logInfo(`[memory] Collection recreated with ${vectorSize}D vectors`);
+
+                    // Validate collection dimensions match embedding model
+                    const collectionInfo = await qdrantClient.getCollectionInfo();
+                    if (collectionInfo && collectionInfo.vectorSize !== vectorSize) {
+                        logError(`[memory] Dimension mismatch detected: collection is ${collectionInfo.vectorSize}D but model produces ${vectorSize}D`);
+                        logInfo(`[memory] Recreating collection with correct dimensions...`);
+                        await qdrantClient.deleteCollection();
+                        await qdrantClient.initialize();
+                        logInfo(`[memory] Collection recreated with ${vectorSize}D vectors`);
+                    }
+
+                    logInfo(`[memory] Qdrant connected at ${memoryConfig.qdrantUrl}`);
+                    logInfo(`[memory] Embedding model: ${memoryConfig.embeddingModel} (${vectorSize}d)`);
+                    qdrantInitError = null;
+                    break; // success
+                } catch (error) {
+                    qdrantInitError = error;
+                    if (attempt < QDRANT_RETRIES) {
+                        logWarn(`[memory] Qdrant init attempt ${attempt}/${QDRANT_RETRIES} failed, retrying in ${QDRANT_RETRY_DELAY_MS}ms: ${toErrorMessage(error)}`);
+                        qdrantClient = undefined;
+                        embeddingService = undefined;
+                        await new Promise(r => setTimeout(r, QDRANT_RETRY_DELAY_MS));
+                    }
                 }
-                
-                logInfo(`[memory] Qdrant connected at ${memoryConfig.qdrantUrl}`);
-                logInfo(`[memory] Embedding model: ${memoryConfig.embeddingModel} (${vectorSize}d)`);
-            } catch (error) {
+            }
+
+            if (qdrantInitError !== null) {
                 if (memoryConfig.fallbackToLocal) {
-                    logError(`[memory] Qdrant unavailable, using local storage only: ${toErrorMessage(error)}`);
+                    logError(`[memory] Qdrant unavailable after ${QDRANT_RETRIES} attempts, using local storage only: ${toErrorMessage(qdrantInitError)}`);
                     qdrantClient = undefined;
                     embeddingService = undefined;
-                    // Notify the user so they know semantic search (Tiers 4-5) is offline.
-                    // Use showWarningMessage so it appears in the UI, not just the log.
                     vscode.window.showWarningMessage(
                         'Ollama Forge: Qdrant is unavailable — memory Tiers 4-5 (semantic search) are offline. Tiers 0-3 (local) are still active.',
                         'Open Log'
@@ -123,7 +139,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                         }
                     });
                 } else {
-                    throw error;
+                    throw qdrantInitError;
                 }
             }
             
