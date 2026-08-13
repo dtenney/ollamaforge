@@ -8334,7 +8334,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                                     || /\bcursor\.execute|session\.query|\.bulk_|executemany/i.test(timedOutScriptSrc)
                                     || shutil_or_archive_re.test(timedOutScriptSrc)
                                 );
-                                const hasNetworkLoop = timedOutScriptSrc && /for\b.+in\b.+:\s*\n(?:[\s\S]{0,80}\n){0,5}[\s\S]{0,80}(?:requests\.|urllib|paramiko|scp|sftp)/i.test(timedOutScriptSrc);
+                                const hasNetworkLoop = timedOutScriptSrc && /for\b.+in\b(?!\s*\[)[^:]+:\s*\n(?:[\s\S]{0,80}\n){0,5}[\s\S]{0,80}(?:requests\.|urllib\.request\.|paramiko|scp\.|sftp\.)/i.test(timedOutScriptSrc);
                                 if (isLongRunningDataScript || hasNetworkLoop) {
                                     // This is a bulk data/network script that genuinely needs minutes.
                                     // Hand control back to the user with a copy-paste command.
@@ -11872,7 +11872,9 @@ if errors:
                                 // - bulk archive / compression / export patterns
                                 const hasLongRunningPattern =
                                     /\bos\.walk\s*\(|glob\.\w+\(.*\*\*|scandir|listdir.*for\b/i.test(scriptSrc)
-                                    || /for\b.+in\b.+:\s*\n(?:[\s\S]{0,40}\n){0,3}[\s\S]{0,40}(?:requests\.|urllib|subprocess|paramiko|scp|sftp)/i.test(scriptSrc)
+                                    // Network loop: for ... in <variable/call> (not a small literal list)
+                                    // subprocess excluded -- it runs local commands, not bulk network ops
+                                    || /for\b.+in\b(?!\s*\[)[^:]+:\s*\n(?:[\s\S]{0,40}\n){0,3}[\s\S]{0,40}(?:requests\.|urllib\.request\.|paramiko|scp\.|sftp\.)/i.test(scriptSrc)
                                     || /\bpd\.read_csv|pd\.read_excel|\.iterrows\(\)|\.itertuples\(\)/i.test(scriptSrc)
                                     || /\bcursor\.execute|session\.query|\.bulk_|executemany/i.test(scriptSrc)
                                     || /shutil\.copy|shutil\.move|shutil\.copytree|tarfile|zipfile\.ZipFile/i.test(scriptSrc);
@@ -11890,7 +11892,7 @@ if errors:
                                     const cmdToCopy = cmd.trim();
                                     logWarn(`[long-run-guard] Script "${scriptBasename}" looks long-running and has no --limit/--dry-run mode`);
                                     return `[LONG-RUNNING SCRIPT — not executed]\n\nThe script "${scriptBasename}" performs bulk operations (file crawl / network loop / database scan) that will likely exceed the 60-second timeout.\n\nOptions:\n1. **Run it yourself**: copy and paste this command into your terminal:\n   \`${cmdToCopy}\`\n\n2. **Test with a small sample first**: I can add a \`--limit N\` flag (e.g. \`--limit 10\`) so the script processes only the first 10 items. Say "add a --limit flag" and I'll modify the script.\n\n3. **Background run**: If you want me to kick it off and move on, say "run it anyway" and I'll execute it (it may time out).\n\nWhat would you like to do?`;
-                                } else if (impliedLargeScope && /requests\.|urllib|subprocess|scp|sftp|ssh/i.test(scriptSrc)) {
+                                } else if (impliedLargeScope && /requests\.|urllib\.request\.|paramiko|scp\.|sftp\.|ssh/i.test(scriptSrc)) {
                                     const cmdToCopy = cmd.trim();
                                     return `[LONG-RUNNING SCRIPT — not executed]\n\nThe task mentions ${bigCountMatch![1]} ${bigCountMatch![2]}s and the script makes network calls in a loop. Processing this many items will take several minutes.\n\nPlease run this yourself when ready:\n   \`${cmdToCopy}\`\n\nAlternatively, say "run the first 10 only" and I'll add a --limit flag.`;
                                 }
