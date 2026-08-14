@@ -6400,7 +6400,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // Also catch present-progressive action statements like "Running with the venv's interpreter instead."
                 // or "Using X approach" / "Switching to Y" — model stating what it's about to do without a tool call.
                 // Also catch "Need to find/check/look" — agent stating its next required action without a future-tense marker.
-                const hasForwardIntent = /\b(?:let me |i(?:'ll| will) |i(?:'m| am) going to |now i(?:'ll| will| need)|next[, ]|then[, ]|after that|first[, ].*then|going to |(?:running|using|switching|installing|applying|trying|attempting|executing) (?:with |the |this |a )?(?:\w+ ){0,4}instead\b)\b/i.test(resp)
+                const hasForwardIntent = /\b(?:let me (?!know\b)|i(?:'ll| will) |i(?:'m| am) going to |now i(?:'ll| will| need)|next[, ]|then[, ]|after that|first[, ].*then|going to |(?:running|using|switching|installing|applying|trying|attempting|executing) (?:with |the |this |a )?(?:\w+ ){0,4}instead\b)\b/i.test(resp)
                     || /^(?:running |using |switching |installing |applying |trying |attempting |executing )/i.test(resp.trim())
                     // Obligation without future tense: "need to", "have to", "must", "should" + action verb
                     || /\b(?:need|have|must|also need|still need|will need) to (?:find|check|look|read|search|examine|trace|investigate|verify|confirm|test|run|install|fix|update|get|see|figure out|grep|cat|ssh|curl|ping|restart|reload|enable|disable|create|write|edit|remove|delete|move|copy)\b/i.test(resp)
@@ -6418,6 +6418,12 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // A response that ends with a question to the user is always a legitimate stop —
                 // the model is handing control back and waiting for input.
                 const endsWithQuestion = /\?\s*$/.test(resp.trim());
+                // User dismissal: the most recent user message was a conversational close
+                // ("no, just...", "okay thanks", "I'll check later", "got it", "sounds good").
+                // In this case a short acknowledgment with no tool call is always a legitimate stop.
+                const lastUserMsg = (this.lastUserMessage ?? '').trim().toLowerCase();
+                const isUserDismissal = lastUserMsg.length < 120
+                    && /^(?:ok(?:ay)?[,.]?|got it[,.]?|sounds good[,.]?|thanks?[,.]?|cool[,.]?|alright[,.]?|perfect[,.]?|no[,.]?\s+just\b|never mind|nvm|not now|i(?:'ll| will) (?:check|try|look|let you know|come back)|just (?:let me know|checking)|no[,.]?\s+(?:thanks?|that'?s? (?:fine|ok|good|all|enough)))\b/i.test(lastUserMsg);
                 // Additional completion signals: model confirmed state, reported results, or summarised work
                 const hasConfirmationLanguage = /\b(back to (?:its|the) (?:correct|original|previous)|matches (?:exactly|what)|(?:file|code|script) (?:is|looks) (?:correct|right|good|restored|intact|unchanged)|(?:correctly|successfully) (?:restored|reverted|applied|updated|changed|fixed|deployed|installed)|(?:verified|confirmed|checked)(?:\s+and)? (?:correct|working|ok|good)|task (?:is )?complete|no (?:further|more) (?:changes|edits|work|action)|(?:everything|all) (?:looks|is) (?:correct|good|right|fine|in order))\b/i.test(resp);
                 // Short conversational reply (greeting, clarifying question, brief Q&A):
@@ -6429,14 +6435,17 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     && !toolCalls.length;
                 // hasForwardIntent always wins — if the model stated intent to act next,
                 // it is never a legitimate stop regardless of completion language present elsewhere.
-                const isLegitimateStop = !hasForwardIntent && (
+                // Exception: user dismissal ("no, just...", "got it", "I'll check later") — a short
+                // acknowledgment in response to a dismissal is always a legitimate stop even if
+                // hasForwardIntent fired on "just let me know when you're ready" phrasing.
+                const isLegitimateStop = (isUserDismissal && turnHasText && resp.trim().length < 300) || (!hasForwardIntent && (
                     hasCompletionLanguage
                     || hasConfirmationLanguage
                     || isConversationalStop
                     || endsWithQuestion
                     || (turnHasText && !isPlanningNarration && !isMidTask && !toolsCalledThisRun)
                     || (turnHasText && !isPlanningNarration && !isMidTask && toolsCalledThisRun)
-                );
+                ));
                 // Reset stall budget when the model gives a real answer — it wasn't stalling,
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
