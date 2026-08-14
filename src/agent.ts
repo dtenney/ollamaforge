@@ -14149,9 +14149,15 @@ ${sampleHtml}
 
     private safePath(root: string, rel: string): string {
         const full = path.resolve(root, rel);
-        // Use case-insensitive comparison on Windows (paths may differ in drive letter case)
-        const fullNorm = process.platform === 'win32' ? full.toLowerCase() : full;
-        const rootNorm = process.platform === 'win32' ? root.toLowerCase() : root;
+        // Normalize slashes + case on Windows — models often pass forward slashes while
+        // vscode.workspace.workspaceFolders[0].uri.fsPath returns backslashes.
+        const normalize = (p: string) => {
+            let n = p.replace(/\//g, path.sep);
+            if (process.platform === 'win32') { n = n.toLowerCase(); }
+            return n;
+        };
+        const fullNorm = normalize(full);
+        const rootNorm = normalize(root);
         const rootNormWithSep = rootNorm.endsWith(path.sep) ? rootNorm : rootNorm + path.sep;
         if (fullNorm !== rootNorm && !fullNorm.startsWith(rootNormWithSep)) {
             throw new Error(`Path "${rel}" is outside the workspace`);
