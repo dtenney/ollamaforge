@@ -7236,8 +7236,8 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
 
 Use the reliable pattern instead:
   1. write_file: scripts/myscript.py
-  2. run_command: scp scripts/myscript.py root@HOST:/tmp/myscript.py
-  3. run_command: ssh root@HOST python3 /tmp/myscript.py
+  2. run_command: scp scripts/myscript.py HOST:/tmp/myscript.py  -- check DEPLOYMENT.md or session context for the correct user@host
+  3. run_command: ssh HOST python3 /tmp/myscript.py
 
 Write the script locally now.]`;
                             if (isTextMode) {
@@ -8371,7 +8371,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             // scp completed -- next step is always to verify the file arrived and run it
                             const remoteMatch = cmdStr.match(/(\S+):(\S+)\s*$/);
                             const remotePath = remoteMatch?.[2] ?? '/tmp/script.py';
-                            const remoteHost = remoteMatch?.[1] ?? 'root@HOST';
+                            const remoteHost = remoteMatch?.[1] ?? 'HOST';
                             nudge = `File transferred. Call run_command NOW: ssh ${remoteHost} python3 ${remotePath}`;
                         } else if (/^\s*ssh\s/i.test(cmdStr) && !/python3|bash|sh\s/.test(cmdStr)) {
                             // Simple ssh command (not running a script) -- continue immediately
@@ -10296,8 +10296,8 @@ if errors:
                         this._lastWrittenFilePath = rel;
                         this._writtenPathsThisSession.add(rel.replace(/\\/g, '/'));
                         this._editFileHardBlocked.delete(rel.replace(/\\/g, '/')); // Lift edit block -- write_file succeeded
-                        const scpTarget = `root@HOST:/tmp/${path.basename(rel)}`;
-                        return `File written and validated: ${rel} (${content.split('\n').length} lines) ✓ py_compile passed\n\n[NEXT STEP -- do this NOW]: run_command: "scp ./${rel} ${scpTarget}" then run_command: "ssh root@HOST python3 /tmp/${path.basename(rel)}"${priorContentNote}${newFileDirNote}`;
+                        const scpTarget = `HOST:/tmp/${path.basename(rel)}`;
+                        return `File written and validated: ${rel} (${content.split('\n').length} lines) ✓ py_compile passed\n\n[NEXT STEP -- do this NOW]: run_command: "scp ./${rel} ${scpTarget}" then run_command: "ssh HOST python3 /tmp/${path.basename(rel)}" — check DEPLOYMENT.md or session context for the correct user@host before running${priorContentNote}${newFileDirNote}`;
                     }
 
                     this._lastWrittenFilePath = rel;
