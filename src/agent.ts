@@ -1296,6 +1296,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 
 ## Staying on track
 **Confirmed plan = authorization for all steps.** When the user says yes/go ahead/proceed, execute the entire sequence without pausing to ask "want me to continue-- or "should I do X next-- at each step. Only pause for a genuine blocker: unexpected error, irreversible action not in the plan, or a value only the user can provide.
+**"Move X from A to B" is ambiguous — always ask first.** When the user says "move scripts/code/logic from X to Y" where X and Y are platform/service names (discord, matrix, slack, telegram, database names, service names) rather than filesystem paths, do NOT assume they mean a filesystem \`mv\` or directory rename. They almost certainly mean: update the code so it targets platform B instead of platform A (change imports, API calls, config). Before doing anything, ask: "Do you want me to (1) update the code so these scripts send to [B] instead of [A], or (2) physically move the files to a different directory?" One sentence, one question.
 **Batch, don't enumerate.** Never check items one at a time with repeated ls/find calls. Write one script that checks everything at once and prints a summary. If you are about to run the same command pattern a second time on a different item -- stop, write a loop, run it once.
 **Never write a numbered plan or mid-task status list.** Do not write "1. Search for X, 2. Search for Y..." or "Current progress: [x] item A, [ ] item B" in your response. Writing the plan or status causes a spiral. Instead: act on the next item immediately. Each tool call IS the plan step. Only produce a summary when ALL items are complete.
 **Never re-read a checklist to decide what to do next.** If you are working through a checklist, pick the next unchecked item and call a tool on it immediately. Do NOT re-enumerate remaining items, re-evaluate which are "actionable", or re-list what is done. Just act.
@@ -8268,7 +8269,11 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         const isMoveCmd = /\bmv\b|\bmove\b|\bMove-Item\b/i.test(cmdStr);
                         const isMkdirCmd = /\bmkdir\b|\bNew-Item\b/i.test(cmdStr);
                         const lastUserMsg = this._currentTaskMessage.toLowerCase();
-                        const userWantsPathUpdate = /\b(point|location|path|import|reference)\b/i.test(lastUserMsg) && /\b(edit|update|change|fix|modify)\b/i.test(lastUserMsg);
+                        // "move X from A to B" where A/B are platform/service names = code update, not filesystem mv
+                        const platformNames = /\b(discord|matrix|slack|telegram|teams|mattermost|rocket\.?chat|irc|email|smtp|webhook|sentry|pagerduty|opsgenie|pushover|ntfy|gotify)\b/i;
+                        const userWantsPlatformSwitch = /\b(move|switch|migrate|convert|port|change)\b/i.test(lastUserMsg) && platformNames.test(lastUserMsg);
+                        const userWantsPathUpdate = userWantsPlatformSwitch
+                            || (/\b(point|location|path|import|reference)\b/i.test(lastUserMsg) && /\b(edit|update|change|fix|modify)\b/i.test(lastUserMsg));
                         // hasFailed: only trigger on genuine shell error signatures, not on file
                         // content that happens to contain words like "Error" or "syntax".
                         // Require exit code evidence OR error-only output (no substantial content before the error).
