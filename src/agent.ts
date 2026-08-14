@@ -1066,6 +1066,17 @@ async function loadHierarchicalContext(workspaceRoot: string): Promise<string> {
             }
         } catch { /* file doesn't exist yet -- skip */ }
 
+        // â"€â"€ DEPLOYMENT.md (root only -- SSH users, scp patterns, service names) â"€â"€
+        const deployPath = path.join(workspaceRoot, 'DEPLOYMENT.md');
+        try {
+            const stat = fs.statSync(deployPath);
+            if (stat.isFile()) {
+                const content = fs.readFileSync(deployPath, 'utf8').slice(0, MAX_CONTEXT_FILE_BYTES);
+                sections.push(`### DEPLOYMENT.md (SSH users, deploy commands, service names -- always check before forming ssh/scp commands)\n${content.trim()}`);
+                logInfo(`[context-files] Loaded DEPLOYMENT.md (${content.length} chars)`);
+            }
+        } catch { /* file doesn't exist -- skip */ }
+
         // â"€â"€ PLAN.md (root only, loaded second -- development plan and backlog) â"€â"€
         const planPath = path.join(workspaceRoot, 'PLAN.md');
         try {
@@ -1210,9 +1221,9 @@ Check memory_search and hosts_inventory.json before SSHing anywhere. Save every 
 ## Remote execution (SSH / BusyBox targets)
 For any logic that needs to run on a remote host, the sequence is always:
   1. write_file: scripts/myscript.py  -- write the complete script locally
-  2. run_command: scp scripts/myscript.py USER@HOST:/tmp/myscript.py  -- use the same USER as your other ssh commands (e.g. david@HOST). Do NOT use root@ unless you have confirmed root SSH key access.
-  3. run_command: ssh USER@HOST test -f /tmp/myscript.py && echo EXISTS
-  4. run_command: ssh USER@HOST python3 /tmp/myscript.py
+  2. run_command: scp scripts/myscript.py HOST:/tmp/myscript.py  -- before forming this command, check DEPLOYMENT.md, context.md, or earlier ssh commands in this session for the correct username. If unsure, ask -- do NOT guess root@.
+  3. run_command: ssh HOST test -f /tmp/myscript.py && echo EXISTS
+  4. run_command: ssh HOST python3 /tmp/myscript.py
 
 Never use ssh with inline Python (python3 -c), heredocs (<< EOF), or awk scripts -- BusyBox/ash does not support them. Simple commands over ssh are always fine: "ssh host ls /path", "ssh host systemctl restart svc", "ssh host 'cd /dir && ./run.sh'". Only multi-line interpreters (python3 -c, awk) and heredocs need the write_file + scp + ssh pattern.
 After every scp, verify the file exists on the remote before running it -- once. If the file was confirmed present, proceed immediately without re-checking.
