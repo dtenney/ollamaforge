@@ -463,6 +463,12 @@
           "maximum": 200,
           "markdownDescription": "Maximum number of agent tool-call turns per session. `0` (default) uses built-in limits per task type (sweep=50, merge=60, plan=50, normal=40, small-model=8). Set to a lower value (e.g. `24`) to cap resource usage for large models."
         },
+        "ollamaForge.allowedExternalReadPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["~/.ssh/config"],
+          "markdownDescription": "File paths outside the workspace that `read_file` may access without prompting for confirmation. Supports `~` for the home directory. Example: `[\"~/.ssh/config\", \"~/.gitconfig\"]`."
+        },
         "ollamaForge.routing.enabled": {
           "type": "boolean",
           "default": false,

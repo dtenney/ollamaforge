@@ -10735,9 +10735,17 @@ if errors:
                     if (Agent.isOsProtectedPath(rfAbsolute)) {
                         return `[read_file] Access denied: "${rfPathRaw}" is in an OS-protected directory and cannot be read.`;
                     }
+                    // Check user-configured allowlist (ollamaForge.allowedExternalReadPaths)
+                    const allowedExternalPaths = vscode.workspace.getConfiguration('ollamaForge')
+                        .get<string[]>('allowedExternalReadPaths', ['~/.ssh/config']);
+                    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+                    const isAllowed = allowedExternalPaths.some(allowed => {
+                        const expanded = allowed.startsWith('~') ? path.join(homeDir, allowed.slice(1)) : allowed;
+                        return path.resolve(expanded).toLowerCase() === rfAbsolute.toLowerCase();
+                    });
                     // SSH paths and remote URIs are not local paths — skip the prompt.
                     const isRemote = /^[a-z][a-z0-9+\-.]*:\/\//i.test(rfPathRaw);
-                    if (!isRemote) {
+                    if (!isRemote && !isAllowed) {
                         const approved = await this.requestConfirmation(
                             'read_outside_workspace',
                             `Read file outside workspace: \`${rfAbsolute}\`\n\nThis file is not inside the workspace root. Allow?`,
