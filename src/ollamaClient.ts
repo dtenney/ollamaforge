@@ -169,6 +169,11 @@ export function streamChatRequest(
         // 4096 gives enough headroom for tool calls + surrounding text without enabling spirals.
         opts.num_predict = options?.numPredict ?? 4096;
         if (Object.keys(opts).length > 0) { payload.options = opts; }
+        // reasoning_effort: Qwen3.8+ supports "low", "medium", "xhigh" (default xhigh).
+        // Only send when the user has explicitly configured a non-default value and the model supports it.
+        if (cfg.reasoningEffort && thinkingEnabled && /qwen3/i.test(modelLower)) {
+            payload.reasoning_effort = cfg.reasoningEffort;
+        }
         // keep_alive: how long Ollama holds the model in GPU memory after the request.
         // Configured by the user; defaults to '10m' to avoid cold-start latency on consecutive calls.
         if (cfg.keepAlive) { payload.keep_alive = cfg.keepAlive; }
@@ -371,15 +376,17 @@ export function streamChatRequest(
                         if (!line.trim()) { continue; }
                         try {
                             const p = JSON.parse(line);
-                            if (p.message?.thinking) {
+                            // Qwen3.8 uses reasoning_content; older Ollama/Qwen3 uses thinking.
+                            const thinkingChunk: string = p.message?.thinking || p.message?.reasoning_content || '';
+                            if (thinkingChunk) {
                                 // Send thinking via sentinel tokens so the webview can render
                                 // it as a collapsible <details> block. Accumulate for return value too.
                                 if (!thinkingStarted) {
                                     onToken('\x01THINK_START\x01');
                                     thinkingStarted = true;
                                 }
-                                fullThinking += p.message.thinking;
-                                onToken(p.message.thinking);
+                                fullThinking += thinkingChunk;
+                                onToken(thinkingChunk);
                                 // Thinking block guards: repetition, list spiral, hard size cap
                                 // Disabled for sub-agent calls (e.g. critic) that legitimately
                                 // include code in their thinking when reviewing a file.

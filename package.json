@@ -500,6 +500,18 @@
           "default": "10m",
           "markdownDescription": "How long Ollama keeps the model loaded in GPU memory between requests. Use Ollama duration syntax: `10m` (10 minutes), `1h` (1 hour), `0` (unload immediately after each request), `-1` (keep loaded forever). A longer value reduces cold-start latency for consecutive agent turns. Default: `10m`."
         },
+        "ollamaForge.reasoningEffort": {
+          "type": "string",
+          "enum": ["", "low", "medium", "xhigh"],
+          "enumDescriptions": [
+            "Use model default (xhigh — maximum reasoning depth)",
+            "Low reasoning effort: faster responses, less thorough reasoning",
+            "Medium reasoning effort: balanced speed and depth",
+            "Maximum reasoning effort: deepest thinking, slowest (model default)"
+          ],
+          "default": "",
+          "markdownDescription": "Reasoning effort for Qwen3.8+ models (`reasoning_effort` parameter). Controls how deeply the model reasons before answering. Leave empty to use the model default (`xhigh`). **Note:** Setting this lower can speed up responses but may cause more retries on complex agentic tasks, which can increase total latency."
+        },
         "ollamaForge.stack.sshHost": {
           "type": "string",
           "default": "",

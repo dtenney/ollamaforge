@@ -67,6 +67,8 @@ export interface OllamaConfig {
     contextFileAutoUpdateDays: number;
     /** How long Ollama keeps the model loaded in GPU memory between requests (e.g. "10m", "1h", "0" to unload immediately). */
     keepAlive: string;
+    /** reasoning_effort for Qwen3.8+ models: "low", "medium", or "xhigh". Empty = use model default (xhigh). */
+    reasoningEffort: string;
 }
 
 // ── Model routing helpers ─────────────────────────────────────────────────────
@@ -125,6 +127,7 @@ export function getConfig(): OllamaConfig {
         dreamModel:                c.get<string> ('dreamModel',                     ''),
         contextFileAutoUpdateDays: c.get<number> ('contextFile.autoUpdateDays',     7),
         keepAlive:                 c.get<string> ('keepAlive',                      '10m'),
+        reasoningEffort:           c.get<string> ('reasoningEffort',                 ''),
     };
 }
 
