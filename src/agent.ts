@@ -9097,11 +9097,17 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // or when the agent used zero tools this whole run AND produced a long standalone
             // answer (pure Q&A, not a mid-task status update).
             const usedToolsThisRun = this._toolCallsThisRun.length > 0;
-            const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|ready (?:to|for)|awaiting (?:your|hardware|next)|session (?:complete|done|finished|summary)|reach out (?:when|if)|nothing else to (?:act|do|work)|let me know (?:when|if)|(?:here|this) (?:concludes|completes|wraps))\b/i.test(lastAssistantText);
+            const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|ready (?:to|for)|awaiting (?:your|hardware|next)|session (?:complete|done|finished|summary)|reach out (?:when|if)|nothing else to (?:act|do|work)|let me know (?:when|if)|(?:here|this) (?:concludes|completes|wraps)|you(?:'re| are) welcome|happy to help|glad (?:I could|to help)|anytime[.!]?$|no problem[.!]?|of course[.!]?)\b/i.test(lastAssistantText);
+            // If the user's last message was a conversational close/dismissal, treat the session as finished
+            // regardless of what tools were used. "just leave them for now. Thanks!" after a memory_tier_write
+            // should not auto-continue.
+            const lastUserMsg = (this.lastUserMessage ?? '').trim().toLowerCase();
+            const userDismissedSession = lastUserMsg.length < 150
+                && /^(?:ok(?:ay)?[,.]?|got it[,.]?|sounds good[,.]?|thanks?[!.,]?|thank you[!.,]?|cool[,.]?|alright[,.]?|perfect[,.]?|no[,.]?\s+just\b|never mind|nvm|not now|i(?:'ll| will) (?:check|try|look|let you know|come back)|just (?:let me know|checking)|no[,.]?\s+(?:thanks?|that'?s? (?:fine|ok|good|all|enough))|just leave|leave (?:it|them) for now|that(?:'s| is) (?:fine|ok|good|all|enough)[.!]?)\b/i.test(lastUserMsg);
             // Pure Q&A detection: zero tools used + response is substantial (>400 chars = real answer, not a status note)
             // A short text-only turn mid-task ("Checking now...") should still auto-continue.
             const isPureQA = !usedToolsThisRun && !lastToolCall && lastAssistantText.length > 400;
-            const looksFinished = hasCompletionLanguage || isPureQA;
+            const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession;
             // Track consecutive runs with no meaningful progress to detect infinite auto-continue loops.
             // "Progress" = any tool that changes state or actively investigates (file writes, commands,
             // shell reads, web fetches, memory writes). Only pure no-op turns (zero tools, or only
