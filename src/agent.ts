@@ -4695,7 +4695,9 @@ Before executing anything, call task_log once with status "started" and a messag
         if (cfg.autoSaveMemory) {
             const nudge = this.buildMemoryNudge();
             if (nudge) {
-                memoryNudgeMsg = { role: 'system', content: nudge.trim() };
+                // Use role:'user' not 'system' — some models (qwen3.8) reject system messages
+                // that appear anywhere other than position 0.
+                memoryNudgeMsg = { role: 'user', content: `[SYSTEM: ${nudge.trim()}]` };
                 logInfo(`[agent] Memory nudge prepared at turn ${this.userTurnCount}`);
             }
         }
@@ -5572,7 +5574,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             } else {
                 ctxBudgetNote = `[Context: ${Math.round(contextStats.usagePercentage)}% used, ~${Math.round(remainingTokens / 1000)}k tokens remaining.]`;
             }
-            const ctxBudgetMsg: OllamaMessage = { role: 'system', content: ctxBudgetNote };
+            // Use role:'user' not 'system' — some models (qwen3.8) reject system messages
+            // that appear anywhere other than position 0.
+            const ctxBudgetMsg: OllamaMessage = { role: 'user', content: `[SYSTEM: ${ctxBudgetNote}]` };
 
             // Route to fast model when the previous turn was purely reads and no edits yet
             const effectiveModel = (prevTurnWasReadOnly && this._editsThisRun === 0)
