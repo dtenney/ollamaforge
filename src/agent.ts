@@ -12154,7 +12154,7 @@ if errors:
 
                 // Rate-limit: max 3 memory writes per agent response
                 if (this.memoryWritesThisResponse >= Agent.MAX_MEMORY_WRITES_PER_RESPONSE) {
-                    return `Rate limited: already saved ${this.memoryWritesThisResponse} entries this response. Try again in the next message.`;
+                    return `Memory rate limit reached (${this.memoryWritesThisResponse} saves this turn). STOP saving — do not retry. Move on to the next task step.`;
                 }
 
                 // Tier 0 validation: must contain actual infrastructure data
