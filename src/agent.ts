@@ -5559,21 +5559,21 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             // â"€â"€ Context budget nudge â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             // Inject a synthetic system message each turn so the model always
             // knows its remaining headroom and adjusts output size accordingly.
-            // Thresholds:   comfortable â‰¥50% remaining   ->  no special guidance
-            //               tight       25--50% remaining  ->  be concise
-            //               low         10--25% remaining  ->  chunk large tasks
-            //               critical    <10% remaining    ->  finish current step only
+            // Thresholds:   comfortable â‰¥30% remaining   ->  no special guidance
+            //               tight       15--30% remaining  ->  be concise
+            //               low         7--15% remaining   ->  chunk large tasks
+            //               critical    <7% remaining      ->  finish current step only
             const remainingTokens = contextStats.modelLimit - contextStats.totalTokens;
             const remainingPct = 100 - contextStats.usagePercentage;
             let ctxBudgetNote: string;
-            if (remainingPct < 10) {
+            if (remainingPct < 7) {
                 ctxBudgetNote = `[CONTEXT CRITICAL: ${Math.round(remainingPct)}% remaining (~${Math.round(remainingTokens / 1000)}k tokens). Finish the single tool call you are currently on, then stop and tell the user exactly what was completed and what still needs to be done, so they can say "keep going" to continue in a new context window.`;
-            } else if (remainingPct < 25) {
+            } else if (remainingPct < 15) {
                 ctxBudgetNote = `[CONTEXT LOW: ${Math.round(remainingPct)}% remaining (~${Math.round(remainingTokens / 1000)}k tokens). If writing code, output ONE function or section at a time. After each chunk, stop and ask the user to confirm before continuing. Do not attempt to write an entire file in one response.]`;
-            } else if (remainingPct < 50) {
+            } else if (remainingPct < 30) {
                 ctxBudgetNote = `[CONTEXT TIGHT: ${Math.round(remainingPct)}% remaining (~${Math.round(remainingTokens / 1000)}k tokens). Keep responses concise. If a coding task requires writing >100 lines, split it into named sections and complete one per turn. If you have discovered important facts (IPs, file paths, decisions), save them with memory_write now before context is compacted.]`;
             } else if (contextStats.usagePercentage >= 50) {
-                ctxBudgetNote = `[Context: ${Math.round(contextStats.usagePercentage)}% used, ~${Math.round(remainingTokens / 1000)}k tokens remaining. If you have discovered new facts worth remembering (paths, config, decisions), save them with memory_write.]`;
+                ctxBudgetNote = `[Context: ${Math.round(contextStats.usagePercentage)}% used, ~${Math.round(remainingTokens / 1000)}k tokens remaining.]`;
             } else {
                 ctxBudgetNote = `[Context: ${Math.round(contextStats.usagePercentage)}% used, ~${Math.round(remainingTokens / 1000)}k tokens remaining.]`;
             }
