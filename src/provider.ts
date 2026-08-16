@@ -1773,6 +1773,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
             approvals.add('run_command');
             approvals.add('run_command_pip');
             approvals.add('run_command_destructive');
+            // Read access outside workspace — SSH/remote file reads should not prompt in YOLO
+            approvals.add('shell_read_outside');
+            approvals.add('read_file_outside');
         }
         if (approvals.size) {
             agent.seedPersistentApprovals(approvals);

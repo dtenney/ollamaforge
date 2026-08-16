@@ -4561,11 +4561,14 @@ export class Agent {
                     `${i + 1}. ${p.action === 'create' ? 'âœš' : '~'} \`${p.relPath}\` -- ${p.description}`
                 ).join('\n');
                 post({ type: 'planCard', plan, planText });
-                const confirmed = await this.requestConfirmation(
-                    'multi_file_plan',
-                    `Proceed with creating/modifying ${plan.length} files?`,
-                    `multi_plan_${Date.now()}`
-                );
+                // In trust/yolo mode, auto-approve the multi-file plan (dynamic tool name can't be pre-seeded)
+                const confirmed = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
+                    ? true
+                    : await this.requestConfirmation(
+                        'multi_file_plan',
+                        `Proceed with creating/modifying ${plan.length} files?`,
+                        `multi_plan_${Date.now()}`
+                    );
                 if (!confirmed) {
                     post({ type: 'streamStart' });
                     const msg = 'Plan cancelled. Let me know what you\'d like to change.';
