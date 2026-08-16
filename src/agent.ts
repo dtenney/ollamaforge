@@ -7822,9 +7822,14 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             } catch { /* keep original if grep fails */ }
                         }
                     }
-                    // Detect soft failures: run_command/shell_read that returned non-zero exit code
+                    // Detect soft failures: run_command/shell_read that returned non-zero exit code.
+                    // Our runners only append "(exited with code N)" when there is no output at all.
+                    // Never match bare "exit 1" strings inside command output — a bash script that was
+                    // cat'd successfully (e.g. offsite_backup.sh) may contain "exit 1" on error paths
+                    // but the shell_read itself succeeded with exit 0.
                     const isSoftFailure = (name === 'run_command' || name === 'shell_read')
-                        && /exit (?:[1-9]|\-1)/.test(toolResult)
+                        && (/\(exited with code [1-9]\d*\)/.test(toolResult)
+                            || /^(?:bash|sh|zsh|cmd|python\d?):[^\n]*(?:command not found|No such file|Permission denied|not found)/m.test(toolResult))
                         && !toolResult.includes('file(s) moved');
                     if (isSoftFailure) {
                         // D-Bus / Wayland session not available over SSH.
