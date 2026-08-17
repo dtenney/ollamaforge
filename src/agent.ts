@@ -10289,6 +10289,21 @@ def collect_names(target):
     return set()
 src = open(sys.argv[1], encoding='utf-8').read()
 tree = ast.parse(src)
+# Collect module-level names: imports, function/class defs, assignments
+# These are visible to all functions in the module as globals.
+module_globals = set()
+for node in ast.iter_child_nodes(tree):
+    if isinstance(node, (ast.Import,)):
+        for alias in node.names: module_globals.add(alias.asname or alias.name.split('.')[0])
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names: module_globals.add(alias.asname or alias.name)
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        module_globals.add(node.name)
+    elif isinstance(node, ast.Assign):
+        for t in node.targets: module_globals |= collect_names(t)
+    elif isinstance(node, ast.AugAssign):
+        module_globals |= collect_names(node.target)
+builtins = set(dir(__builtins__) if isinstance(__builtins__, dict) else dir(__builtins__))
 errors = []
 for node in ast.walk(tree):
     if isinstance(node, ast.FunctionDef):
@@ -10305,7 +10320,7 @@ for node in ast.walk(tree):
                 for gen in child.generators: assigned |= collect_names(gen.target)
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
                 used.add(child.id)
-        defined = args | assigned | set(dir(__builtins__) if isinstance(dir(__builtins__), list) else dir(__builtins__))
+        defined = args | assigned | module_globals | builtins
         for name in used:
             if name not in defined and not name.startswith('_'):
                 errors.append(f"'{name}' may be undefined in {node.name}()")
