@@ -6445,19 +6445,23 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     && endsWithQuestion
                     && !hasForwardIntent
                     && !toolCalls.length;
-                // hasForwardIntent always wins — if the model stated intent to act next,
-                // it is never a legitimate stop regardless of completion language present elsewhere.
-                // Exception: user dismissal ("no, just...", "got it", "I'll check later") — a short
-                // acknowledgment in response to a dismissal is always a legitimate stop even if
-                // hasForwardIntent fired on "just let me know when you're ready" phrasing.
-                const isLegitimateStop = (isUserDismissal && turnHasText && resp.trim().length < 300) || (!hasForwardIntent && (
-                    hasCompletionLanguage
-                    || hasConfirmationLanguage
-                    || isConversationalStop
-                    || endsWithQuestion
-                    || (turnHasText && !isPlanningNarration && !isMidTask && !toolsCalledThisRun)
-                    || (turnHasText && !isPlanningNarration && !isMidTask && toolsCalledThisRun)
-                ));
+                // hasForwardIntent normally wins — model stated intent to act next.
+                // Exceptions where completion language overrides forward intent:
+                //   1. User dismissal ("got it", "thanks", etc.) — always a stop
+                //   2. Tools were called this run AND explicit completion language is present —
+                //      forward-looking phrases in a summary ("you can now...", "the script will...")
+                //      are informational, not intent to act again.
+                const completionAfterWork = toolsCalledThisRun && (hasCompletionLanguage || hasConfirmationLanguage);
+                const isLegitimateStop = (isUserDismissal && turnHasText && resp.trim().length < 300)
+                    || completionAfterWork
+                    || (!hasForwardIntent && (
+                        hasCompletionLanguage
+                        || hasConfirmationLanguage
+                        || isConversationalStop
+                        || endsWithQuestion
+                        || (turnHasText && !isPlanningNarration && !isMidTask && !toolsCalledThisRun)
+                        || (turnHasText && !isPlanningNarration && !isMidTask && toolsCalledThisRun)
+                    ));
                 // Reset stall budget when the model gives a real answer — it wasn't stalling,
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
