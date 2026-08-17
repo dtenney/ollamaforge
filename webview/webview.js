@@ -1969,68 +1969,67 @@ function finalizeCommandBlock(id, exitCode) {
     const output = block.querySelector('.cmd-output');
     const hasOutput = output && output.textContent.trim().length > 0;
 
+    // Add exit badge, toggle arrow, and line count to header, then wire the click.
+    // Shallow-clone the header first to strip any prior event listeners, then append
+    // all new children to the fresh node so closure references remain live in DOM.
     if (header) {
         const badge = document.createElement('span');
         badge.className = 'cmd-exit';
         badge.textContent = ok ? `✓ exit 0` : `✗ exit ${exitCode}`;
         badge.style.color = ok ? '#4ec94e' : '#f44747';
-        header.appendChild(badge);
-    }
 
-    // On success: collapse output now that the command is done (it was live-expanded during the run).
-    // On failure: always leave expanded so errors are immediately visible.
-    // If the user manually toggled during streaming, respect their choice.
-    if (output && !block.dataset.userCollapsed) {
-        output.style.display = ok ? 'none' : 'block';
-    }
-
-    // Add toggle arrow + line count to header, then wire the click.
-    // Re-wire here instead of relying on the closure from addCommandBlock — this ensures
-    // the toggle always works even if addCommandBlock's output reference was stale.
-    if (header && hasOutput && output) {
-        const lines = output.textContent.split('\n').filter(l => l.trim()).length;
-        const toggleArrow = document.createElement('span');
-        toggleArrow.className = 'cmd-toggle';
-        toggleArrow.style.cssText = 'margin-left:auto;font-size:0.75em;opacity:0.6;flex-shrink:0';
-        toggleArrow.textContent = output.style.display === 'none' ? '▶' : '▼';
-        header.appendChild(toggleArrow);
-
-        const lineHint = document.createElement('span');
-        lineHint.className = 'cmd-exit';
-        lineHint.textContent = `${lines} line${lines !== 1 ? 's' : ''}`;
-        lineHint.style.opacity = '0.4';
-        header.appendChild(lineHint);
-
-        // Wire toggle directly here — fresh reference, always correct.
-        const toggle = () => {
-            const hidden = output.style.display === 'none';
-            output.style.display = hidden ? 'block' : 'none';
-            toggleArrow.textContent = hidden ? '▼' : '▶';
-            block.dataset.userCollapsed = hidden ? '' : '1';
-            if (preview) { preview.style.display = hidden ? 'none' : ''; }
-        };
-        block._toggleOutput = toggle;
-        header.style.cursor = 'pointer';
-        // Remove any prior listener by cloning the header node, then re-attach.
-        const newHeader = header.cloneNode(true);
+        // Shallow clone strips old listeners without detaching children we haven't added yet.
+        const newHeader = header.cloneNode(false);
         header.replaceWith(newHeader);
-        newHeader.addEventListener('click', toggle);
+        newHeader.appendChild(badge);
 
-        // Show first line of output as a preview strip when collapsed (success only).
-        var preview = null;
-        if (ok) {
-            const firstLine = output.textContent.split('\n').find(l => l.trim()) ?? '';
-            if (firstLine.trim()) {
-                preview = document.createElement('div');
-                preview.className = 'cmd-preview';
-                preview.textContent = firstLine.trim();
-                preview.title = 'Click to expand full output';
-                preview.style.display = output.style.display === 'none' ? '' : 'none';
-                preview.addEventListener('click', toggle);
-                block.insertBefore(preview, output);
+        if (hasOutput && output) {
+            const lines = output.textContent.split('\n').filter(l => l.trim()).length;
+            const toggleArrow = document.createElement('span');
+            toggleArrow.className = 'cmd-toggle';
+            toggleArrow.style.cssText = 'margin-left:auto;font-size:0.75em;opacity:0.6;flex-shrink:0';
+
+            const lineHint = document.createElement('span');
+            lineHint.className = 'cmd-exit';
+            lineHint.textContent = `${lines} line${lines !== 1 ? 's' : ''}`;
+            lineHint.style.opacity = '0.4';
+
+            newHeader.appendChild(toggleArrow);
+            newHeader.appendChild(lineHint);
+            newHeader.style.cursor = 'pointer';
+
+            // On success: collapse output. On failure: leave expanded. Respect manual toggle.
+            if (!block.dataset.userCollapsed) {
+                output.style.display = ok ? 'none' : 'block';
             }
-        }
-    }
+            toggleArrow.textContent = output.style.display === 'none' ? '▶' : '▼';
+
+            const toggle = () => {
+                const hidden = output.style.display === 'none';
+                output.style.display = hidden ? 'block' : 'none';
+                toggleArrow.textContent = hidden ? '▼' : '▶';
+                block.dataset.userCollapsed = hidden ? '' : '1';
+                if (preview) { preview.style.display = hidden ? 'none' : ''; }
+            };
+            block._toggleOutput = toggle;
+            newHeader.addEventListener('click', toggle);
+
+            // Show first line of output as a preview strip when collapsed (success only).
+            var preview = null;
+            if (ok) {
+                const firstLine = output.textContent.split('\n').find(l => l.trim()) ?? '';
+                if (firstLine.trim()) {
+                    preview = document.createElement('div');
+                    preview.className = 'cmd-preview';
+                    preview.textContent = firstLine.trim();
+                    preview.title = 'Click to expand full output';
+                    preview.style.display = output.style.display === 'none' ? '' : 'none';
+                    preview.addEventListener('click', toggle);
+                    block.insertBefore(preview, output);
+                }
+            }
+        } // end if (hasOutput && output)
+    } // end if (header)
 
     scrollBottom();
 }
