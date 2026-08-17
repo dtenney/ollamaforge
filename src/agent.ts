@@ -1293,6 +1293,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Act on every tool result.** If a result contradicts your plan, update the plan. Ignoring a tool result is a failure.
 **Exit 0 is not correctness.** After running a command, read its output once to confirm it worked. If you already confirmed it worked, move on — do NOT re-check the same output again.
 **Done means verified — once.** Written → syntax-checked → executed → output confirmed. One verification pass is enough. Do not run the same verification check more than once.
+**Before declaring done: check the tracking document.** If the user has a tracking document (any file ending in .md, .txt, or .todo that contains a checklist of tasks — e.g. "progress.md", "tasks.md", "TODO.md", "PLAN.md", or a file mentioned by name in the conversation), read it with read_file BEFORE saying the task is complete. Count unchecked items (lines starting with \`- [ ]\` or \`[ ]\` or numbered items without a ✓). If any items remain unchecked, continue working — do NOT declare done.
 
 ## Staying on track
 **Confirmed plan = authorization for all steps.** When the user says yes/go ahead/proceed, execute the entire sequence without pausing to ask "want me to continue-- or "should I do X next-- at each step. Only pause for a genuine blocker: unexpected error, irreversible action not in the plan, or a value only the user can provide.
@@ -2747,6 +2748,8 @@ export class Agent {
     private _currentTaskMessage: string = '';
     /** The first user task message this session -- never overwritten, used for compaction summaries */
     private _originalTaskMessage: string = '';
+    /** Whether the tracking-document completion check has already fired this run (prevents read-doc spiral) */
+    private _trackingDocCheckedThisRun = false;
     /** Whether a focused grep was already injected this turn (prevents double-injection within a turn) */
     private _focusedGrepInjectedThisTurn = false;
     /** File paths for which focused grep content was injected this run (prevents re-injection on loop-back) */
@@ -3660,6 +3663,7 @@ export class Agent {
         // NOTE: _failedEditSignatures intentionally NOT cleared between turns -- persistent across
         // the session so the same broken old_string doesn't retry indefinitely across user replies.
         this._focusedGrepInjectedThisTurn = false; // Reset focused-grep dedup flag
+        this._trackingDocCheckedThisRun = false;   // Reset tracking-doc check so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._editContextInjected = false;     // Reset read-then-act flag
         this._editsThisRun = 0;                // Reset per-turn edit counter (session total in _totalEditsThisSession)
@@ -6458,6 +6462,32 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
                 if (isLegitimateStop) { this.autoRetryCount = 0; }
+
+                // ── Tracking-document check ────────────────────────────────────────────
+                // If the model is about to declare completion (hasCompletionLanguage) but
+                // the user's task references a tracking/progress document that hasn't been
+                // read this turn, inject a nudge to read it first.
+                // Only fires once per run to avoid a read-doc spiral.
+                if (isLegitimateStop && hasCompletionLanguage && !isUserDismissal
+                    && !this._trackingDocCheckedThisRun) {
+                    // Look for a tracking doc reference in the user's original task message
+                    const taskMsg = (this._originalTaskMessage || this._currentTaskMessage || '').toLowerCase();
+                    const trackingDocMatch = taskMsg.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i)
+                        ?? this.lastUserMessage?.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i);
+                    const trackingDoc = trackingDocMatch?.[1];
+                    if (trackingDoc && !this._filesReadThisSession.has(trackingDoc.toLowerCase())) {
+                        // Check if the file actually exists before nudging
+                        const trackingDocAbs = path.join(this.workspaceRoot, trackingDoc);
+                        if (fs.existsSync(trackingDocAbs)) {
+                            this._trackingDocCheckedThisRun = true;
+                            logInfo(`[agent] Completion declared but tracking doc "${trackingDoc}" not read — injecting check nudge`);
+                            this.history.pop();
+                            this.history.push({ role: 'user', content: `[SYSTEM: Before declaring done, read the tracking document "${trackingDoc}" with read_file and check for any unchecked items (lines starting with - [ ] or [ ]). If any remain, continue working on them.]` });
+                            post({ type: 'removeLastAssistant' });
+                            continue;
+                        }
+                    }
+                }
 
                 // ── Read-saturation guard ──────────────────────────────────────────────
                 // Model keeps reading without acting. Action is unique here: we inject the
