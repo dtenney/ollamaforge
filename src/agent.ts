@@ -6626,9 +6626,28 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
 
                     const reason = hasFencedToolCall ? 'fenced' : isDeflecting ? 'deflecting' : isGivingInstructions ? 'giving-instructions' : 'no-tool';
                     logInfo(`[agent] No-tool nudge (reason=${reason}, turn=${turn}, retry=${this.autoRetryCount})`);
-                    this.history.pop();
-                    this.history.push({ role: 'user', content: nudgeContent });
-                    post({ type: 'removeLastAssistant' });
+
+                    // Decide whether to remove the visible response or keep it.
+                    // Planning narration, deflection, giving-instructions, and fenced tool calls
+                    // should be removed — they are mid-task artifacts, not useful to the user.
+                    // Substantial text responses (>80 chars, no planning markers) that look like
+                    // real answers should stay visible — the user saw something useful, and hiding it
+                    // is confusing. We keep the history entry and just append the nudge as a new user turn.
+                    const looksLikeRealAnswer = resp.trim().length > 80
+                        && !isPlanningNarration
+                        && !hasFencedToolCall
+                        && !isDeflecting
+                        && !isGivingInstructions
+                        && !isPlanningLoop;
+                    if (looksLikeRealAnswer) {
+                        // Keep the assistant message visible; push nudge as next user turn.
+                        this.history.push({ role: 'user', content: nudgeContent });
+                    } else {
+                        // Remove the unhelpful partial response and replace with nudge.
+                        this.history.pop();
+                        this.history.push({ role: 'user', content: nudgeContent });
+                        post({ type: 'removeLastAssistant' });
+                    }
                     continue;
                 }
 
