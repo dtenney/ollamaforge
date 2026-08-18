@@ -1970,21 +1970,23 @@ function finalizeCommandBlock(id, exitCode) {
     const hasOutput = output && output.textContent.trim().length > 0;
 
     // Add exit badge, toggle arrow, and line count to header, then wire the click.
-    // Shallow-clone the header first to strip any prior event listeners, then append
-    // all new children to the fresh node so closure references remain live in DOM.
+    // Strategy: append new children directly to the existing header element (no clone),
+    // then replace block._toggleOutput so the already-wired click delegate picks it up.
+    // The click delegate in addCommandBlock calls div._toggleOutput(), so we just need
+    // to update that reference — no need to re-wire listeners or clone the header.
     if (header) {
+        // Remove the streaming dots now that the command has finished.
+        // (already removed above, but guard in case querySelector missed it)
+
         const badge = document.createElement('span');
         badge.className = 'cmd-exit';
         badge.textContent = ok ? `✓ exit 0` : `✗ exit ${exitCode}`;
         badge.style.color = ok ? '#4ec94e' : '#f44747';
-
-        // Shallow clone strips old listeners without detaching children we haven't added yet.
-        const newHeader = header.cloneNode(false);
-        header.replaceWith(newHeader);
-        newHeader.appendChild(badge);
+        header.appendChild(badge);
 
         if (hasOutput && output) {
             const lines = output.textContent.split('\n').filter(l => l.trim()).length;
+
             const toggleArrow = document.createElement('span');
             toggleArrow.className = 'cmd-toggle';
             toggleArrow.style.cssText = 'margin-left:auto;font-size:0.75em;opacity:0.6;flex-shrink:0';
@@ -1994,9 +1996,9 @@ function finalizeCommandBlock(id, exitCode) {
             lineHint.textContent = `${lines} line${lines !== 1 ? 's' : ''}`;
             lineHint.style.opacity = '0.4';
 
-            newHeader.appendChild(toggleArrow);
-            newHeader.appendChild(lineHint);
-            newHeader.style.cursor = 'pointer';
+            header.appendChild(toggleArrow);
+            header.appendChild(lineHint);
+            header.style.cursor = 'pointer';
 
             // On success: collapse output. On failure: leave expanded. Respect manual toggle.
             if (!block.dataset.userCollapsed) {
@@ -2004,17 +2006,7 @@ function finalizeCommandBlock(id, exitCode) {
             }
             toggleArrow.textContent = output.style.display === 'none' ? '▶' : '▼';
 
-            const toggle = () => {
-                const hidden = output.style.display === 'none';
-                output.style.display = hidden ? 'block' : 'none';
-                toggleArrow.textContent = hidden ? '▼' : '▶';
-                block.dataset.userCollapsed = hidden ? '' : '1';
-                if (preview) { preview.style.display = hidden ? 'none' : ''; }
-            };
-            block._toggleOutput = toggle;
-            newHeader.addEventListener('click', toggle);
-
-            // Show first line of output as a preview strip when collapsed (success only).
+            // Preview strip (first line, shown when collapsed, success only).
             var preview = null;
             if (ok) {
                 const firstLine = output.textContent.split('\n').find(l => l.trim()) ?? '';
@@ -2024,10 +2016,21 @@ function finalizeCommandBlock(id, exitCode) {
                     preview.textContent = firstLine.trim();
                     preview.title = 'Click to expand full output';
                     preview.style.display = output.style.display === 'none' ? '' : 'none';
-                    preview.addEventListener('click', toggle);
                     block.insertBefore(preview, output);
                 }
             }
+
+            // Update block._toggleOutput in-place — the click listener in addCommandBlock
+            // already delegates to this property, so no new addEventListener needed.
+            block._toggleOutput = () => {
+                const hidden = output.style.display === 'none';
+                output.style.display = hidden ? 'block' : 'none';
+                toggleArrow.textContent = hidden ? '▼' : '▶';
+                block.dataset.userCollapsed = hidden ? '' : '1';
+                if (preview) { preview.style.display = hidden ? 'none' : ''; }
+            };
+            // Also wire preview click directly (it's not covered by the header delegate).
+            if (preview) { preview.addEventListener('click', block._toggleOutput); }
         } // end if (hasOutput && output)
     } // end if (header)
 

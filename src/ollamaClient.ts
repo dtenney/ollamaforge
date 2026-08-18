@@ -148,7 +148,12 @@ export function streamChatRequest(
         if (thinkingEnabled) {
             // `think` is a top-level Ollama parameter, NOT inside options{} — sending it inside options
             // causes "invalid option provided: think" warnings in Ollama logs (OLLAMA_LOOP_BUG.md).
-            (payload as Record<string, unknown>).think = true;
+            // For Qwen3.8+, `think` also accepts effort levels: "low", "medium", "high".
+            // Map our config value ("xhigh" → "high"; empty → true for on/off compat).
+            const thinkValue: string | boolean = (cfg.reasoningEffort && /qwen3/i.test(modelLower))
+                ? (cfg.reasoningEffort === 'xhigh' ? 'high' : cfg.reasoningEffort)
+                : true;
+            (payload as Record<string, unknown>).think = thinkValue;
             // Accuracy over speed: use lower temperature when thinking is on.
             // High temp + chain-of-thought = hallucination. Default 0.7 → 0.3 for thinking models.
             const effectiveTemp = cfg.temperature !== 0.7 ? cfg.temperature : 0.3;
@@ -169,17 +174,15 @@ export function streamChatRequest(
         // 4096 gives enough headroom for tool calls + surrounding text without enabling spirals.
         opts.num_predict = options?.numPredict ?? 4096;
         if (Object.keys(opts).length > 0) { payload.options = opts; }
-        // reasoning_effort: Qwen3.8+ supports "low", "medium", "xhigh" (default xhigh).
-        // Only send when the user has explicitly configured a non-default value and the model supports it.
-        if (cfg.reasoningEffort && thinkingEnabled && /qwen3/i.test(modelLower)) {
-            payload.reasoning_effort = cfg.reasoningEffort;
-        }
+        // reasoning_effort is handled via the `think` field above (native /api/chat endpoint).
+        // Do NOT send reasoning_effort here — it only works on /v1/chat/completions (OpenAI compat).
         // keep_alive: how long Ollama holds the model in GPU memory after the request.
         // Configured by the user; defaults to '10m' to avoid cold-start latency on consecutive calls.
         if (cfg.keepAlive) { payload.keep_alive = cfg.keepAlive; }
 
         const body = JSON.stringify(payload);
-        logInfo(`POST /api/chat  model=${model}  msgs=${messages.length}  think=${thinkingEnabled}  temp=${opts.temperature ?? 0.7}  num_predict=${opts.num_predict}  num_ctx=${cfg.contextWindow || 'model-default'}  keep_alive=${cfg.keepAlive || 'default'}`);
+        const thinkVal = (payload as Record<string, unknown>).think;
+        logInfo(`POST /api/chat  model=${model}  msgs=${messages.length}  think=${thinkVal ?? false}  temp=${opts.temperature ?? 0.7}  num_predict=${opts.num_predict}  num_ctx=${cfg.contextWindow || 'model-default'}  keep_alive=${cfg.keepAlive || 'default'}`);
 
         const req = makeRequest(
             {

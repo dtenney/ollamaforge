@@ -502,15 +502,15 @@
         },
         "ollamaForge.reasoningEffort": {
           "type": "string",
-          "enum": ["", "low", "medium", "xhigh"],
+          "enum": ["", "low", "medium", "high"],
           "enumDescriptions": [
-            "Use model default (xhigh — maximum reasoning depth)",
+            "Use model default (high — maximum reasoning depth)",
             "Low reasoning effort: faster responses, less thorough reasoning",
             "Medium reasoning effort: balanced speed and depth",
             "Maximum reasoning effort: deepest thinking, slowest (model default)"
           ],
           "default": "",
-          "markdownDescription": "Reasoning effort for Qwen3.8+ models (`reasoning_effort` parameter). Controls how deeply the model reasons before answering. Leave empty to use the model default (`xhigh`). **Note:** Setting this lower can speed up responses but may cause more retries on complex agentic tasks, which can increase total latency."
+          "markdownDescription": "Reasoning effort for Qwen3.8+ models (maps to the `think` parameter level). Controls how deeply the model reasons before answering. Leave empty to use the model default (`high`). **Note:** Setting this lower can speed up responses but may cause more retries on complex agentic tasks, which can increase total latency."
         },
         "ollamaForge.stack.sshHost": {
           "type": "string",

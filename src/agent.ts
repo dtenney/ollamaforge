@@ -1226,6 +1226,8 @@ For any logic that needs to run on a remote host, the sequence is always:
   4. run_command: ssh HOST python3 /tmp/myscript.py
 
 Never use ssh with inline Python (python3 -c), heredocs (<< EOF), or awk scripts -- BusyBox/ash does not support them. Simple commands over ssh are always fine: "ssh host ls /path", "ssh host systemctl restart svc", "ssh host 'cd /dir && ./run.sh'". Only multi-line interpreters (python3 -c, awk) and heredocs need the write_file + scp + ssh pattern.
+**NEVER use ssh ... sed -i to edit a remote file** -- the local shell mangles quotes and backslashes before ssh sees them, corrupting the file. To edit a remote file: edit the local copy with edit_file, then scp it up, then ssh to move it into place.
+**Avoid long ssh && chains** -- when chaining "cmd1 && cmd2 && cmd3" over ssh, a silent failure in cmd1 can leave the system in a half-applied state. For multi-step remote operations, write a script locally and scp+run it instead.
 After every scp, verify the file exists on the remote before running it -- once. If the file was confirmed present, proceed immediately without re-checking.
 Copy remote paths verbatim from tool results -- never reconstruct from memory or local paths.
 Destructive scripts (mv, rm, archive): add DRY_RUN=True mode, run dry-run first, show output, then re-run with DRY_RUN=False after the user sees the preview.
@@ -2693,6 +2695,8 @@ export class Agent {
     /** Count consecutive pre-draft / spiral aborts -- hard-stop after 3 to protect Ollama */
     private _consecutiveAborts = 0;
     private readonly MAX_CONSECUTIVE_ABORTS = 3;
+    /** Track auto-learned correction rule IDs so we don't re-learn the same rule twice per session */
+    private _autoLearnedRuleIds = new Set<string>();
     private _readOnlyTurnsSinceLastEdit = 0; // tracks consecutive read-only turns without an edit
     private _responseFingerprints: string[] = []; // rolling list of response fingerprints for loop detection
     /** Current execution phase -- drives stall thresholds without task-keyword matching.
@@ -2816,6 +2820,12 @@ export class Agent {
     private _lastPlanStepOutput: string = '';
     /** Absolute path of the active task plan file (plans/<name>.md), or null if none */
     private _activePlanFile: string | null = null;
+    /** Absolute path of the active PROJECT.md (project-level tracker), or null if none */
+    private _activeProjectFile: string | null = null;
+    /** Turn number when the project context was last injected — throttles re-injection */
+    private _projectNudgeLastTurn: number = -1;
+    /** Whether the project file update-before-stop guard has fired this run */
+    private _projectStopGuardFiredThisRun: boolean = false;
     /** Async subagent handles -- keyed by handle string returned by delegate_task_async */
     private _asyncHandles: Map<string, Promise<string>> = new Map();
     /** Monotonic counter for async handle uniqueness -- never reused within an Agent instance */
@@ -2857,6 +2867,15 @@ export class Agent {
                 this._codeGraph = graph;
                 // Background workspace index on first run (non-blocking)
                 graph.indexWorkspace().catch(() => {/* ignore */});
+            }
+        }
+
+        // Auto-detect an existing PROJECT.md on session start
+        if (workspaceRoot) {
+            const found = this.findProjectFile();
+            if (found) {
+                this._activeProjectFile = found;
+                logInfo(`[project] Found existing project file: ${path.relative(workspaceRoot, found).replace(/\\/g, '/')}`);
             }
         }
     }
@@ -3597,6 +3616,12 @@ export class Agent {
         }
 
         this.userTurnCount++;
+        // Auto-learn correction rules from user feedback.
+        // Awaited so the 📌 note appears before the agent response, not mid-stream.
+        // Fast path: returns immediately on no match or if memory is unavailable.
+        if (this.userTurnCount > 1) {
+            await this.autoLearnCorrection(userMessage, post).catch(() => {});
+        }
         this.autoRetryCount = 0;      // Reset auto-retry counter for each new user message
         this._consecutiveAborts = 0;  // Reset abort streak counter
         this._consecutiveNoWriteRuns = 0; // Reset no-write streak for each new user message
@@ -3664,6 +3689,7 @@ export class Agent {
         // the session so the same broken old_string doesn't retry indefinitely across user replies.
         this._focusedGrepInjectedThisTurn = false; // Reset focused-grep dedup flag
         this._trackingDocCheckedThisRun = false;   // Reset tracking-doc check so it can fire once per user message
+        this._projectStopGuardFiredThisRun = false; // Reset project stop guard so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._editContextInjected = false;     // Reset read-then-act flag
         this._editsThisRun = 0;                // Reset per-turn edit counter (session total in _totalEditsThisSession)
@@ -4697,6 +4723,41 @@ The user has set trust level to Trust. This means:
 Before executing anything, call task_log once with status "started" and a message listing the steps you plan to take (e.g. "Steps: 1. Review X  2. Fix Y  3. Deploy Z"). Then call task_log with status "step" after each step completes. This keeps your plan visible across context compactions and turn-limit resets — you can always see what's done and what's next.`;
         }
 
+        // ── Project-level task detection ──────────────────────────────────────────
+        // When the user describes work spanning multiple phases, streams, or sessions
+        // (weeks/months of effort, multiple tracks), auto-create PROJECT.md to anchor
+        // the agent's awareness across compactions and sessions.
+        // Only fires on the first user turn and only if no PROJECT.md exists yet.
+        const _isProjectLevelTask = !isConfirmation && !this._activeProjectFile && this.userTurnCount <= 2 && (
+            /\b(phase[s]?|stream[s]?|milestone[s]?|sprint[s]?|initiative|roadmap|multi[- ]?phase|multi[- ]?stream|long[- ]?term|over\s+the\s+(next|coming)\s+(week|month|quarter))\b/i.test(userMessage)
+            || /\b(track\s+\d|track\s+(a|b|one|two)|parallel\s+(work|effort|stream)|two\s+tracks|three\s+tracks)\b/i.test(userMessage)
+            || /\b(project\s+(plan|tracker|tracking)|keep\s+track\s+of|tracking\s+doc|tracking\s+document)\b/i.test(userMessage)
+        );
+        if (_isProjectLevelTask) {
+            // Create a minimal PROJECT.md skeleton — agent will fill in the real phases/streams
+            this.writeProjectFile(userMessage, ['(agent will fill in phases after planning)'], []);
+            baseSystemContent += `\n\n## PROJECT-LEVEL TASK — CREATE PROJECT.md
+This task spans multiple phases or streams. A PROJECT.md skeleton has been created at the workspace root. Before starting any work:
+1. Read PROJECT.md with read_file
+2. Replace the placeholder phases/streams with real ones based on the user's description
+3. Use PROJECT.md as your master checklist — tick items off with edit_file as you complete them
+4. Before stopping each session, update the "Next action" line in PROJECT.md so the next session can resume instantly`;
+        }
+
+        // If a PROJECT.md is already active, surface its "next action" to orient this session
+        if (this._activeProjectFile && !_isProjectLevelTask && this.userTurnCount === 1) {
+            try {
+                const pfContent = fs.readFileSync(this._activeProjectFile, 'utf8');
+                const nextActionMatch = pfContent.match(/\*\*Next action\*\*:\s*(.+)/);
+                const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
+                if (nextActionMatch) {
+                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nLast recorded next action: **${nextActionMatch[1].trim()}**\nRead ${relPf} now to see the current open items before responding.`;
+                } else {
+                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nA project tracking file exists. Read it now to see current status before responding.`;
+                }
+            } catch { /* non-fatal */ }
+        }
+
         // Inject periodic memory nudge as a separate system message (not mutating user message)
         let memoryNudgeMsg: OllamaMessage | null = null;
         if (cfg.autoSaveMemory) {
@@ -4706,6 +4767,24 @@ Before executing anything, call task_log once with status "started" and a messag
                 // that appear anywhere other than position 0.
                 memoryNudgeMsg = { role: 'user', content: `[SYSTEM: ${nudge.trim()}]` };
                 logInfo(`[agent] Memory nudge prepared at turn ${this.userTurnCount}`);
+            }
+        }
+
+        // Inject periodic project context nudge — re-surfaces open items from PROJECT.md every 6 turns
+        // so compaction never causes the agent to lose track of the larger plan.
+        let projectNudgeMsg: OllamaMessage | null = null;
+        if (this._activeProjectFile) {
+            const PROJECT_NUDGE_INTERVAL = 6;
+            const turnsSinceLastNudge = this.userTurnCount - this._projectNudgeLastTurn;
+            if (turnsSinceLastNudge >= PROJECT_NUDGE_INTERVAL || this._projectNudgeLastTurn < 0) {
+                const openItems = this.readProjectOpenItems();
+                if (openItems) {
+                    const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
+                    const nudgeText = `[SYSTEM: PROJECT CONTEXT REMINDER — You are working on an extended project tracked in ${relPf}. Current open items:\n\n${openItems}\n\nAfter completing any item, tick it off in ${relPf} with edit_file. Do not declare the overall project done until all items are checked. Do not mention this reminder to the user.]`;
+                    projectNudgeMsg = { role: 'user', content: nudgeText };
+                    this._projectNudgeLastTurn = this.userTurnCount;
+                    logInfo(`[project] Project nudge injected at turn ${this.userTurnCount} (${openItems.split('\n').filter(l => l.startsWith('- [ ]')).length} open items)`);
+                }
             }
         }
 
@@ -5647,9 +5726,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     if (_inToolBlock) { return false; }
 
                     // Wait for enough model-generated content before checking -- tool output
-                    // echoed in the first ~1000 chars can contain repeated tokens in filenames
-                    // (e.g. "handshake_partial.220_partial.220...") and must not trigger abort.
-                    if (_spiralBuf.length < 800) { return false; }
+                    // echoed in the first ~2000 chars (esp. thinking tokens about SSH/JSON output)
+                    // can contain repeated tokens and must not trigger abort.
+                    if (_spiralBuf.length < 2000) { return false; }
 
                     // Throttle: run expensive checks only every SPIRAL_CHECK_INTERVAL tokens.
                     if ((++_spiralCheckCounter % SPIRAL_CHECK_INTERVAL) !== 0) { return false; }
@@ -5658,12 +5737,13 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // tool-result data echoed near the start of the response.
                     const tail = _spiralBuf.slice(-600);
                     if (/(.{15,60})\1{4,}/.test(tail)) { _spiralAborted = true; return true; }
-                    // Check for line repetition: same line 4+ times in recent output
-                    const recentLines = _spiralBuf.slice(-800).split('\n').map(l => l.trim()).filter(l => l.length > 15);
-                    if (recentLines.length >= 6) {
+                    // Check for line repetition: same line 5+ times in recent output (raised from 4
+                    // to reduce false-positives on SSH/log/JSON output with naturally repeated structure).
+                    const recentLines = _spiralBuf.slice(-1200).split('\n').map(l => l.trim()).filter(l => l.length > 15);
+                    if (recentLines.length >= 8) {
                         const freq: Record<string, number> = {};
                         for (const l of recentLines) { freq[l] = (freq[l] ?? 0) + 1; }
-                        if (Object.values(freq).some(c => c >= 4)) { _spiralAborted = true; return true; }
+                        if (Object.values(freq).some(c => c >= 5)) { _spiralAborted = true; return true; }
                     }
                     return false;
                 };
@@ -5710,7 +5790,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 }
                 result = await streamChatRequest(
                     effectiveModel,
-                    [{ role: 'system', content: systemContent }, ...this.history, ...(memoryNudgeMsg ? [memoryNudgeMsg] : []), ctxBudgetMsg],
+                    [{ role: 'system', content: systemContent }, ...this.history, ...(memoryNudgeMsg ? [memoryNudgeMsg] : []), ...(projectNudgeMsg ? [projectNudgeMsg] : []), ctxBudgetMsg],
                     tools,
                     (token) => { const t = streamFilter(token); if (t) { post({ type: 'token', text: t }); } },
                     this.stopRef,
@@ -6490,6 +6570,29 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             post({ type: 'removeLastAssistant' });
                             continue;
                         }
+                    }
+                }
+
+                // ── Project file: update-before-stop guard ────────────────────────────
+                // When a PROJECT.md is active and the agent is about to stop, require it
+                // to tick off completed items and stamp the next-action line before finishing.
+                // Only fires once per run to prevent a loop, and only on completion stops.
+                if (isLegitimateStop && hasCompletionLanguage && !isUserDismissal
+                    && this._activeProjectFile && !this._projectStopGuardFiredThisRun) {
+                    const openItems = this.readProjectOpenItems();
+                    if (openItems) {
+                        // There are still open items — nudge the agent to check them
+                        this._projectStopGuardFiredThisRun = true;
+                        const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
+                        logInfo(`[project] Completion declared with open project items — injecting project check nudge`);
+                        this.history.pop();
+                        this.history.push({ role: 'user', content: `[SYSTEM: Before stopping, read ${relPf} with read_file. Check which items you completed this session and tick them off with edit_file (change "- [ ]" to "- [x]"). Also update the "Next action" line to describe what should happen next session. Then continue any remaining unchecked items if they are in scope for this request.]` });
+                        post({ type: 'removeLastAssistant' });
+                        continue;
+                    } else {
+                        // All items checked — just stamp the timestamp and next-action
+                        this._projectStopGuardFiredThisRun = true;
+                        this.stampProjectFile('(all items complete — see Notes for follow-up)');
                     }
                 }
 
@@ -7295,6 +7398,32 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     const cmd = String(args.command ?? '');
                     const isSSHCmd = /\bssh\b/.test(cmd);
                     if (isSSHCmd) {
+                        // Hard block: ssh ... sed -i (remote in-place edit) -- quoting always mangles the
+                        // replacement string. The right pattern is: edit locally → scp → ssh sudo mv.
+                        const SSH_SED_BLOCK_RE = /\bssh\b[^|&;]*\bsed\s+-i\b/s;
+                        if (SSH_SED_BLOCK_RE.test(cmd)) {
+                            this._sshInlineGuardFired = true;
+                            logWarn('[agent] SSH sed -i blocked -- shell quoting mangles replacement strings');
+                            const sedHint = `[SYSTEM: ssh ... sed -i always mangles the replacement string because the shell on the local side interprets quotes and backslashes before ssh sees them. The edit will corrupt the remote file.
+
+Use the reliable remote-edit pattern instead:
+  1. read_file: the local copy of the file (or scp the remote file down first if it differs)
+  2. edit_file: make the change locally
+  3. run_command: scp <local_file> USER@HOST:/tmp/<filename>
+  4. run_command: ssh USER@HOST "sudo cp /tmp/<filename> <remote_path> && sudo chown <owner> <remote_path>"
+
+Do NOT use ssh + sed -i. Edit the file locally and scp it up.]`;
+                            if (isTextMode) {
+                                this.history.push({ role: 'user', content: sedHint });
+                            } else {
+                                this.history.push({ role: 'tool', content: sedHint });
+                            }
+                            post({ type: 'toolResult', id: toolId, name, success: false, preview: '(SSH sed -i blocked — edit locally then scp)' });
+                            this.consecutiveSameToolCalls = 0;
+                            this.lastToolName = '';
+                            break;
+                        }
+
                         // Hard block: multi-line python3 -c or heredoc -- guaranteed to fail on BusyBox
                         const SSH_HARD_BLOCK_RE = /\bssh\b.*(?:python3\s+-c\s+["'][^"']*\n|<<\s*['"]?EOF)/s;
                         // Soft nudge: single-line python3 -c, awk, or find -printf (may work, but fragile)
@@ -13712,6 +13841,190 @@ ${sampleHtml}
         this._activePlanFile = null;
     }
 
+    // -- Auto-learn corrections from user feedback ---------------------------------------------------
+
+    /**
+     * Detect correction language in a user message and auto-write a Tier 3 convention entry.
+     * Fires at most once per unique rule per session. Returns the rule text if learned, else null.
+     *
+     * Patterns detected:
+     *   "don't / stop / never / avoid / no more [doing X]"
+     *   "use X not Y" / "use X instead [of Y]"
+     *   "no, [do X]" / "actually [do X]"
+     */
+    private async autoLearnCorrection(userMessage: string, postFn: (e: unknown) => void): Promise<void> {
+        if (!this.memory) { return; }
+
+        const msg = userMessage.trim();
+        // Must be short-ish (corrections are usually brief directives, not long task descriptions)
+        if (msg.length > 400) { return; }
+
+        // Normalise for matching; keep original casing for storage
+        const lower = msg.toLowerCase();
+
+        // Pattern A: prohibition  —  "don't X", "stop X", "never X", "avoid X", "no more X"
+        const prohibitionMatch = lower.match(
+            /^(?:please\s+)?(?:don'?t|do not|stop|never|avoid|no more|quit|cease)\s+(.{8,120})$/
+        );
+
+        // Pattern B: preference swap  —  "use X not Y" / "use X instead"
+        // Bug fix: was `.{4,60?}` (invalid quantifier) — corrected to `.{4,60}`
+        const preferenceMatch = lower.match(
+            /^(?:please\s+)?use\s+(.{4,60}?)(?:\s+(?:not|instead of|rather than)\s+(.{4,60}))?(?:\s*,\s*.+)?$/
+        );
+
+        // Pattern C: soft correction opening  —  "no, use X" / "actually stop Y" / "wait, never Z"
+        // Bug fix: was capturing only after the imperative keyword, losing negation words like "never".
+        // Now captures the full imperative clause so "actually never do X" → "never do X".
+        const softCorrectionMatch = lower.match(
+            /^(?:no[,.]?\s+|actually[,.]?\s+|wait[,.]?\s+)(?:please\s+)?(.{8,120})$/
+        );
+
+        let ruleText: string | null = null;
+
+        if (prohibitionMatch) {
+            // Bug fix: strip a leading "avoid" from the capture to prevent "Convention: avoid avoid X"
+            const body = prohibitionMatch[1].replace(/^avoid\s+/, '').trimEnd().replace(/\.$/, '');
+            ruleText = `Convention: avoid ${body}`;
+        } else if (preferenceMatch) {
+            const prefer = preferenceMatch[1].trimEnd();
+            const avoid = preferenceMatch[2]?.trimEnd();
+            ruleText = avoid
+                ? `Convention: use ${prefer} instead of ${avoid}`
+                : `Convention: prefer ${prefer}`;
+        } else if (softCorrectionMatch) {
+            ruleText = `Convention: ${softCorrectionMatch[1].trimEnd().replace(/\.$/, '')}`;
+        }
+
+        if (!ruleText) { return; }
+
+        // Deduplicate within session using a normalised key
+        const ruleKey = ruleText.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+        if (this._autoLearnedRuleIds.has(ruleKey)) { return; }
+
+        // Skip if semantically duplicate to an existing memory entry
+        try {
+            const isDupe = await this.memory.isSemanticDuplicate(ruleText, 0.82);
+            if (isDupe) {
+                logInfo(`[auto-learn] Rule already in memory (semantic dupe): "${ruleText.slice(0, 60)}"`);
+                return;
+            }
+        } catch { /* Qdrant unavailable — write anyway */ }
+
+        // Bug fix: only add to dedup set after a successful write, not speculatively before.
+        // This way a failed write can be retried on the next correction message.
+        try {
+            await this.memory.addEntry(3, ruleText, ['auto-learned', 'convention']);
+            this._autoLearnedRuleIds.add(ruleKey);
+            logInfo(`[auto-learn] Learned Tier 3 convention: "${ruleText.slice(0, 80)}"`);
+            postFn({ type: 'info', text: `📌 Learned: ${ruleText}` });
+        } catch (err) {
+            logWarn(`[auto-learn] Failed to write convention: ${toErrorMessage(err)}`);
+        }
+    }
+
+    // -- Project file (PROJECT.md) -------------------------------------------------------------------
+
+    /**
+     * Find the project file for the current workspace.
+     * Searches for PROJECT.md (or any *.project.md) in the workspace root.
+     */
+    private findProjectFile(): string | null {
+        if (!this.workspaceRoot) { return null; }
+        const explicit = path.join(this.workspaceRoot, 'PROJECT.md');
+        if (fs.existsSync(explicit)) { return explicit; }
+        try {
+            const files = fs.readdirSync(this.workspaceRoot);
+            const match = files.find(f => f.toLowerCase().endsWith('.project.md'));
+            if (match) { return path.join(this.workspaceRoot, match); }
+        } catch { /* non-fatal */ }
+        return null;
+    }
+
+    /**
+     * Read the unchecked items from the active project file.
+     * Returns a formatted summary of open items by section, or empty if all done.
+     */
+    private readProjectOpenItems(): string {
+        const pf = this._activeProjectFile;
+        if (!pf || !fs.existsSync(pf)) { return ''; }
+        try {
+            const content = fs.readFileSync(pf, 'utf8');
+            const rawLines = content.split('\n');
+            const openItems: string[] = [];
+            let currentSection = '';
+            for (const line of rawLines) {
+                const sectionMatch = line.match(/^#+\s+(.+)/);
+                if (sectionMatch) { currentSection = sectionMatch[1].trim(); }
+                if (/^[-*]\s+\[ \]/.test(line)) {
+                    const item = line.replace(/^[-*]\s+\[ \]\s*/, '').trim();
+                    openItems.push(currentSection ? `[${currentSection}] ${item}` : item);
+                }
+            }
+            if (openItems.length === 0) { return ''; }
+            const relPath = path.relative(this.workspaceRoot, pf).replace(/\\/g, '/');
+            return `## Open project items (from ${relPath})\n${openItems.map(i => `- [ ] ${i}`).join('\n')}`;
+        } catch { return ''; }
+    }
+
+    /**
+     * Create PROJECT.md for a new multi-phase project.
+     */
+    private writeProjectFile(goal: string, phases: string[], streams: string[]): void {
+        if (!this.workspaceRoot) { return; }
+        try {
+            const filePath = path.join(this.workspaceRoot, 'PROJECT.md');
+            const now = new Date().toISOString().slice(0, 10);
+            const fileLines: string[] = [
+                `# Project: ${goal.slice(0, 100)}`,
+                '',
+                `**Created**: ${now}`,
+                `**Last updated**: ${now}`,
+                '**Status**: in progress',
+                '',
+            ];
+            if (phases.length > 0) {
+                fileLines.push('## Phases');
+                for (const p of phases) { fileLines.push(`- [ ] ${p}`); }
+                fileLines.push('');
+            }
+            if (streams.length > 0) {
+                fileLines.push('## Streams');
+                for (const s of streams) { fileLines.push(`- [ ] ${s}`); }
+                fileLines.push('');
+            }
+            fileLines.push('## Notes', '');
+            fs.writeFileSync(filePath, fileLines.join('\n'), 'utf8');
+            this._activeProjectFile = filePath;
+            logInfo(`[project] Created PROJECT.md (${phases.length} phases, ${streams.length} streams)`);
+        } catch (err) {
+            logWarn(`[project] Could not write PROJECT.md: ${toErrorMessage(err)}`);
+        }
+    }
+
+    /**
+     * Stamp PROJECT.md with "last updated" and a next-action line before the agent stops.
+     */
+    private stampProjectFile(nextAction: string): void {
+        const pf = this._activeProjectFile;
+        if (!pf || !fs.existsSync(pf)) { return; }
+        try {
+            let pfContent = fs.readFileSync(pf, 'utf8');
+            const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+            pfContent = pfContent.replace(/\*\*Last updated\*\*: .*/, `**Last updated**: ${now}`);
+            if (nextAction) {
+                if (pfContent.includes('**Next action**:')) {
+                    pfContent = pfContent.replace(/\*\*Next action\*\*: .*/, `**Next action**: ${nextAction}`);
+                } else {
+                    pfContent = pfContent.replace(/\*\*Status\*\*: .*/, `**Status**: in progress\n**Next action**: ${nextAction}`);
+                }
+            }
+            fs.writeFileSync(pf, pfContent, 'utf8');
+            logInfo(`[project] Stamped PROJECT.md: next=${nextAction.slice(0, 60)}`);
+        } catch { /* silent */ }
+    }
+
+
     // â"€â"€ Session recon â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     /**
@@ -13757,6 +14070,29 @@ ${sampleHtml}
         // Shell
         const shellEnv = detectShellEnvironment();
         lines.push(`- Shell: ${shellEnv.label}`);
+        if (platform === 'win32') {
+            lines.push(`- ⚠ Windows: use Git Bash syntax in run_command (find/cat/grep/ls). PowerShell cmdlets (Get-ChildItem, Set-Content, etc.) will fail with "command not found".`);
+        }
+
+        // Detect deploy command from package.json if present
+        try {
+            const pkgPath = path.join(process.cwd(), 'package.json');
+            if (fs.existsSync(pkgPath)) {
+                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { scripts?: Record<string, string>; name?: string };
+                const scripts = pkg.scripts ?? {};
+                const deployCmd = scripts['deploy'] ? 'npm run deploy'
+                    : scripts['build'] ? 'npm run build'
+                    : scripts['bundle'] ? 'npm run bundle'
+                    : '';
+                if (deployCmd) {
+                    lines.push(`- Deploy command: \`${deployCmd}\` (from package.json scripts)`);
+                }
+                // Flag if tsc is the compile step (don't confuse with deploy)
+                if (scripts['compile']?.includes('tsc') && scripts['deploy']) {
+                    lines.push(`  ⚠ "npm run compile" uses tsc (type-check only) — use "${deployCmd}" to build and deploy, not compile`);
+                }
+            }
+        } catch { /* non-fatal */ }
 
         const result = lines.join('\n');
         logInfo(`[recon] Session environment:\n${result}`);
