@@ -14121,7 +14121,7 @@ ${sampleHtml}
      *   "use X not Y" / "use X instead [of Y]"
      *   "no, [do X]" / "actually [do X]"
      */
-    private async autoLearnCorrection(userMessage: string, postFn: (e: unknown) => void): Promise<void> {
+    private async autoLearnCorrection(userMessage: string, postFn: PostFn): Promise<void> {
         if (!this.memory) { return; }
 
         const msg = userMessage.trim();
