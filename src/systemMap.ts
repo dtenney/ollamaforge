@@ -42,6 +42,12 @@ export interface SystemNode {
     /** Key facts: host, port, path, tech stack, etc. */
     metadata: Record<string, string>;
     updatedAt: string;      // ISO timestamp
+    /**
+     * Signal strength in [0, 1]. Decays exponentially at ~50% per 90 days.
+     * Nodes below EVICTION_THRESHOLD are removed during decay passes.
+     * Defaults to 1.0 on creation; boosted toward 1.0 on each upsert/touch.
+     */
+    signalStrength?: number;
 }
 
 export interface SystemEdge {
@@ -59,6 +65,13 @@ export interface SystemMap {
     nodes: SystemNode[];
     edges: SystemEdge[];
 }
+
+// ── Decay constants ────────────────────────────────────────────────────────────
+
+/** Nodes with signalStrength below this are evicted during a decay pass. */
+const EVICTION_THRESHOLD = 0.1;
+/** Half-life for signal decay in days (strength halves every 90 days without reinforcement). */
+const HALF_LIFE_DAYS = 90;
 
 // ── Storage path ───────────────────────────────────────────────────────────────
 
@@ -104,6 +117,11 @@ function save(map: SystemMap): void {
 /**
  * Upsert a node. If a node with the same id already exists, merges metadata
  * and updates label/description/type if provided.
+ *
+ * Signal strength behaviour on update:
+ * - If the caller provides an explicit `signalStrength`, it is used as-is (clamped to [0,1]).
+ * - Otherwise the existing strength is boosted 50% toward 1.0: `strength = strength * 0.5 + 0.5`.
+ *   This makes each upsert reinforce the node without resetting it.
  */
 export function upsertNode(node: Omit<SystemNode, 'updatedAt'>): SystemMap {
     const map = load();
@@ -113,10 +131,15 @@ export function upsertNode(node: Omit<SystemNode, 'updatedAt'>): SystemMap {
         existing.type        = node.type        || existing.type;
         existing.label       = node.label       || existing.label;
         existing.description = node.description || existing.description;
-        existing.metadata    = { ...existing.metadata, ...node.metadata };
+        // `?? {}` guards against callers that omit metadata entirely
+        existing.metadata    = { ...existing.metadata, ...(node.metadata ?? {}) };
         existing.updatedAt   = now;
+        // Honour an explicit caller-provided strength; otherwise boost toward 1.0
+        existing.signalStrength = node.signalStrength !== undefined
+            ? Math.min(1.0, Math.max(0, node.signalStrength))
+            : Math.min(1.0, (existing.signalStrength ?? 1.0) * 0.5 + 0.5);
     } else {
-        map.nodes.push({ ...node, updatedAt: now });
+        map.nodes.push({ ...node, updatedAt: now, signalStrength: node.signalStrength ?? 1.0 });
     }
     save(map);
     return map;
@@ -138,6 +161,77 @@ export function upsertEdge(edge: Omit<SystemEdge, 'id' | 'updatedAt'>): SystemMa
     }
     save(map);
     return map;
+}
+
+/**
+ * Boost the signal strength of a node without changing any other fields.
+ * Use this when the agent observes a node being actively used (e.g. a service
+ * was successfully called, a workspace was opened). Nodes that are never touched
+ * decay toward zero and are eventually evicted by decayMap().
+ */
+export function touchNode(nodeId: string): void {
+    const map = load();
+    const node = map.nodes.find(n => n.id === nodeId);
+    if (!node) { return; }
+    node.signalStrength = Math.min(1.0, (node.signalStrength ?? 1.0) * 0.5 + 0.5);
+    node.updatedAt = new Date().toISOString();
+    save(map);
+}
+
+/**
+ * Apply exponential signal strength decay to all nodes based on time elapsed
+ * since their last updatedAt timestamp. Evicts nodes whose strength drops below
+ * EVICTION_THRESHOLD (0.1). Edges whose endpoints were evicted are also removed.
+ *
+ * Formula: strength *= exp(-daysSinceUpdate / HALF_LIFE_DAYS * ln2)
+ * Effect: a node untouched for 90 days halves its strength; after ~300 days it
+ * falls below the 0.1 eviction threshold and is removed.
+ *
+ * Edge lifetime: edges are coupled to node lifetime rather than decayed
+ * independently. SystemEdge has no signalStrength field — an edge is kept as
+ * long as both its endpoints survive decay, and removed the moment either
+ * endpoint is evicted. This is intentional: edges represent relationships that
+ * are only meaningful if both participants are still active.
+ *
+ * Save behaviour: decay always mutates every node's signalStrength in the
+ * in-memory copy. The map is saved whenever there is at least one node (even
+ * if nothing was evicted) so that updated strength values are persisted.
+ * An empty map is not saved to avoid creating a file for the zero-node case.
+ *
+ * Safe to call periodically (e.g. once per day). Returns eviction count.
+ *
+ * @throws If the underlying save() call fails (disk full, permission denied).
+ *         Callers should wrap in try/catch. On save failure the on-disk file
+ *         is unchanged (temp file + rename is atomic), but the in-memory copy
+ *         is already mutated — it is discarded on the next load() call.
+ */
+export function decayMap(): { evicted: number } {
+    const map = load();
+    const now = Date.now();
+    const LN2 = Math.LN2;
+
+    const beforeCount = map.nodes.length;
+
+    map.nodes = map.nodes.filter(n => {
+        const updatedMs = new Date(n.updatedAt).getTime();
+        const daysSince = Math.max(0, (now - updatedMs) / 86_400_000);
+        const decayed = (n.signalStrength ?? 1.0) * Math.exp(-daysSince / HALF_LIFE_DAYS * LN2);
+        n.signalStrength = decayed;
+        return decayed >= EVICTION_THRESHOLD;
+    });
+
+    // Remove edges whose endpoints were evicted
+    const surviving = new Set(map.nodes.map(n => n.id));
+    map.edges = map.edges.filter(e => surviving.has(e.from) && surviving.has(e.to));
+
+    const evicted = beforeCount - map.nodes.length;
+    // Save whenever there are nodes: decay mutates every node's signalStrength,
+    // so the on-disk copy is always stale after a decay pass, even if no node
+    // was evicted. Skip only for a completely empty map (nothing to persist).
+    if (map.nodes.length > 0) {
+        save(map);
+    }
+    return { evicted };
 }
 
 /**

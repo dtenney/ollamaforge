@@ -828,19 +828,35 @@ export class TieredMemoryManager {
                 0.5 // Minimum similarity score
             );
             
-            // Convert Qdrant results to MemoryEntry format
-            const entries: MemoryEntry[] = results.map(r => ({
-                id: r.id,
-                tier: r.payload.tier as 0 | 1 | 2 | 3 | 4 | 5,
-                content: r.payload.content,
-                createdAt: r.payload.createdAt,
-                lastAccessed: r.payload.timestamp,
-                accessCount: r.payload.accessCount,
-                tags: r.payload.tags,
-                relevanceScore: r.score
-            }));
-            
-            logInfo(`[memory] Semantic search for "${query}" returned ${entries.length} results`);
+            // Convert Qdrant results to MemoryEntry format, applying recency boost.
+            // Formula (Cognitron-inspired): adjustedScore = rawScore * (0.5 + 0.5 * exp(-daysOld / 90 * ln2))
+            // Age is measured from lastAccessed (r.payload.timestamp), not createdAt — a recently-accessed
+            // old fact should rank higher than a recently-created but never-used one.
+            // Effect: a 0-day-old entry scores 1.0x its raw score; a 90-day-old entry scores 0.75x;
+            // a 1-year-old entry scores ~0.55x. Floor of 0.5 ensures old entries are never fully suppressed.
+            // The local fallback path (searchLocal) uses the same formula for consistent ranking.
+            const now = Date.now();
+            const LN2 = Math.LN2;
+            const entries: MemoryEntry[] = results.map(r => {
+                const lastAccessedMs = r.payload.timestamp ? new Date(r.payload.timestamp).getTime() : now;
+                const daysOld        = Math.max(0, (now - lastAccessedMs) / 86_400_000);
+                const recency        = 0.5 + 0.5 * Math.exp(-daysOld / 90 * LN2);
+                return {
+                    id: r.id,
+                    tier: r.payload.tier as 0 | 1 | 2 | 3 | 4 | 5,
+                    content: r.payload.content,
+                    createdAt: r.payload.createdAt,
+                    lastAccessed: r.payload.timestamp,
+                    accessCount: r.payload.accessCount,
+                    tags: r.payload.tags,
+                    relevanceScore: r.score * recency
+                };
+            });
+
+            // Re-sort after recency adjustment (Qdrant returns by raw score; order may shift slightly)
+            entries.sort((a, b) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0));
+
+            logInfo(`[memory] Semantic search for "${query}" returned ${entries.length} results (recency-boosted)`);
             return entries;
         } catch (error) {
             logError(`[memory] Semantic search failed: ${toErrorMessage(error)}`);
@@ -1295,7 +1311,9 @@ export class TieredMemoryManager {
     /**
      * Local keyword search across tiers 0-3 (fallback when Qdrant unavailable).
      * Scores by keyword overlap × importance (tier weight) × recency decay.
-     * Recency half-life: 30 days — a fact accessed today scores 2× one from 30 days ago.
+     * Recency formula matches the Qdrant path: 0.5 + 0.5 * exp(-daysOld / 90 * ln2)
+     *   — 0-day entry: 1.0×; 90-day entry: 0.75×; 1-year entry: ~0.55×.
+     *   Floor of 0.5 ensures old entries are never fully suppressed by age alone.
      * Invalidated and validUntil-expired entries are excluded.
      */
     private searchLocal(query: string, tier?: number, limit: number = 5): MemoryEntry[] {
@@ -1308,7 +1326,7 @@ export class TieredMemoryManager {
             : ['tier_0_critical', 'tier_1_essential', 'tier_2_operational', 'tier_3_collaboration'];
 
         const now = Date.now();
-        const HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+        const LN2 = Math.LN2;
         // Higher tier number = lower importance weight
         const TIER_WEIGHT = [2.0, 1.6, 1.2, 1.0, 0.8, 0.5];
 
@@ -1323,8 +1341,8 @@ export class TieredMemoryManager {
                 const keywordScore = words.filter(w => text.includes(w)).length / words.length;
                 if (keywordScore === 0) { continue; }
 
-                const ageMs = now - new Date(entry.lastAccessed).getTime();
-                const recency = Math.exp(-ageMs / HALF_LIFE_MS); // 1.0 = today, ~0.5 = 30 days
+                const daysOld  = Math.max(0, (now - new Date(entry.lastAccessed).getTime()) / 86_400_000);
+                const recency  = 0.5 + 0.5 * Math.exp(-daysOld / 90 * LN2);
                 const importance = TIER_WEIGHT[entry.tier] ?? 1.0;
                 const finalScore = keywordScore * importance * recency;
 

@@ -71,15 +71,18 @@ interface GateResult {
 }
 
 function shouldRunDream(workspaceRoot: string): GateResult {
-    // Guard against concurrent in-flight runs: if proposed_rules.md was written
-    // within the last IN_FLIGHT_GUARD_MINUTES, another cycle is probably in progress.
-    const proposedPath = path.join(workspaceRoot, '.ollamaforge', 'proposed_rules.md');
+    // Guard against concurrent in-flight runs via a lock file written at the
+    // START of runDreamCycle() (not at the end), so we detect overlap even
+    // if the cycle hasn't produced proposed_rules.md yet.
+    const lockPath = path.join(workspaceRoot, '.ollamaforge', 'dream.lock');
     try {
-        const stat = fs.statSync(proposedPath);
+        const stat = fs.statSync(lockPath);
         if ((Date.now() - stat.mtimeMs) < IN_FLIGHT_GUARD_MINUTES * 60 * 1000) {
-            return { run: false, reason: 'proposed_rules.md written recently — another cycle may be in flight', currentFeedbackCount: 0, newFeedbackCount: 0, currentPositiveCount: 0 };
+            return { run: false, reason: 'dream.lock present — another cycle is in flight', currentFeedbackCount: 0, newFeedbackCount: 0, currentPositiveCount: 0 };
         }
-    } catch { /* file doesn't exist — fine */ }
+        // Lock is stale (older than IN_FLIGHT_GUARD_MINUTES) — a crashed run left it; remove it
+        try { fs.unlinkSync(lockPath); } catch { /* best-effort */ }
+    } catch { /* lock file doesn't exist — fine, no cycle running */ }
 
     const state = readDreamState(workspaceRoot);
     const hoursSinceLast = (Date.now() - state.last_run_ts) / 3_600_000;
@@ -100,7 +103,8 @@ function shouldRunDream(workspaceRoot: string): GateResult {
         currentPositiveCount = (content.match(/^## \[/gm) || []).length;
     } catch { /* no positive feedback yet */ }
 
-    const newFeedbackCount = currentFeedbackCount - state.last_feedback_count;
+    // Clamp to 0 in case feedback was deleted or the count was reset
+    const newFeedbackCount = Math.max(0, currentFeedbackCount - state.last_feedback_count);
 
     if (newFeedbackCount < MIN_NEW_FEEDBACK_ENTRIES) {
         return { run: false, reason: `only ${newFeedbackCount} new feedback entries (need ${MIN_NEW_FEEDBACK_ENTRIES})`, currentFeedbackCount, newFeedbackCount, currentPositiveCount };
@@ -306,8 +310,9 @@ If all entries should be kept as-is, output them unchanged.`;
  * Merged/surviving entries replace the originals; dropped entries are invalidated.
  * Returns number of original entries processed.
  *
- * Safety order: write survivors FIRST, then invalidate originals.
- * This prevents data loss if addEntry throws mid-loop.
+ * Safety order: write ALL survivors first, then invalidate originals ONLY if all writes succeeded.
+ * A partial write failure leaves originals intact so the next pass can retry — duplicates are
+ * preferred over data loss.
  */
 async function consolidateMemoryEntries(
     memory: TieredMemoryManager,
@@ -369,30 +374,41 @@ async function consolidateMemoryEntries(
         return 0;
     }
 
-    // ── Safety order: write survivors FIRST, then invalidate originals ────────
-    // This prevents data loss if addEntry throws partway through.
-    const written: string[] = [];
+    // ── Safety order: write ALL survivors FIRST, then invalidate originals ───
+    // We only invalidate originals if every survivor was successfully written.
+    // A partial write failure (e.g. Qdrant down mid-loop) would otherwise cause
+    // data loss: some originals invalidated while their replacements were never stored.
+    let writeFailures = 0;
+    const writtenCount = { n: 0 };
     for (const content of surviving) {
         try {
             await memory.addEntry(2, content, ['consolidated', 'dream-pass'], {
                 sourceTool: 'dream_consolidation',
             });
-            written.push(content);
+            writtenCount.n++;
         } catch (err) {
+            writeFailures++;
             logError(`[dream] Memory consolidation: failed to write survivor: ${toErrorMessage(err)}`);
         }
     }
 
-    if (written.length === 0) {
+    if (writtenCount.n === 0) {
         logInfo('[dream] Memory consolidation: no survivors written — skipping invalidation of originals');
         return 0;
     }
 
-    // Batch-invalidate originals in a single lock acquisition
+    if (writeFailures > 0) {
+        // Partial write failure — do NOT invalidate originals to avoid data loss.
+        // Next consolidation pass will re-process the same candidates.
+        logError(`[dream] Memory consolidation: ${writeFailures} write failure(s) — skipping invalidation to prevent data loss`);
+        return 0;
+    }
+
+    // All survivors written — safe to batch-invalidate originals
     await memory.invalidateEntries(candidates.map(e => e.id));
 
-    const removed = candidates.length - written.length;
-    logInfo(`[dream] Memory consolidation complete: ${candidates.length} → ${written.length} entries (${removed} dropped/merged)`);
+    const removed = candidates.length - writtenCount.n;
+    logInfo(`[dream] Memory consolidation complete: ${candidates.length} → ${writtenCount.n} entries (${removed} dropped/merged)`);
     return candidates.length;
 }
 
@@ -482,90 +498,102 @@ export async function runDreamCycle(
 
     logInfo(`[dream] Starting cycle (${gate.newFeedbackCount} new negative feedback entries, ${gate.currentPositiveCount} positive total)`);
 
-    const cfg = getConfig();
-    const model = cfg.dreamModel || cfg.model;
+    // Write lock file immediately so any concurrent call to shouldRunDream() sees it
+    // and bails out. The finally block below removes it regardless of outcome.
+    const lockPath = path.join(workspaceRoot, '.ollamaforge', 'dream.lock');
+    try { fs.writeFileSync(lockPath, String(Date.now()), 'utf8'); } catch { /* non-fatal */ }
 
-    // ── Memory consolidation pass (Mnemosyne-inspired) ─────────────────────
-    // Runs before rule generation — compresses stale tier-2 entries via LLM.
-    if (memory) {
-        try {
-            await consolidateMemoryEntries(memory, model);
-        } catch (err) {
-            logError(`[dream] Memory consolidation error (non-fatal): ${toErrorMessage(err)}`);
-        }
-    }
-
-    const logContent = harvestLogs(workspaceRoot);
-    if (!logContent.trim()) {
-        logInfo('[dream] No log content to analyze — skipping');
-        return;
-    }
-
-    let rawOutput: string;
     try {
-        rawOutput = await executeDream(workspaceRoot, logContent, memory, codeIndexer, model);
-    } catch (err) {
-        logError(`[dream] Agent run failed: ${toErrorMessage(err)}`);
-        return;
-    }
+        const cfg = getConfig();
+        const model = cfg.dreamModel || cfg.model;
 
-    const { added, removed } = parseAndWriteRules(workspaceRoot, rawOutput);
-
-    // Stack health check — runs after rule generation, appended to notification if issues found
-    // Read stack config directly from VS Code since OllamaConfig doesn't expose these fields
-    let sshHost = '';
-    let composePath = '~/docker-compose.yml';
-    let healthCheckEnabled = true;
-    try {
-        const stackCfg = vscode.workspace.getConfiguration('ollamaForge');
-        sshHost = stackCfg.get<string>('stack.sshHost', '').trim();
-        composePath = stackCfg.get<string>('stack.composePath', '~/docker-compose.yml').trim();
-        healthCheckEnabled = stackCfg.get<boolean>('stack.healthCheckOnDream', true);
-    } catch { /* not in a VS Code context — skip */ }
-    let healthSummary = '';
-    if (healthCheckEnabled && sshHost) {
-        const searchCfg = getSearchConfig();
-        healthSummary = dreamHealthSummary(sshHost, searchCfg.url, composePath);
-        if (healthSummary) {
-            logInfo(`[dream] Stack issues detected: ${healthSummary}`);
+        // ── Memory consolidation pass (Mnemosyne-inspired) ─────────────────────
+        // Runs before rule generation — compresses stale tier-2 entries via LLM.
+        if (memory) {
+            try {
+                await consolidateMemoryEntries(memory, model);
+            } catch (err) {
+                logError(`[dream] Memory consolidation error (non-fatal): ${toErrorMessage(err)}`);
+            }
         }
-    }
 
-    // Always update state so we don't re-run on every reload if conditions remain met
-    writeDreamState(workspaceRoot, {
-        last_run_ts: Date.now(),
-        last_feedback_count: gate.currentFeedbackCount,
-        last_positive_count: gate.currentPositiveCount,
-    });
+        const logContent = harvestLogs(workspaceRoot);
+        if (!logContent.trim()) {
+            logInfo('[dream] No log content to analyze — skipping');
+            return;
+        }
 
-    if (added === 0 && removed === 0 && !healthSummary) {
-        logInfo('[dream] No actionable rule changes proposed');
-        return;
-    }
-
-    logInfo(`[dream] Proposed ${added} new rule(s), ${removed} removal(s) — notifying user`);
-
-    const ruleSummary = [
-        added   ? `${added} new rule${added === 1 ? '' : 's'}` : '',
-        removed ? `${removed} rule${removed === 1 ? '' : 's'} to remove` : '',
-    ].filter(Boolean).join(' and ');
-
-    const healthNote = healthSummary ? ` | Stack: ${healthSummary}` : '';
-    const notifMsg = ruleSummary
-        ? `Ollama Forge: Agent proposed ${ruleSummary} based on your feedback.${healthNote} Review and accept to apply.`
-        : `Ollama Forge: Stack health issues detected — ${healthSummary}. Run "Check Stack Health" to review.`;
-
-    const choices = ruleSummary ? ['Review', 'Dismiss'] : ['Check Stack Health', 'Dismiss'];
-    const choice = await vscode.window.showInformationMessage(notifMsg, ...choices);
-    if (choice === 'Review') {
-        const rulesPath = path.join(workspaceRoot, '.ollamaforge', 'proposed_rules.md');
+        let rawOutput: string;
         try {
-            const doc = await vscode.workspace.openTextDocument(rulesPath);
-            await vscode.window.showTextDocument(doc);
+            rawOutput = await executeDream(workspaceRoot, logContent, memory, codeIndexer, model);
         } catch (err) {
-            logError(`[dream] Could not open proposed_rules.md: ${toErrorMessage(err)}`);
+            logError(`[dream] Agent run failed: ${toErrorMessage(err)}`);
+            return;
         }
-    } else if (choice === 'Check Stack Health') {
-        vscode.commands.executeCommand('ollamaForge.checkStackHealth');
+
+        const { added, removed } = parseAndWriteRules(workspaceRoot, rawOutput);
+
+        // Stack health check — runs after rule generation, appended to notification if issues found
+        // Read stack config directly from VS Code since OllamaConfig doesn't expose these fields
+        let sshHost = '';
+        let composePath = '~/docker-compose.yml';
+        let healthCheckEnabled = true;
+        try {
+            const stackCfg = vscode.workspace.getConfiguration('ollamaForge');
+            sshHost = stackCfg.get<string>('stack.sshHost', '').trim();
+            composePath = stackCfg.get<string>('stack.composePath', '~/docker-compose.yml').trim();
+            healthCheckEnabled = stackCfg.get<boolean>('stack.healthCheckOnDream', true);
+        } catch { /* not in a VS Code context — skip */ }
+        let healthSummary = '';
+        if (healthCheckEnabled && sshHost) {
+            const searchCfg = getSearchConfig();
+            healthSummary = dreamHealthSummary(sshHost, searchCfg.url, composePath);
+            if (healthSummary) {
+                logInfo(`[dream] Stack issues detected: ${healthSummary}`);
+            }
+        }
+
+        // Always update state so we don't re-run on every reload if conditions remain met
+        writeDreamState(workspaceRoot, {
+            last_run_ts: Date.now(),
+            last_feedback_count: gate.currentFeedbackCount,
+            last_positive_count: gate.currentPositiveCount,
+        });
+
+        if (added === 0 && removed === 0 && !healthSummary) {
+            logInfo('[dream] No actionable rule changes proposed');
+            return;
+        }
+
+        logInfo(`[dream] Proposed ${added} new rule(s), ${removed} removal(s) — notifying user`);
+
+        const ruleSummary = [
+            added   ? `${added} new rule${added === 1 ? '' : 's'}` : '',
+            removed ? `${removed} rule${removed === 1 ? '' : 's'} to remove` : '',
+        ].filter(Boolean).join(' and ');
+
+        const healthNote = healthSummary ? ` | Stack: ${healthSummary}` : '';
+        const notifMsg = ruleSummary
+            ? `Ollama Forge: Agent proposed ${ruleSummary} based on your feedback.${healthNote} Review and accept to apply.`
+            : `Ollama Forge: Stack health issues detected — ${healthSummary}. Run "Check Stack Health" to review.`;
+
+        const choices = ruleSummary ? ['Review', 'Dismiss'] : ['Check Stack Health', 'Dismiss'];
+        const choice = await vscode.window.showInformationMessage(notifMsg, ...choices);
+        if (choice === 'Review') {
+            const rulesPath = path.join(workspaceRoot, '.ollamaforge', 'proposed_rules.md');
+            try {
+                const doc = await vscode.workspace.openTextDocument(rulesPath);
+                await vscode.window.showTextDocument(doc);
+            } catch (err) {
+                logError(`[dream] Could not open proposed_rules.md: ${toErrorMessage(err)}`);
+            }
+        } else if (choice === 'Check Stack Health') {
+            vscode.commands.executeCommand('ollamaForge.checkStackHealth');
+        }
+    } finally {
+        // Always remove the lock file so crashed/aborted runs don't permanently block future cycles.
+        // shouldRunDream() treats stale locks (> IN_FLIGHT_GUARD_MINUTES old) as crashed and removes
+        // them automatically, but cleaning up here is faster and more reliable.
+        try { fs.unlinkSync(lockPath); } catch { /* already removed or never written */ }
     }
 }

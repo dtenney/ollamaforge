@@ -415,6 +415,11 @@
           "default": false,
           "markdownDescription": "When the agent declares a task complete after editing TypeScript/JavaScript files, automatically run `get_diagnostics` on the changed files and feed any errors back for another turn. Prevents shipping code that doesn't compile. Off by default — enable for stricter verification on code-heavy projects."
         },
+        "ollamaForge.proactiveIdleHints": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When VS Code loses focus, scan recently-changed files for TODO/FIXME markers and surface a notification if any are found. Rate-limited to once per hour. Disable if you find it disruptive."
+        },
         "ollamaForge.autoCompactContext": {
           "type": "boolean",
           "default": true,

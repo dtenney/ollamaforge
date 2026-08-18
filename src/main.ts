@@ -24,6 +24,7 @@ import { ensureGitignore } from './codeGraph';
 import { ensureEnvironmentContext } from './environmentProbe';
 import { detectShellEnvironment } from './agent';
 import { runDreamCycle } from './dreamAgent';
+import { decayMap } from './systemMap';
 import { checkAll, formatReport, executeHeal, HealAction } from './stackHealth';
 import { getSearchConfig } from './config';
 import * as fs from 'fs';
@@ -168,6 +169,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     const archived = await memoryManager.archiveOldEntries();
                     logInfo(`[memory] Maintenance complete: ${demoted} demoted, ${promoted} promoted, ${archived} archived`);
                 }
+                // Decay system map signal strengths and evict stale nodes
+                try {
+                    const { evicted } = decayMap();
+                    if (evicted > 0) {
+                        logInfo(`[system_map] Decay pass: evicted ${evicted} stale node(s)`);
+                    }
+                } catch (err) {
+                    logError(`[system_map] Decay pass failed: ${toErrorMessage(err)}`);
+                }
             }, 24 * 60 * 60 * 1000); // 24 hours
             
             context.subscriptions.push({
@@ -276,6 +286,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Make codeIndexer available to the provider
     (global as any).__ollamaforgeCodeIndexer = codeIndexer;
 
+    // ── Dream cycle auto-scheduler ───────────────────────────────────────────
+    // Checks every 6 hours whether the dream cycle gate conditions are met
+    // (enough new feedback entries, enough elapsed time since last run).
+    // runDreamCycle() itself checks Ollama active-inference state before
+    // running — so concurrent inference is never interrupted.
+    // Initial check fires after 30s so it doesn't compete with activation.
+    const dreamRoot = workspaceRoot;
+    if (dreamRoot) {
+        setTimeout(async () => {
+            try { await runDreamCycle(dreamRoot, memoryManager, codeIndexer); }
+            catch (err) { logError(`[dream] Scheduled run failed: ${toErrorMessage(err)}`); }
+        }, 30_000);
+
+        const dreamInterval = setInterval(async () => {
+            try { await runDreamCycle(dreamRoot, memoryManager, codeIndexer); }
+            catch (err) { logError(`[dream] Scheduled run failed: ${toErrorMessage(err)}`); }
+        }, 6 * 60 * 60 * 1000); // every 6 hours
+
+        context.subscriptions.push({ dispose: () => clearInterval(dreamInterval) });
+        logInfo('[dream] Auto-scheduler registered (6h interval, first check in 30s)');
+    }
+
     // ── Multi-Workspace Manager ──────────────────────────────────────────────
     const workspaceManager = new MultiWorkspaceManager(context, memoryManager);
     await workspaceManager.initialize();
@@ -302,6 +334,79 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             webviewOptions: { retainContextWhenHidden: true },
         })
     );
+
+    // ── Idle-time proactive hook ─────────────────────────────────────────────
+    // When the VS Code window loses focus, scan recently-changed files for
+    // TODO/FIXME markers and uncommitted changes. Surfaces a notification only
+    // when actionable items are found. Rate-limited to once per hour to avoid
+    // alert fatigue. Can be disabled via ollamaForge.proactiveIdleHints setting.
+    {
+        let lastIdleCheckMs = 0;
+        const IDLE_CHECK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+        context.subscriptions.push(
+            vscode.window.onDidChangeWindowState(async (state) => {
+                if (state.focused) { return; } // only fire when window loses focus
+
+                const idleRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+                if (!idleRoot) { return; }
+
+                const proactiveEnabled = vscode.workspace.getConfiguration('ollamaForge')
+                    .get<boolean>('proactiveIdleHints', true);
+                if (!proactiveEnabled) { return; }
+
+                const now = Date.now();
+                if (now - lastIdleCheckMs < IDLE_CHECK_COOLDOWN_MS) { return; }
+                lastIdleCheckMs = now;
+
+                try {
+                    const findings: string[] = [];
+
+                    // 1. Check for TODO/FIXME in recently-modified source files (last 24h)
+                    const srcDir = path.join(idleRoot, 'src');
+                    const scanDir = fs.existsSync(srcDir) ? srcDir : idleRoot;
+                    const cutoffMs = now - 24 * 60 * 60 * 1000;
+
+                    const SKIP_DIRS = new Set(['node_modules', 'dist', 'out', 'build', '.git', '__pycache__', '.venv', 'venv']);
+                    const scanForTodos = (dir: string, depth = 0): void => {
+                        if (depth > 4) { return; }
+                        let entries: fs.Dirent[];
+                        try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+                        catch { return; }
+                        for (const e of entries) {
+                            if (e.name.startsWith('.') || SKIP_DIRS.has(e.name)) { continue; }
+                            const full = path.join(dir, e.name);
+                            if (e.isDirectory()) { scanForTodos(full, depth + 1); continue; }
+                            if (!/\.(ts|tsx|js|jsx|py)$/.test(e.name)) { continue; }
+                            try {
+                                const stat = fs.statSync(full);
+                                if (stat.mtimeMs < cutoffMs) { continue; }
+                                const content = fs.readFileSync(full, 'utf8');
+                                const matches = (content.match(/\b(TODO|FIXME|HACK|XXX)\b.*$/gm) || []).slice(0, 3);
+                                if (matches.length > 0) {
+                                    findings.push(`${path.relative(idleRoot, full)}: ${matches.join(', ').slice(0, 120)}`);
+                                }
+                            } catch { /* unreadable */ }
+                        }
+                    };
+                    scanForTodos(scanDir);
+
+                    if (findings.length === 0) { return; }
+
+                    const preview = findings.slice(0, 3).join('\n');
+                    const msg = `Ollama Forge: Found ${findings.length} TODO/FIXME marker${findings.length === 1 ? '' : 's'} in recently-changed files.`;
+                    const choice = await vscode.window.showInformationMessage(msg, 'Show Details', 'Dismiss');
+                    if (choice === 'Show Details') {
+                        channel.show(true);
+                        logInfo(`[idle-hint] TODO/FIXME markers:\n${preview}`);
+                    }
+                } catch (err) {
+                    logError(`[idle-hint] Scan failed: ${toErrorMessage(err)}`);
+                }
+            })
+        );
+        logInfo('[idle-hint] Proactive idle hook registered');
+    }
 
     // ── Code Actions Provider (right-click menu) ───────────────────────────
     const codeActionsProvider = new OllamaCodeActionsProvider();

@@ -7,7 +7,7 @@ import { getConfig } from './config';
 import { getActiveContext, buildContextString } from './context';
 import { logInfo, logWarn, logError, channel, toErrorMessage } from './logger';
 import { ChatStorage, ChatSession, StoredMessage, deriveTitle, relativeTime, PendingResume } from './chatStorage';
-import { appendSessionLog } from './sessionLog';
+import { appendSessionLog, appendSessionLogMd } from './sessionLog';
 import { indexWorkspaceFiles, fuzzySearchFiles, buildMentionContext } from './mentions';
 import { buildGitDiffContext } from './gitContext';
 import { TieredMemoryManager } from './memoryCore';
@@ -1040,7 +1040,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     } finally {
                         const stats = runTab.agent.runStats;
                         if (this._currentWorkspaceRoot) {
-                            appendSessionLog(this._currentWorkspaceRoot, {
+                            const sessionEntry = {
                                 ts:           new Date(runStart).toISOString(),
                                 sessionId:    runTab.session.id,
                                 model,
@@ -1052,7 +1052,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 avgLogprob:   stats.avgLogprob,
                                 durationMs:   Date.now() - runStart,
                                 outcome:      stats.outcome,
-                            });
+                            };
+                            appendSessionLog(this._currentWorkspaceRoot, sessionEntry);
+                            appendSessionLogMd(this._currentWorkspaceRoot, sessionEntry);
                         }
                         // Guard: stopGeneration may have already set running=false and sent agentDone.
                         // Avoid duplicate agentDone which confuses the webview spinner.
@@ -1161,7 +1163,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     } finally {
                         const retryStats = retryTab.agent.runStats;
                         if (this._currentWorkspaceRoot) {
-                            appendSessionLog(this._currentWorkspaceRoot, {
+                            const retryEntry = {
                                 ts:           new Date(retryStart).toISOString(),
                                 sessionId:    retryTab.session.id,
                                 model,
@@ -1173,7 +1175,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 avgLogprob:   retryStats.avgLogprob,
                                 durationMs:   Date.now() - retryStart,
                                 outcome:      retryStats.outcome,
-                            });
+                            };
+                            appendSessionLog(this._currentWorkspaceRoot, retryEntry);
+                            appendSessionLogMd(this._currentWorkspaceRoot, retryEntry);
                         }
                         retryTab.running = false;
                         post({ type: 'agentDone' });

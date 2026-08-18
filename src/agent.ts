@@ -513,6 +513,20 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
     {
         type: 'function',
         function: {
+            name: 'system_map_visualize',
+            description: 'Write a Mermaid diagram of the cross-workspace system map to .ollamaforge/system-map.md and open it in VS Code. Use this when the user asks to see, draw, or visualize the system map. The file can be previewed with VS Code\'s built-in Markdown Preview (Ctrl+Shift+V).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    filter: { type: 'string', description: 'Optional: restrict the diagram to nodes/edges matching this search term (same as system_map_query search parameter). Omit to show the full map.' },
+                },
+                required: [],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'run_command',
             description: `Run a shell command that may MODIFY files or state. Requires user confirmation. Use for: running tests, linting, installing dependencies, building, running scripts, npm/pip install, make, etc. For read-only commands (git log, ls, cat, etc.) prefer shell_read instead.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH -- use bash/Unix commands. NEVER use PowerShell cmdlets (Get-ChildItem, Set-Content, etc.) for local operations -- use bash equivalents (find, cat, cp, mv, rm, mkdir). SSH/remote commands are fine as-is.' : ''} Destructive operations (rm, delete, overwrite) require prior listing and user confirmation. Dry-run first for any script that moves/renames/deletes files. Result includes [CWD: ...] for orientation.`,
             parameters: {
@@ -1266,7 +1280,7 @@ Always work from actual project files -- never answer from training data alone.
   gather_context     -- read 2--8 files in parallel (read-only)
   run_command        -- state-changing shell commands (mv, cp, rm, scp, ssh, install)
   memory_search / memory_list / memory_write / memory_tier_write / memory_delete
-  system_map_update / system_map_query
+  system_map_update / system_map_query / system_map_visualize
   get_diagnostics    -- VS Code errors/warnings for a file
   read_terminal      -- VS Code terminal output${webSearchLine ? `\n${webSearchLine}` : ''}${generateImageLine ? `\n${generateImageLine}` : ''}
 
@@ -13340,6 +13354,44 @@ ${sampleHtml}
             }
 
             // â"€â"€ task_log â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+            // ── system_map_visualize ─────────────────────────────────────────────────
+            case 'system_map_visualize': {
+                const smvFilter = args.filter ? String(args.filter).trim() : undefined;
+                const smvSubgraph = smvFilter
+                    ? queryMap({ search: smvFilter })
+                    : queryMap({});
+
+                if (smvSubgraph.nodes.length === 0) {
+                    return smvFilter
+                        ? `No nodes matched filter "${smvFilter}". Use system_map_query with no filter to see everything, or system_map_update to add nodes.`
+                        : `(system map is empty — use system_map_update to add nodes first)`;
+                }
+
+                const smvMermaid = formatMapAsMermaid(smvSubgraph);
+                const smvFilterNote = smvFilter ? ` (filtered: "${smvFilter}")` : '';
+                const smvContent = [
+                    `# System Map${smvFilterNote}`,
+                    `> Generated ${new Date().toISOString().slice(0, 16).replace('T', ' ')} — ${smvSubgraph.nodes.length} node(s), ${smvSubgraph.edges.length} edge(s)`,
+                    `> Open VS Code Markdown Preview (Ctrl+Shift+V) to see the diagram.`,
+                    '',
+                    '```mermaid',
+                    smvMermaid,
+                    '```',
+                    '',
+                ].join('\n');
+
+                const smvOutPath = path.join(root, '.ollamaforge', 'system-map.md');
+                fs.mkdirSync(path.dirname(smvOutPath), { recursive: true });
+                fs.writeFileSync(smvOutPath, smvContent, 'utf8');
+
+                try {
+                    const smvDoc = await vscode.workspace.openTextDocument(smvOutPath);
+                    await vscode.window.showTextDocument(smvDoc, { preview: true });
+                } catch { /* non-fatal if VS Code API unavailable */ }
+
+                return `System map written to .ollamaforge/system-map.md (${smvSubgraph.nodes.length} nodes, ${smvSubgraph.edges.length} edges). Open Markdown Preview (Ctrl+Shift+V) to see the diagram.`;
+            }
+
             case 'task_log': {
                 const taskId = String(args.task_id ?? '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 64);
                 if (!taskId) { throw new Error('task_id is required'); }
