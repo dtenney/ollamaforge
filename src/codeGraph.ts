@@ -814,6 +814,144 @@ export class CodeGraph {
         return lines.join('\n');
     }
 
+    /**
+     * Return the top N nodes most relevant to a query, with file + line metadata.
+     * Used by the adaptive context allocator to decide which files/ranges to pre-load.
+     * Returns empty array if graph not ready or no matches.
+     */
+    getTopScoredNodes(query: string, limit = 6): Array<{ file: string; startLine: number; endLine: number; name: string; kind: string; score: number }> {
+        if (!this.ready) return [];
+        try {
+            const ftsQuery = extractKeywords(query)
+                .split(' ')
+                .filter(w => w.length > 2)
+                .slice(0, 8)
+                .map(w => `"${w}"`)
+                .join(' OR ');
+            if (!ftsQuery) return [];
+
+            let rows: any[] = [];
+            try {
+                rows = this.db.prepare(`
+                    SELECT n.id, n.kind, n.name, n.file, n.start_line, n.end_line
+                    FROM nodes_fts f
+                    JOIN nodes n ON n.rowid = f.rowid
+                    WHERE nodes_fts MATCH ?
+                    LIMIT 20
+                `).all(ftsQuery);
+            } catch {
+                const term = query.trim().split(/\s+/)[0].replace(/[%_]/g, '\\$&');
+                rows = this.db.prepare(`
+                    SELECT id, kind, name, file, start_line, end_line
+                    FROM nodes WHERE name LIKE ? ESCAPE '\\' LIMIT 20
+                `).all(`%${term}%`);
+            }
+
+            const queryWords = new Set(
+                (query.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || []).map(w => w.toLowerCase()).filter(w => w.length > 2)
+            );
+            return rows
+                .map(r => {
+                    const nameLower = r.name.toLowerCase();
+                    let score = 0.1;
+                    for (const w of queryWords) {
+                        if (nameLower === w) score += 3;
+                        else if (nameLower.includes(w)) score += 1;
+                    }
+                    return { file: r.file, startLine: r.start_line, endLine: r.end_line, name: r.name, kind: r.kind, score };
+                })
+                .sort((a, b) => b.score - a.score)
+                .slice(0, limit);
+        } catch (e) {
+            logWarn('[CodeGraph] getTopScoredNodes failed: ' + String(e));
+            return [];
+        }
+    }
+
+    /**
+     * Return relevant symbol bodies from a specific file, scored against a query.
+     * Used by read_file to return targeted function/class content instead of a
+     * raw truncated slice when the file exceeds the line budget.
+     *
+     * @param filePath   Absolute path to the file
+     * @param query      The user's current task message (for FTS scoring)
+     * @param budgetTokens  Max tokens to return (default 800)
+     * @returns Formatted string with numbered source lines, or null if graph not ready / no hits
+     */
+    getRelevantSymbolsForFile(filePath: string, query: string, budgetTokens = 800): string | null {
+        if (!this.ready) return null;
+        try {
+            // Pull all symbols for this file from the graph (already indexed)
+            const rows: any[] = this.db.prepare(`
+                SELECT kind, name, start_line, end_line, body
+                FROM nodes
+                WHERE file = ?
+                ORDER BY start_line ASC
+            `).all(filePath);
+
+            if (rows.length === 0) return null;
+
+            // Score each symbol against the query using simple keyword overlap
+            const queryWords = new Set(
+                (query.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || [])
+                    .map(w => w.toLowerCase())
+                    .filter(w => w.length > 2)
+            );
+
+            const scored = rows.map(r => {
+                const nameLower = r.name.toLowerCase();
+                let score = 0;
+                for (const w of queryWords) {
+                    if (nameLower === w) score += 3;
+                    else if (nameLower.includes(w)) score += 1;
+                }
+                // Always include at least a base score so all symbols are eligible
+                return { ...r, score: score + 0.1 };
+            });
+
+            // Sort by score desc, then by line order for ties
+            scored.sort((a, b) => b.score - a.score || a.start_line - b.start_line);
+
+            // Read the file once to extract actual current source lines
+            let fileLines: string[];
+            try {
+                fileLines = fs.readFileSync(filePath, 'utf8').split('\n');
+            } catch {
+                return null;
+            }
+
+            const budgetChars = budgetTokens * 4;
+            const parts: string[] = [];
+            let totalChars = 0;
+            const usedRanges: Array<[number, number]> = [];
+
+            for (const sym of scored) {
+                const start = Math.max(0, sym.start_line - 1);
+                const end   = Math.min(fileLines.length, sym.end_line);
+                // Skip if overlaps an already-included range
+                if (usedRanges.some(([s, e]) => start < e && end > s)) continue;
+
+                const slice = fileLines.slice(start, end);
+                const numbered = slice
+                    .map((l, i) => `${String(start + i + 1).padStart(4, ' ')}\t${l}`)
+                    .join('\n');
+                if (totalChars + numbered.length > budgetChars) break;
+
+                parts.push(`// ${sym.kind} ${sym.name} (lines ${sym.start_line}–${sym.end_line})\n${numbered}`);
+                totalChars += numbered.length;
+                usedRanges.push([start, end]);
+            }
+
+            if (parts.length === 0) return null;
+
+            const rel = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
+            return `[Graph-extracted symbols from ${rel} — ${parts.length} of ${rows.length} total, scored for current task]\n\n${parts.join('\n\n')}`;
+        } catch (e) {
+            logWarn('[CodeGraph] getRelevantSymbolsForFile failed: ' + String(e));
+            return null;
+        }
+    }
+
     /** Get graph stats for display */
     getStats(): { nodes: number; files: number; indexedAt: number | null } {
         if (!this.ready) return { nodes: 0, files: 0, indexedAt: null };

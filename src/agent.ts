@@ -2826,6 +2826,7 @@ export class Agent {
     private _projectNudgeLastTurn: number = -1;
     /** Whether the project file update-before-stop guard has fired this run */
     private _projectStopGuardFiredThisRun: boolean = false;
+    private _autoVerifyFiredThisRun: boolean = false;
     /** Async subagent handles -- keyed by handle string returned by delegate_task_async */
     private _asyncHandles: Map<string, Promise<string>> = new Map();
     /** Monotonic counter for async handle uniqueness -- never reused within an Agent instance */
@@ -3690,6 +3691,7 @@ export class Agent {
         this._focusedGrepInjectedThisTurn = false; // Reset focused-grep dedup flag
         this._trackingDocCheckedThisRun = false;   // Reset tracking-doc check so it can fire once per user message
         this._projectStopGuardFiredThisRun = false; // Reset project stop guard so it can fire once per user message
+        this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._editContextInjected = false;     // Reset read-then-act flag
         this._editsThisRun = 0;                // Reset per-turn edit counter (session total in _totalEditsThisSession)
@@ -4934,6 +4936,75 @@ This task spans multiple phases or streams. A PROJECT.md skeleton has been creat
                     logInfo(`[codeGraph] Drift report injected: ${drift.gone.length} gone, ${drift.ambiguous.length} ambiguous`);
                 }
             }
+
+            // ── Fan-out: codeIndex semantic hits (fills the gap between graph + memory) ──
+            // codeGraph covers structural symbols; memory covers past facts. codeIndex adds
+            // semantic file-level relevance from Qdrant — the store not otherwise queried here.
+            if (this.codeIndex?.isReady) {
+                try {
+                    const ciHits = await this.codeIndex.findRelevantFiles(userMessage, 4);
+                    if (ciHits.length > 0) {
+                        const ciLines = ciHits.map(h =>
+                            `- **${h.relPath}** (${Math.round(h.score * 100)}%): ${h.summary}`
+                        );
+                        graphContext += `## Semantically Relevant Files\n${ciLines.join('\n')}\n\n`;
+                        logInfo(`[fanout] codeIndex injected: ${ciHits.length} files`);
+                    }
+                } catch (e) { logWarn('[fanout] codeIndex query failed: ' + String(e)); }
+            }
+
+            // ── Adaptive context allocation: pre-load graph-scored symbol bodies ──────
+            // When the code graph has indexed this workspace, query top-scored nodes and
+            // inject their actual source lines (not just names). This gives the model
+            // precise, task-relevant code on turn 1 — reducing read_file round-trips.
+            // Only fires when: graph is ready, this is not a subagent (has own context),
+            // and the model hasn't been given pre-edit injection already.
+            const cgAdaptive = this._codeGraph;
+            if (cgAdaptive?.isReady() && !this._isSubagent && !this._editContextInjected && userMessage.length > 20) {
+                try {
+                    const topNodes = cgAdaptive.getTopScoredNodes(userMessage, 5);
+                    // Group by file; only pre-load if top nodes score well (score > 1 means keyword hit)
+                    const highScoreNodes = topNodes.filter(n => n.score > 1);
+                    if (highScoreNodes.length > 0) {
+                        // Deduplicate by file — one entry per file, union of line ranges
+                        const fileRanges = new Map<string, { start: number; end: number; names: string[] }>();
+                        for (const n of highScoreNodes) {
+                            const existing = fileRanges.get(n.file);
+                            if (existing) {
+                                existing.start = Math.min(existing.start, n.startLine);
+                                existing.end   = Math.max(existing.end,   n.endLine);
+                                existing.names.push(n.name);
+                            } else {
+                                fileRanges.set(n.file, { start: n.startLine, end: n.endLine, names: [n.name] });
+                            }
+                        }
+
+                        const adaptiveParts: string[] = [];
+                        let adaptiveTokens = 0;
+                        const ADAPTIVE_TOKEN_CAP = 600; // keep it tight so we don't crowd the prompt
+
+                        for (const [filePath, range] of fileRanges) {
+                            if (adaptiveTokens >= ADAPTIVE_TOKEN_CAP) break;
+                            try {
+                                const fileContent = fs.readFileSync(filePath, 'utf8').split('\n');
+                                const startIdx = Math.max(0, range.start - 1);
+                                const endIdx   = Math.min(fileContent.length, range.end);
+                                const slice    = fileContent.slice(startIdx, endIdx);
+                                const numbered = slice.map((l, i) => `${String(startIdx + i + 1).padStart(4, ' ')}\t${l}`).join('\n');
+                                const relPath  = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
+                                const block    = `// Adaptive pre-load: ${relPath} (lines ${range.start}–${range.end}, symbols: ${range.names.join(', ')})\n${numbered}`;
+                                adaptiveParts.push(block);
+                                adaptiveTokens += Math.ceil(block.length / 4);
+                            } catch { /* skip unreadable file */ }
+                        }
+
+                        if (adaptiveParts.length > 0) {
+                            graphContext += `## Adaptive Context (graph-scored pre-load)\n${adaptiveParts.join('\n\n')}\n\n`;
+                            logInfo(`[adaptive] Pre-loaded ${adaptiveParts.length} file range(s), ~${adaptiveTokens} tokens`);
+                        }
+                    }
+                } catch (e) { logWarn('[adaptive] Context allocation failed: ' + String(e)); }
+            }
         }
 
         // Build system content once (only text-mode suffix varies per iteration)
@@ -5199,7 +5270,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
         // â"€â"€ Multi-model routing â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         // Track whether the previous turn was purely read-only (shell_read, memory_*)
         // so we can downshift to the fast model when no writes have happened yet.
-        const READ_ONLY_TOOLS = new Set(['shell_read', 'memory_search', 'memory_list', 'memory_tier_list', 'memory_stats']);
+        const READ_ONLY_TOOLS = new Set(['shell_read', 'memory_search', 'memory_list', 'memory_tier_list', 'memory_stats', 'code_search', 'read_file', 'find_files', 'search_files', 'workspace_summary']);
         let prevTurnWasReadOnly = isPlanTask || isCreativeTask; // plan/creative tasks start in read mode
         const routedFastModel = cfg.modelRoutingEnabled ? (cfg.fastModel || model) : model;
         const routedCriticModel = cfg.modelRoutingEnabled ? (cfg.criticModel || model) : model;
@@ -6596,6 +6667,44 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     }
                 }
 
+                // ── Self-evaluation loop ───────────────────────────────────────────────
+                // When the agent declares completion after editing TS/JS files, auto-run
+                // get_diagnostics and feed back any NEW errors before allowing the stop.
+                // Gated on: ollamaForge.autoVerifyOnComplete setting (opt-in), having
+                // changed files, and only fires once per run to avoid a diagnostics spiral.
+                const autoVerifyEnabled = vscode.workspace.getConfiguration('ollamaForge')
+                    .get<boolean>('autoVerifyOnComplete', false);
+                if (autoVerifyEnabled
+                    && isLegitimateStop && (hasCompletionLanguage || hasConfirmationLanguage)
+                    && !isUserDismissal && !this._autoVerifyFiredThisRun
+                    && this._filesChangedThisRun.length > 0) {
+                    const verifiableFiles = this._filesChangedThisRun
+                        .filter(f => /\.(ts|tsx|js|jsx)$/i.test(f));
+                    if (verifiableFiles.length > 0) {
+                        this._autoVerifyFiredThisRun = true;
+                        // Run diagnostics on each changed file; collect errors only
+                        const diagParts: string[] = [];
+                        for (const rel of verifiableFiles.slice(0, 5)) {
+                            try {
+                                const diagResult = this.getDiagnostics(this.workspaceRoot, rel);
+                                // Only surface actual errors (skip "No diagnostics" and warning-only results)
+                                if (diagResult && /error/i.test(diagResult) && !/no (errors|diagnostics)/i.test(diagResult)) {
+                                    diagParts.push(`**${rel}:**\n${diagResult}`);
+                                }
+                            } catch { /* skip */ }
+                        }
+                        if (diagParts.length > 0) {
+                            logInfo(`[auto-verify] Errors found in ${diagParts.length} file(s) — injecting feedback`);
+                            this.history.pop();
+                            this.history.push({ role: 'user', content: `[SYSTEM: Auto-verification found errors in files you just edited. Fix all errors before declaring done.\n\n${diagParts.join('\n\n')}]` });
+                            post({ type: 'removeLastAssistant' });
+                            continue;
+                        } else {
+                            logInfo(`[auto-verify] No errors found in ${verifiableFiles.length} changed file(s) — stop approved`);
+                        }
+                    }
+                }
+
                 // ── Read-saturation guard ──────────────────────────────────────────────
                 // Model keeps reading without acting. Action is unique here: we inject the
                 // actual file content so it has what it needs and has no reason to re-read.
@@ -7052,7 +7161,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             // â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
             // Always batch read-only tool calls (shell_read, memory_search) -- deferral only needed for edit tools
-            const allReadOnly = toolCalls.every(tc => ['shell_read', 'memory_search', 'code_search'].includes(tc.function.name));
+            const allReadOnly = toolCalls.every(tc => READ_ONLY_TOOLS.has(tc.function.name));
             const executeBatch = this._isSweepTask || allReadOnly || !(isTextMode && toolCalls.length > 1);
             const callsToExecute = executeBatch ? toolCalls : [toolCalls[0]];
             const deferredCalls = executeBatch ? [] : toolCalls.slice(1);
@@ -7068,6 +7177,98 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             let batchToolsAttempted = 0;
             let batchToolsSucceeded = 0;
             let batchAllWereWriteTools = true; // only revert for write-tool-only batches
+
+            // ── Parallel read-only batch ──────────────────────────────────────────
+            // When all tools in the batch are read-only (shell_read, memory_search,
+            // code_search) and there are 2+, execute them concurrently via
+            // Promise.allSettled. This saves wall-clock time on multi-file reads.
+            if (allReadOnly && callsToExecute.length > 1 && !this.stopRef.stop) {
+                logInfo(`[agent] Parallel read-only batch: ${callsToExecute.length} tools`);
+                // Safety: shell_read can run arbitrary commands. Only parallelize
+                // when every shell_read command matches a known read-only pattern.
+                const SAFE_SHELL_RE = /^(grep|find|ls|cat|head|tail|wc|file|stat|du|df|which|where|echo|printf|git\s+(log|diff|status|show|blame|branch|tag|remote|config|shortlog)|node\s+--version|python3?\s+--version|npm\s+(ls|list|view|outdated)|pip3?\s+(list|show|check)|curl\s+(-s|--silent|-I|--head)\s)/i;
+                const allShellSafe = callsToExecute.every(tc => {
+                    if (tc.function.name !== 'shell_read') { return true; }
+                    let cmd = '';
+                    try {
+                        const a = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
+                        cmd = String(a.command ?? '').trim();
+                    } catch { return false; }
+                    return SAFE_SHELL_RE.test(cmd);
+                });
+                if (!allShellSafe) {
+                    logInfo(`[agent] Parallel batch skipped: shell_read command not in safe list`);
+                    // fall through to sequential loop below
+                } else {
+                interface ParallelCall { tc: OllamaToolCall; name: string; args: Record<string, unknown>; toolId: string; aborted: boolean; }
+                const parallelCalls: ParallelCall[] = callsToExecute.map(tc => {
+                    const name = tc.function.name;
+                    let args: Record<string, unknown>;
+                    try {
+                        args = typeof tc.function.arguments === 'string'
+                            ? JSON.parse(tc.function.arguments as unknown as string)
+                            : tc.function.arguments;
+                    } catch { args = {}; }
+                    // Coerce numeric strings
+                    if (typeof args.offset === 'string' && /^\d+$/.test(args.offset)) { args = { ...args, offset: parseInt(args.offset, 10) }; }
+                    if (typeof args.limit === 'string' && /^\d+$/.test(args.limit)) { args = { ...args, limit: parseInt(args.limit, 10) }; }
+                    // Pre-hook middleware
+                    let aborted = false;
+                    for (const mw of Agent._middlewares) {
+                        if (!mw.preHook) { continue; }
+                        try {
+                            const r = mw.preHook(name, args);
+                            if (r === null) { aborted = true; break; }
+                            if (r !== undefined) { args = r; }
+                        } catch { /* continue */ }
+                    }
+                    return { tc, name, args, toolId: `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, aborted };
+                });
+                // Phase 2: execute in parallel
+                // Snapshot _lastReadFilePath -- shell_read(cat) → read_file mutates it,
+                // and concurrent calls would race. Restore after all settle.
+                const savedLastReadPath = this._lastReadFilePath;
+                const settled = await Promise.allSettled(
+                    parallelCalls.map(pc => pc.aborted
+                        ? Promise.resolve('__ABORTED__')
+                        : this.executeTool(pc.name, pc.args, pc.toolId)
+                    )
+                );
+                this._lastReadFilePath = savedLastReadPath;
+                // Phase 3: process results sequentially (history order matters)
+                for (let i = 0; i < settled.length; i++) {
+                    const pc = parallelCalls[i];
+                    const s = settled[i];
+                    batchToolsAttempted++;
+                    if (pc.aborted) {
+                        post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: '(aborted by middleware)' });
+                        continue;
+                    }
+                    if (s.status === 'fulfilled') {
+                        let toolResult = s.value;
+                        // Post-hook middleware
+                        for (const mw of [...Agent._middlewares].reverse()) {
+                            if (!mw.postHook) { continue; }
+                            try {
+                                const t = mw.postHook(pc.name, pc.args, toolResult);
+                                if (t !== undefined) { toolResult = t; }
+                            } catch { /* continue */ }
+                        }
+                        batchToolsSucceeded++;
+                        this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
+                        this.history.push({ role: 'tool', content: `[TOOL RESULT: ${pc.name}]\n${toolResult}` });
+                        post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: true, preview: toolResult.slice(0, 200) });
+                    } else {
+                        const errMsg = toErrorMessage(s.reason);
+                        this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
+                        this.history.push({ role: 'tool', content: `[TOOL ERROR: ${pc.name}]\n${errMsg}` });
+                        post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: errMsg.slice(0, 200) });
+                    }
+                }
+                continue;
+                } // end else (allShellSafe)
+            } // end if (allReadOnly && callsToExecute.length > 1 && !this.stopRef.stop)
+
             for (const tc of callsToExecute) {
                 if (this.stopRef.stop) { break; }
 
@@ -11008,6 +11209,22 @@ if errors:
                     const rfPartialNote = rfExplicitLimit && rfSlice.length < rfLines.length
                         ? `\n[NOTE: You requested limit=${args.limit}. The file has ${rfLines.length} total lines. Call read_file again without limit to see the full file.]`
                         : '';
+
+                    // ── Tool result intelligence (graph-guided symbol extraction) ──────
+                    // When a file is large AND the model hasn't requested a specific offset/limit,
+                    // use the code graph to return the most task-relevant symbols instead of a
+                    // raw truncated slice. Falls back to normal truncated output if graph unavailable.
+                    const rfIsLargeFile = rfLines.length > 300 && !rfExplicitLimit && rfOffset === 0;
+                    const rfGraphReady  = this._codeGraph?.isReady() && this._currentTaskMessage;
+                    const rfIsCodeFile  = /\.(ts|js|tsx|jsx|py|go|java|rs|rb|cs|cpp|c|swift|php)\b/i.test(rfPath);
+                    if (rfIsLargeFile && rfGraphReady && rfIsCodeFile) {
+                        const graphExtract = this._codeGraph!.getRelevantSymbolsForFile(rfPath, this._currentTaskMessage, 800);
+                        if (graphExtract) {
+                            logInfo(`[read_file] Graph extraction used for large file: ${rfRel} (${rfLines.length} lines)`);
+                            return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total — graph-extracted relevant symbols shown below; use offset/limit for raw lines)\n\n${graphExtract}`;
+                        }
+                    }
+
                     return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total):\n${rfNumbered}${rfTrunc}${rfPartialNote}`;
                 } catch (e) {
                     return `[read_file] Error: ${e instanceof Error ? e.message : String(e)}`;

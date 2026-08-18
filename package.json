@@ -410,6 +410,11 @@
           "default": true,
           "markdownDescription": "Automatically save important information to memory as the AI discovers it. Saves are filtered through garbage patterns and semantic dedup to prevent noise."
         },
+        "ollamaForge.autoVerifyOnComplete": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When the agent declares a task complete after editing TypeScript/JavaScript files, automatically run `get_diagnostics` on the changed files and feed any errors back for another turn. Prevents shipping code that doesn't compile. Off by default — enable for stricter verification on code-heavy projects."
+        },
         "ollamaForge.autoCompactContext": {
           "type": "boolean",
           "default": true,
