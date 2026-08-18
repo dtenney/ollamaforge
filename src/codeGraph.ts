@@ -1,11 +1,36 @@
 /**
- * codeGraph.ts — MEX-style code graph for Ollama Forge
+ * codeGraph.ts — structural code graph for Ollama Forge
  *
- * Builds a Tree-sitter symbol index into SQLite (.ollamaforge/graph.db).
- * Provides scope routing: given a user query, returns ≤1500 tokens of
- * the most relevant symbols to inject into the system prompt.
- * Provides drift detection via MinHash fingerprints.
- * Cross-references memory entries against the graph to flag stale facts.
+ * Builds a Tree-sitter AST symbol index into SQLite (.ollamaforge/graph.db).
+ * Supports TypeScript/JavaScript (tsx/jsx included) and Python.
+ *
+ * Public API on CodeGraph:
+ *   init()                          — initialize DB, call once at startup
+ *   indexFile(path)                 — index a single file (sync)
+ *   indexWorkspace()                — full workspace index (async, background)
+ *   scheduleFileUpdate(path)        — debounced incremental update on save
+ *   buildScopeContext(query, tokens)— top relevant symbols for prompt injection (≤1500 tok)
+ *   getTopScoredNodes(query, limit) — top N scored nodes with file/line metadata
+ *   getRelevantSymbolsForFile(path, query, tokens) — symbol bodies for a specific file
+ *   checkDrift(maxNodes)            — compare stored fingerprints to current file content
+ *   crossReferenceMemory(entries)   — flag memory entries whose symbols have changed
+ *   formatDriftReport(report)       — format drift report for system prompt (≤200 tok)
+ *   formatMemoryConflicts(conflicts)— format conflict list for system prompt (≤150 tok)
+ *   getStats()                      — node/file counts and last-indexed timestamp
+ *   close()                         — cancel pending timers, close DB
+ *
+ * Module-level exports:
+ *   ensureGitignore(root)           — add .ollamaforge/ to .gitignore
+ *   loadRouterMd(root)              — load ROUTER.md (≤300 tokens)
+ *   isRouterMdStale(root, graph?)   — true when graph was re-indexed after ROUTER.md was written
+ *   generateRouterMd(root)          — auto-generate ROUTER.md from workspace structure
+ *
+ * Known limitations:
+ *   - DriftReport.moved is always empty; move/rename detection is not yet implemented.
+ *   - Edge indexing (who calls whom) is schema-ready but insertEdge is not called during
+ *     indexFile — one-hop neighbor expansion in buildScopeContext returns no neighbors.
+ *   - murmur32 is a simplified hash (not spec-compliant MurmurHash2); adequate for
+ *     MinHash shingle similarity but not cryptographic or interoperability use.
  */
 
 import * as path from 'path';
@@ -27,6 +52,8 @@ let nativeLoadAttempted = false;
 
 function tryLoadNativeModules(): boolean {
     if (nativeLoadAttempted) return nativeAvailable;
+    // Set flag BEFORE the try block to prevent a second concurrent call from
+    // re-entering before the first has finished (multi-workspace VS Code startup).
     nativeLoadAttempted = true;
     try {
         Parser = require('tree-sitter');
@@ -401,7 +428,9 @@ export class CodeGraph {
 
     /** Index a single file. Returns number of symbols found. */
     indexFile(filePath: string): number {
-        if (!this.ready) return 0;
+        // Guard against close() racing with a debounced scheduleFileUpdate:
+        // close() sets ready=false and nulls db/insertNode, so both checks are needed.
+        if (!this.ready || !this.insertNode) return 0;
         const ext = path.extname(filePath).toLowerCase();
         let symbols: RawSymbol[] = [];
 
@@ -505,6 +534,55 @@ export class CodeGraph {
     }
 
     /**
+     * Run FTS against the nodes table and score results by keyword overlap with query.
+     * Shared by buildScopeContext and getTopScoredNodes to avoid duplicated logic.
+     * Returns rows sorted by score descending, each with {id, kind, name, file, start_line, end_line, score}.
+     */
+    private _queryAndScore(query: string, ftsLimit = 20): any[] {
+        const ftsQuery = extractKeywords(query)
+            .split(' ')
+            .filter(w => w.length > 2)
+            .slice(0, 8)
+            .map(w => `"${w}"`)
+            .join(' OR ');
+
+        if (!ftsQuery) return [];
+
+        let rows: any[] = [];
+        try {
+            rows = this.db.prepare(`
+                SELECT n.id, n.kind, n.name, n.file, n.start_line, n.end_line
+                FROM nodes_fts f
+                JOIN nodes n ON n.rowid = f.rowid
+                WHERE nodes_fts MATCH ?
+                LIMIT ?
+            `).all(ftsQuery, ftsLimit);
+        } catch {
+            // FTS query syntax error (e.g. special chars) — fall back to LIKE
+            const term = query.trim().split(/\s+/)[0].replace(/[%_]/g, '\\$&');
+            rows = this.db.prepare(`
+                SELECT id, kind, name, file, start_line, end_line
+                FROM nodes WHERE name LIKE ? ESCAPE '\\' LIMIT ?
+            `).all(`%${term}%`, ftsLimit);
+        }
+
+        const queryWords = (query.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || []);
+        return rows
+            .map((r: any) => {
+                let score = 1.0;
+                const nameLower = r.name.toLowerCase();
+                for (const w of queryWords) {
+                    const wl = w.toLowerCase();
+                    if (r.name === w) score += 0.8;
+                    else if (nameLower === wl) score += 0.5;
+                    else if (nameLower.includes(wl)) score += 0.2;
+                }
+                return { ...r, score };
+            })
+            .sort((a: any, b: any) => b.score - a.score);
+    }
+
+    /**
      * Build scope context for injection into system prompt.
      * Query is the user's message. Budget is max tokens (default 1500 ≈ 6000 chars).
      * Returns null if graph is empty or no relevant symbols found.
@@ -514,48 +592,11 @@ export class CodeGraph {
 
         const budgetChars = budgetTokens * 4;
 
-        // 1. Prepare FTS query — split camelCase, sanitize
-        const ftsQuery = extractKeywords(query)
-            .split(' ')
-            .filter(w => w.length > 2)
-            .slice(0, 8)
-            .map(w => `"${w}"`)
-            .join(' OR ');
+        // 1. FTS + scoring (shared helper)
+        const scored = this._queryAndScore(query, 12);
+        if (scored.length === 0) return null;
 
-        if (!ftsQuery) return null;
-
-        let ftsResults: any[] = [];
-        try {
-            ftsResults = this.db.prepare(`
-                SELECT n.id, n.kind, n.name, n.file, n.start_line, n.end_line
-                FROM nodes_fts f
-                JOIN nodes n ON n.rowid = f.rowid
-                WHERE nodes_fts MATCH ?
-                LIMIT 12
-            `).all(ftsQuery);
-        } catch {
-            // FTS query syntax error — fall back to LIKE search
-            const term = query.trim().split(/\s+/)[0].replace(/[%_]/g, '\\$&');
-            ftsResults = this.db.prepare(`
-                SELECT id, kind, name, file, start_line, end_line
-                FROM nodes WHERE name LIKE ? ESCAPE '\\'
-                LIMIT 12
-            `).all(`%${term}%`);
-        }
-
-        // 2. Score candidates
-        const queryWords = (query.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || []);
-        const scored = ftsResults.map((r: any) => {
-            let score = 1.0;
-            for (const w of queryWords) {
-                if (r.name === w) score += 0.8;
-                else if (r.name.toLowerCase() === w.toLowerCase()) score += 0.5;
-                else if (r.name.toLowerCase().includes(w.toLowerCase())) score += 0.2;
-            }
-            return { ...r, score };
-        });
-
-        // 3. One-hop neighbor expansion
+        // 2. One-hop neighbor expansion
         const seen = new Set<string>(scored.map((r: any) => r.id));
         const expanded = [...scored];
         for (const r of scored) {
@@ -576,7 +617,7 @@ export class CodeGraph {
             } catch { /* ignore */ }
         }
 
-        // 4. Sort by score, apply token budget
+        // 3. Sort by score, apply token budget
         // Track chars accurately — include the file header line in the budget.
         expanded.sort((a: any, b: any) => b.score - a.score);
         const selected: any[] = [];
@@ -596,7 +637,7 @@ export class CodeGraph {
 
         if (selected.length === 0) return null;
 
-        // 5. Group by file, format output
+        // 4. Group by file, format output
         const byFile = new Map<string, string[]>();
         for (const r of selected) {
             if (!byFile.has(r.relFile)) byFile.set(r.relFile, []);
@@ -669,9 +710,11 @@ export class CodeGraph {
 
                 if (similarity >= 0.85) {
                     // Unchanged — no report needed
-                } else if (similarity >= 0.55) {
+                } else if (similarity >= 0.1) {
+                    // Partially similar — symbol changed in place (not deleted/moved)
                     report.ambiguous.push({ name: node.name, file: node.file });
                 } else {
+                    // Near-zero similarity — body is gone or completely rewritten
                     report.gone.push({ name: node.name, file: node.file });
                 }
             }
@@ -771,9 +814,13 @@ export class CodeGraph {
         });
     }
 
-    /** Format drift report for system prompt injection (≤200 tokens) */
+    /**
+     * Format drift report for system prompt injection (≤200 tokens).
+     * NOTE: DriftReport.moved is reserved for future move-detection and is currently
+     * always empty — checkDrift() does not yet track symbol renames across files.
+     */
     formatDriftReport(report: DriftReport): string | null {
-        const total = report.moved.length + report.ambiguous.length + report.gone.length;
+        const total = report.ambiguous.length + report.gone.length;
         if (total === 0) return null;
 
         const lines = ['## Code Graph Drift Warning'];
@@ -784,13 +831,10 @@ export class CodeGraph {
         }
 
         if (report.gone.length > 0) {
-            lines.push(`**Gone (${report.gone.length}):** ${report.gone.map(n => n.name).join(', ')}`);
+            lines.push(`**Deleted/rewritten (${report.gone.length}):** ${report.gone.map(n => n.name).join(', ')}`);
         }
         if (report.ambiguous.length > 0) {
             lines.push(`**Changed (${report.ambiguous.length}):** ${report.ambiguous.map(n => n.name).join(', ')}`);
-        }
-        if (report.moved.length > 0) {
-            lines.push(`**Moved (${report.moved.length}):** ${report.moved.map(n => n.name).join(', ')}`);
         }
         lines.push('Run `graph_index` to refresh.');
 
@@ -822,46 +866,9 @@ export class CodeGraph {
     getTopScoredNodes(query: string, limit = 6): Array<{ file: string; startLine: number; endLine: number; name: string; kind: string; score: number }> {
         if (!this.ready) return [];
         try {
-            const ftsQuery = extractKeywords(query)
-                .split(' ')
-                .filter(w => w.length > 2)
-                .slice(0, 8)
-                .map(w => `"${w}"`)
-                .join(' OR ');
-            if (!ftsQuery) return [];
-
-            let rows: any[] = [];
-            try {
-                rows = this.db.prepare(`
-                    SELECT n.id, n.kind, n.name, n.file, n.start_line, n.end_line
-                    FROM nodes_fts f
-                    JOIN nodes n ON n.rowid = f.rowid
-                    WHERE nodes_fts MATCH ?
-                    LIMIT 20
-                `).all(ftsQuery);
-            } catch {
-                const term = query.trim().split(/\s+/)[0].replace(/[%_]/g, '\\$&');
-                rows = this.db.prepare(`
-                    SELECT id, kind, name, file, start_line, end_line
-                    FROM nodes WHERE name LIKE ? ESCAPE '\\' LIMIT 20
-                `).all(`%${term}%`);
-            }
-
-            const queryWords = new Set(
-                (query.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || []).map(w => w.toLowerCase()).filter(w => w.length > 2)
-            );
-            return rows
-                .map(r => {
-                    const nameLower = r.name.toLowerCase();
-                    let score = 0.1;
-                    for (const w of queryWords) {
-                        if (nameLower === w) score += 3;
-                        else if (nameLower.includes(w)) score += 1;
-                    }
-                    return { file: r.file, startLine: r.start_line, endLine: r.end_line, name: r.name, kind: r.kind, score };
-                })
-                .sort((a, b) => b.score - a.score)
-                .slice(0, limit);
+            return this._queryAndScore(query, Math.max(limit * 4, 20))
+                .slice(0, limit)
+                .map(r => ({ file: r.file, startLine: r.start_line, endLine: r.end_line, name: r.name, kind: r.kind, score: r.score }));
         } catch (e) {
             logWarn('[CodeGraph] getTopScoredNodes failed: ' + String(e));
             return [];
@@ -1032,7 +1039,8 @@ export function loadRouterMd(workspaceRoot: string): string | null {
  */
 export function isRouterMdStale(workspaceRoot: string, graph?: CodeGraph): boolean {
     const routerPath = path.join(workspaceRoot, 'ROUTER.md');
-    if (!fs.existsSync(routerPath)) return false; // doesn't exist → let caller generate fresh
+    // Missing ROUTER.md → stale, caller should regenerate
+    if (!fs.existsSync(routerPath)) return true;
 
     try {
         const routerMtime = fs.statSync(routerPath).mtimeMs;
