@@ -7215,6 +7215,8 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         const a = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
                         cmd = String(a.command ?? '').trim();
                     } catch { return false; }
+                    // Reject shell metacharacters -- pipes, chaining, subshells, redirects
+                    if (/[|;&`$()<>]/.test(cmd)) { return false; }
                     return SAFE_SHELL_RE.test(cmd);
                 });
                 if (!allShellSafe) {

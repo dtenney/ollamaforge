@@ -594,7 +594,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             if (lvl === 'trust') {
                                 tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip']);
                             } else if (lvl === 'yolo') {
-                                tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip', 'run_command_destructive']);
+                                // Must match makeAgent() — include outside-workspace read tools
+                                tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip', 'run_command_destructive', 'shell_read_outside', 'read_file_outside']);
                             }
                         }
                     }
@@ -667,7 +668,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             if (incoming === 'trust') {
                                 this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip']);
                             } else if (incoming === 'yolo') {
-                                this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip', 'run_command_destructive']);
+                                // Must match makeAgent() — include outside-workspace read tools
+                                this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip', 'run_command_destructive', 'shell_read_outside', 'read_file_outside']);
                             }
                         } else if (isDowngrade && !allowDowngrade) {
                             // Webview is behind (just loaded) — re-send the correct level
