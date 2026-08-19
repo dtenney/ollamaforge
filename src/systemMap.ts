@@ -128,9 +128,11 @@ export function upsertNode(node: Omit<SystemNode, 'updatedAt'>): SystemMap {
     const now = new Date().toISOString();
     const existing = map.nodes.find(n => n.id === node.id);
     if (existing) {
-        existing.type        = node.type        || existing.type;
-        existing.label       = node.label       || existing.label;
-        existing.description = node.description || existing.description;
+        // Use `??` (not `||`) so callers can explicitly set an empty string to clear a field.
+        // `||` would silently keep the old value when the new value is "".
+        existing.type        = node.type        ?? existing.type;
+        existing.label       = node.label       ?? existing.label;
+        existing.description = node.description ?? existing.description;
         // `?? {}` guards against callers that omit metadata entirely
         existing.metadata    = { ...existing.metadata, ...(node.metadata ?? {}) };
         existing.updatedAt   = now;
@@ -266,7 +268,7 @@ export function queryMap(opts: {
             n.id.toLowerCase().includes(q) ||
             n.label.toLowerCase().includes(q) ||
             n.description.toLowerCase().includes(q) ||
-            Object.values(n.metadata).some(v => v.toLowerCase().includes(q))
+            Object.values(n.metadata).some(v => v?.toLowerCase?.()?.includes(q) ?? false)
         );
     }
     if (opts.related) {
