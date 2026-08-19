@@ -2516,6 +2516,10 @@ export type PostFn = (msg: object) => void;
  * Returns true when a shell_read command is safe to run in a parallel batch.
  * Rejects shell metacharacters (pipes, chaining, subshells, redirects) and
  * requires the command to start with a known read-only binary.
+ *
+ * NOTE: This is a **parallelization gate**, not a security boundary.
+ * shell_read executes arbitrary shell commands regardless of this check.
+ * Commands that fail this gate fall through to the sequential loop and still run.
  */
 export function isSafeShellCommand(cmd: string, extraPatterns?: string[]): boolean {
     const trimmed = cmd.trim();
@@ -2523,7 +2527,13 @@ export function isSafeShellCommand(cmd: string, extraPatterns?: string[]): boole
     // Reject shell metacharacters -- pipes, chaining, subshells, redirects
     if (/[|;&`$()<>]/.test(trimmed)) { return false; }
     const SAFE_SHELL_RE = /^(grep|find|ls|cat|head|tail|wc|file|stat|du|df|which|where|echo|printf|git\s+(log|diff|status|show|blame|branch|tag|remote|config|shortlog)|node\s+--version|python3?\s+--version|npm\s+(ls|list|view|outdated)|pip3?\s+(list|show|check)|curl\s+(-s|--silent|-I|--head)\s)/i;
-    if (SAFE_SHELL_RE.test(trimmed)) { return true; }
+    if (SAFE_SHELL_RE.test(trimmed)) {
+        // Reject destructive find actions: -delete removes files, -exec runs arbitrary commands.
+        if (/^find\b/i.test(trimmed) && /\s(-delete|-exec)\b/.test(trimmed)) { return false; }
+        // Reject curl that writes to a file: -o / --output mutate the filesystem.
+        if (/^curl\b/i.test(trimmed) && /\s(-o\b|--output\b)/.test(trimmed)) { return false; }
+        return true;
+    }
     // User-configured extra safe patterns (ollamaForge.safeShellCommands)
     if (extraPatterns) {
         for (const pat of extraPatterns) {
@@ -2538,6 +2548,8 @@ export function isSafeShellCommand(cmd: string, extraPatterns?: string[]): boole
 export class Agent {
     // â"€â"€ Middleware registry â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     private static _middlewares: ToolMiddleware[] = [];
+    /** Monotonic counter for parallel batch tool IDs — guarantees uniqueness within a process. */
+    private static _parallelBatchCounter = 0;
 
     /** Register a tool middleware. No-op if a middleware with the same id is already registered. */
     static use(mw: ToolMiddleware): void {
@@ -7286,11 +7298,14 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             if (r !== undefined) { args = r; }
                         } catch { /* continue */ }
                     }
-                    return { tc, name, args, toolId: `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, aborted };
+                    return { tc, name, args, toolId: `t_${Date.now()}_${++Agent._parallelBatchCounter}`, aborted };
                 });
                 // Phase 2: execute in parallel
                 // Snapshot _lastReadFilePath -- shell_read(cat) → read_file mutates it,
                 // and concurrent calls would race. Restore after all settle.
+                // NOTE: This relies on Node's single-threaded event loop. If the project ever
+                // moves to worker threads, this snapshot/restore pattern will need a mutex or
+                // per-batch isolation. Same invariant applies to _toolCallsThisRun and _filesReadThisSession.
                 const savedLastReadPath = this._lastReadFilePath;
                 const settled = await Promise.allSettled(
                     parallelCalls.map(pc => pc.aborted
