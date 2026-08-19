@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.vsix
 coverage/
+__pycache__/
 
 # Ollama Forge runtime data (graphs, cache, memory) — machine-local, not for git
 .ollamaforge/
