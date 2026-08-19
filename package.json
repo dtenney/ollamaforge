@@ -479,6 +479,12 @@
           "default": ["~/.ssh/config"],
           "markdownDescription": "File paths outside the workspace that `read_file` may access without prompting for confirmation. Supports `~` for the home directory. Example: `[\"~/.ssh/config\", \"~/.gitconfig\"]`."
         },
+        "ollamaForge.safeShellCommands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Additional shell command prefixes (regex strings) that are safe to run in parallel batches. Each entry is a regex that must match the start of the command. Example: `[\"^rg\\s\", \"^jq\\s\"]` adds ripgrep and jq to the built-in safe list."
+        },
         "ollamaForge.routing.enabled": {
           "type": "boolean",
           "default": false,

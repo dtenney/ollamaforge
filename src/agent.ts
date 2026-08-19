@@ -2512,6 +2512,29 @@ export interface ToolMiddleware {
 
 export type PostFn = (msg: object) => void;
 
+/**
+ * Returns true when a shell_read command is safe to run in a parallel batch.
+ * Rejects shell metacharacters (pipes, chaining, subshells, redirects) and
+ * requires the command to start with a known read-only binary.
+ */
+export function isSafeShellCommand(cmd: string, extraPatterns?: string[]): boolean {
+    const trimmed = cmd.trim();
+    if (!trimmed) { return false; }
+    // Reject shell metacharacters -- pipes, chaining, subshells, redirects
+    if (/[|;&`$()<>]/.test(trimmed)) { return false; }
+    const SAFE_SHELL_RE = /^(grep|find|ls|cat|head|tail|wc|file|stat|du|df|which|where|echo|printf|git\s+(log|diff|status|show|blame|branch|tag|remote|config|shortlog)|node\s+--version|python3?\s+--version|npm\s+(ls|list|view|outdated)|pip3?\s+(list|show|check)|curl\s+(-s|--silent|-I|--head)\s)/i;
+    if (SAFE_SHELL_RE.test(trimmed)) { return true; }
+    // User-configured extra safe patterns (ollamaForge.safeShellCommands)
+    if (extraPatterns) {
+        for (const pat of extraPatterns) {
+            try {
+                if (new RegExp(pat, 'i').test(trimmed)) { return true; }
+            } catch { /* invalid regex -- skip */ }
+        }
+    }
+    return false;
+}
+
 export class Agent {
     // â"€â"€ Middleware registry â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     private static _middlewares: ToolMiddleware[] = [];
@@ -7207,7 +7230,8 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 logInfo(`[agent] Parallel read-only batch: ${callsToExecute.length} tools`);
                 // Safety: shell_read can run arbitrary commands. Only parallelize
                 // when every shell_read command matches a known read-only pattern.
-                const SAFE_SHELL_RE = /^(grep|find|ls|cat|head|tail|wc|file|stat|du|df|which|where|echo|printf|git\s+(log|diff|status|show|blame|branch|tag|remote|config|shortlog)|node\s+--version|python3?\s+--version|npm\s+(ls|list|view|outdated)|pip3?\s+(list|show|check)|curl\s+(-s|--silent|-I|--head)\s)/i;
+                const extraSafePatterns = vscode.workspace.getConfiguration('ollamaForge')
+                    .get<string[]>('safeShellCommands', []);
                 const allShellSafe = callsToExecute.every(tc => {
                     if (tc.function.name !== 'shell_read') { return true; }
                     let cmd = '';
@@ -7215,12 +7239,19 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         const a = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
                         cmd = String(a.command ?? '').trim();
                     } catch { return false; }
-                    // Reject shell metacharacters -- pipes, chaining, subshells, redirects
-                    if (/[|;&`$()<>]/.test(cmd)) { return false; }
-                    return SAFE_SHELL_RE.test(cmd);
+                    return isSafeShellCommand(cmd, extraSafePatterns);
                 });
                 if (!allShellSafe) {
-                    logInfo(`[agent] Parallel batch skipped: shell_read command not in safe list`);
+                    const unsafeCmds = callsToExecute
+                        .filter(tc => tc.function.name === 'shell_read')
+                        .map(tc => {
+                            try {
+                                const a = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
+                                return String(a.command ?? '').trim();
+                            } catch { return '<parse error>'; }
+                        })
+                        .filter(cmd => !isSafeShellCommand(cmd, extraSafePatterns));
+                    logInfo(`[agent] Parallel batch skipped: unsafe shell_read command(s): ${unsafeCmds.join(' | ')}`);
                     // fall through to sequential loop below
                 } else {
                 interface ParallelCall { tc: OllamaToolCall; name: string; args: Record<string, unknown>; toolId: string; aborted: boolean; }
@@ -7236,6 +7267,14 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     if (typeof args.offset === 'string' && /^\d+$/.test(args.offset)) { args = { ...args, offset: parseInt(args.offset, 10) }; }
                     if (typeof args.limit === 'string' && /^\d+$/.test(args.limit)) { args = { ...args, limit: parseInt(args.limit, 10) }; }
                     // Pre-hook middleware
+                    // Safety note: Agent._middlewares is a static array. In the parallel batch
+                    // path this loop runs concurrently for each tool call. Iteration is safe
+                    // because: (1) Node is single-threaded — no true concurrent mutation,
+                    // (2) we iterate the array directly (not a copy), so if a middleware
+                    // unregisters itself mid-loop the iterator will skip it, which is
+                    // acceptable for pre-hooks (they are expected to be idempotent),
+                    // (3) post-hooks use [...Agent._middlewares].reverse() to snapshot
+                    // before iterating, preventing the same issue.
                     let aborted = false;
                     for (const mw of Agent._middlewares) {
                         if (!mw.preHook) { continue; }
