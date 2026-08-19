@@ -35,7 +35,7 @@ export type EdgeType =
     | 'related';    // generic catch-all relationship
 
 export interface SystemNode {
-    id: string;             // unique stable identifier (e.g. "ollamaforge", "server-29")
+    id: string;             // unique stable identifier (e.g. "ollamaforge", "my-server", "api-gateway")
     type: NodeType;
     label: string;          // human-readable name
     description: string;    // one-line summary

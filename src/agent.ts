@@ -475,7 +475,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
                         description: 'add_node -- register a workspace/service/machine/database. add_edge -- record a relationship between two nodes.',
                     },
                     // Node fields
-                    id:          { type: 'string', description: 'Unique stable identifier, e.g. "ollamaforge", "server-29", "patching-workspace". Use lowercase-kebab-case. Also accepted as "node_id".' },
+                    id:          { type: 'string', description: 'Unique stable identifier, e.g. "ollamaforge", "my-server", "api-gateway". Use lowercase-kebab-case. Also accepted as "node_id".' },
                     node_id:     { type: 'string', description: 'Alias for "id". Either field is accepted.' },
                     type:        { type: 'string', enum: ['workspace', 'service', 'machine', 'database', 'other'], description: 'Node type.' },
                     label:       { type: 'string', description: 'Human-readable name, e.g. "Ollama Forge Extension".' },

@@ -330,7 +330,7 @@ export function streamChatRequest(
                     if (dashBulletLines.length >= 20) {
                         // Require value to be a short single token (1-15 chars, no spaces/slashes) —
                         // this targets inventory narration ("- service: systemd") not directory planning
-                        // ("- wifipineapplepager-payloads/: need to check contents").
+                        // ("- my-project-payloads/: need to check contents").
                         const kvPattern = dashBulletLines.filter(l => /^[-*]\s+\S+\s*:\s*[^\s/\\]{1,15}$/.test(l));
                         if (kvPattern.length / dashBulletLines.length > 0.7) { logWarn('[stream] isListSpiral: pattern 4a (kv bullet)'); return true; }
                         // Also catch numbered enumeration within bullet sections: "1. item\n2. item\n..."

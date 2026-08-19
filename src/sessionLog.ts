@@ -71,7 +71,7 @@ export function appendSessionLog(workspaceRoot: string, entry: SessionLogEntry):
 
 /**
  * Append a one-line human-readable summary to SESSION_LOG.md.
- * This is the markdown audit trail equivalent of Cognitron's YYYY-MM-DD.md files —
+ * This is the markdown audit trail — a per-session YYYY-MM-DD structured log
  * a file a human can open to see what the agent did across sessions without
  * needing to parse sessions.jsonl.
  *

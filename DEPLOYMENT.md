@@ -9,7 +9,7 @@
 ## Build & Deploy (local development)
 
 ```bash
-# From workspace root: c:/Users/david/Documents/source/ollamaforge
+# From workspace root (wherever you cloned the repo)
 npm run deploy
 ```
 

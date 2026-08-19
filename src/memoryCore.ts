@@ -829,7 +829,7 @@ export class TieredMemoryManager {
             );
             
             // Convert Qdrant results to MemoryEntry format, applying recency boost.
-            // Formula (Cognitron-inspired): adjustedScore = rawScore * (0.5 + 0.5 * exp(-daysOld / 90 * ln2))
+            // Formula: adjustedScore = rawScore * (0.5 + 0.5 * exp(-daysOld / 90 * ln2))
             // Age is measured from lastAccessed (r.payload.timestamp), not createdAt — a recently-accessed
             // old fact should rank higher than a recently-created but never-used one.
             // Effect: a 0-day-old entry scores 1.0x its raw score; a 90-day-old entry scores 0.75x;
