@@ -3269,7 +3269,14 @@ export class Agent {
         for (const t of toolNames) { this._trustedTools.add(t); }
     }
 
-    /** Clear trust-level approvals -- called when trust level is changed. */
+    /**
+     * Clear ALL approvals — both session-persistent (_trustedTools, seeded by trust level
+     * or "Accept All") and current-run temporary (_autoApprovedTools, per-turn batch).
+     * Called whenever the trust level changes so that downgrading to a less-permissive
+     * level actually removes previously-granted approvals rather than leaving them stale.
+     * Note: despite the name "clearAutoApprovals", this clears both sets — the name is
+     * kept for backwards compatibility with call sites in provider.ts.
+     */
     clearAutoApprovals(): void {
         this._trustedTools.clear();
         this._autoApprovedTools.clear();

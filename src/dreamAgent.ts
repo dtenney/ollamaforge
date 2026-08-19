@@ -404,11 +404,19 @@ async function consolidateMemoryEntries(
         return 0;
     }
 
-    // All survivors written — safe to batch-invalidate originals
-    await memory.invalidateEntries(candidates.map(e => e.id));
+    // All survivors written — safe to batch-invalidate originals.
+    // Wrap in try/catch: if invalidation fails, originals survive intact
+    // (duplicates) rather than being silently lost (data loss > duplication).
+    try {
+        await memory.invalidateEntries(candidates.map(e => e.id));
+    } catch (err) {
+        logError(`[dream] Memory consolidation: failed to invalidate originals: ${toErrorMessage(err)} — originals preserved to avoid data loss`);
+        return 0;
+    }
 
-    const removed = candidates.length - writtenCount.n;
-    logInfo(`[dream] Memory consolidation complete: ${candidates.length} → ${writtenCount.n} entries (${removed} dropped/merged)`);
+    // removed = candidates that were merged/dropped (not re-written as survivors)
+    const removed = candidates.length - surviving.length;
+    logInfo(`[dream] Memory consolidation complete: ${candidates.length} → ${writtenCount.n} entries written (${removed} merged/dropped)`);
     return candidates.length;
 }
 

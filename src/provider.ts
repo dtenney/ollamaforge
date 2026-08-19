@@ -370,8 +370,16 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
     private _saveListener?: vscode.Disposable;
     /** Listener for webview messages — disposed on re-resolve to prevent accumulation. */
     private _messageListener?: vscode.Disposable;
-    /** Timestamp when the current session was loaded — used to detect stale trust-level sync. */
-    private _lastSessionLoadTime: number = 0;
+    /**
+     * Timestamp when the current session was loaded (or the provider was constructed).
+     * Used by the sendMessage trust-level sync to detect stale webview state:
+     * downgrades are allowed only if this timestamp is > 2s in the past
+     * (i.e. the user intentionally changed the dropdown, not a stale dropdown value
+     * being replayed immediately after a session load).
+     * Initialized to Date.now() so fresh sessions have age ≈ 0ms, making the
+     * 2-second gate effective from the very first message.
+     */
+    private _lastSessionLoadTime: number = Date.now();
 
     private readonly codeIndexer: CodeIndexer | null;
 
@@ -647,7 +655,20 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         if ((!isDowngrade || allowDowngrade) && incoming !== current) {
                             logInfo(`[provider] Trust level synced from sendMessage: ${current} → ${incoming}`);
                             this._trustLevel = incoming;
+                            // Full re-seed — same logic as setTrustLevel — so that downgrading
+                            // actually clears the trusted-tools set and strips command approvals.
+                            const COMMAND_TOOLS_SM = new Set(['run_command', 'run_command_pip', 'run_command_destructive']);
+                            this._tab.agent.clearAutoApprovals();
                             this._tab.agent.trustLevel = incoming;
+                            const filteredSM = incoming === 'normal'
+                                ? [...this._persistentApprovals].filter(t => !COMMAND_TOOLS_SM.has(t))
+                                : [...this._persistentApprovals];
+                            this._tab.agent.seedPersistentApprovals(filteredSM);
+                            if (incoming === 'trust') {
+                                this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip']);
+                            } else if (incoming === 'yolo') {
+                                this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip', 'run_command_destructive']);
+                            }
                         } else if (isDowngrade && !allowDowngrade) {
                             // Webview is behind (just loaded) — re-send the correct level
                             post({ type: 'trustLevelRestored', level: this._trustLevel });
