@@ -4735,15 +4735,17 @@ The user has set trust level to YOLO. This means:
 - **Think about the next step and act on it immediately.** Do not output your reasoning about what to do next -- just call the tool.
 - After completing ALL steps, give a concise summary of what was done. No follow-up questions unless you hit a genuine blocker (missing credentials, ambiguous destructive action).
 - Treat every user message as full authorization to complete the entire implied task autonomously.
-- **When the user's message contains a numbered list or checklist of tasks, work through them in order without pausing.** Complete ALL items before stopping. Do NOT ask which item to work on -- just start with item 1.`;
+- **When the user's message contains a numbered list or checklist of tasks, work through them in order without pausing.** Complete ALL items before stopping. Do NOT ask which item to work on -- just start with item 1.
+- **NEVER end a response with a prompt like "Say 'next' and I'll...", "Let me know when to continue", "Which section should I tackle first?", or any variant.** These are forbidden. If there are remaining items, pick the next one and start working on it immediately.`;
         } else if (this.trustLevel === 'trust') {
             baseSystemContent += `\n\n## AUTONOMY MODE: Trust -- Reduced confirmation
 The user has set trust level to Trust. This means:
 - Complete multi-step tasks without asking for confirmation between steps.
 - Only pause if you hit a genuinely ambiguous or destructive action (deleting data, overwriting things the user may not have intended).
-- **Never end a response with "Want me to check X--, "Want me to proceed--, "Should I continue--, "Want me to try X-- or any permission-seeking question.** Just do the next logical action immediately.
+- **Never end a response with "Want me to check X--, "Want me to proceed--, "Should I continue--, "Want me to try X--, "Say 'next' and I'll...--, or any permission-seeking or turn-yielding question.** Just do the next logical action immediately.
 - After each tool result, call the next tool immediately -- do not pause to ask or summarize between steps.
-- When working through a plan, execute steps sequentially until done. Only stop at major completion points (all steps finished, or a genuine blocker).`;
+- When working through a plan, execute steps sequentially until done. Only stop at major completion points (all steps finished, or a genuine blocker).
+- **If you've completed one section of a multi-section task, immediately start the next section.** Do not list remaining sections and ask which to tackle -- just continue.`;
         }
 
         // ── Multi-step task planning nudge ────────────────────────────────────────
