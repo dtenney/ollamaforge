@@ -2521,19 +2521,20 @@ export type PostFn = (msg: object) => void;
  * shell_read executes arbitrary shell commands regardless of this check.
  * Commands that fail this gate fall through to the sequential loop and still run.
  */
-export function isSafeShellCommand(cmd: string, extraPatterns?: string[]): boolean {
+export function isParallelizableShellCommand(cmd: string, extraPatterns?: string[]): boolean {
     const trimmed = cmd.trim();
     if (!trimmed) { return false; }
     // Reject shell metacharacters -- pipes, chaining, subshells, redirects
     if (/[|;&`$()<>]/.test(trimmed)) { return false; }
     const SAFE_SHELL_RE = /^(grep|find|ls|cat|head|tail|wc|file|stat|du|df|which|where|echo|printf|git\s+(log|diff|status|show|blame|branch|tag|remote|config|shortlog)|node\s+--version|python3?\s+--version|npm\s+(ls|list|view|outdated)|pip3?\s+(list|show|check)|curl\s+(-s|--silent|-I|--head)\s)/i;
-    if (SAFE_SHELL_RE.test(trimmed)) {
-        // Reject destructive find actions: -delete removes files, -exec runs arbitrary commands.
-        if (/^find\b/i.test(trimmed) && /\s(-delete|-exec)\b/.test(trimmed)) { return false; }
-        // Reject curl that writes to a file: -o / --output mutate the filesystem.
-        if (/^curl\b/i.test(trimmed) && /\s(-o\b|--output\b)/.test(trimmed)) { return false; }
-        return true;
-    }
+    // Reject destructive find/curl actions regardless of which allow-list matched.
+    // Applied before both the built-in regex and user extraPatterns so a custom
+    // pattern cannot re-allow a filesystem-mutating command.
+    const isDestructive =
+        (/^find\b/i.test(trimmed) && /\s(-delete|-exec|-execdir|-ok)\b/.test(trimmed))
+        || (/^curl\b/i.test(trimmed) && /\s(-o\b|--output\b)/.test(trimmed));
+    if (isDestructive) { return false; }
+    if (SAFE_SHELL_RE.test(trimmed)) { return true; }
     // User-configured extra safe patterns (ollamaForge.safeShellCommands)
     if (extraPatterns) {
         for (const pat of extraPatterns) {
@@ -7253,7 +7254,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         const a = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
                         cmd = String(a.command ?? '').trim();
                     } catch { return false; }
-                    return isSafeShellCommand(cmd, extraSafePatterns);
+                    return isParallelizableShellCommand(cmd, extraSafePatterns);
                 });
                 if (!allShellSafe) {
                     const unsafeCmds = callsToExecute
@@ -7264,7 +7265,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                                 return String(a.command ?? '').trim();
                             } catch { return '<parse error>'; }
                         })
-                        .filter(cmd => !isSafeShellCommand(cmd, extraSafePatterns));
+                        .filter(cmd => !isParallelizableShellCommand(cmd, extraSafePatterns));
                     logInfo(`[agent] Parallel batch skipped: unsafe shell_read command(s): ${unsafeCmds.join(' | ')}`);
                     // fall through to sequential loop below
                 } else {
@@ -7281,16 +7282,12 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     if (typeof args.offset === 'string' && /^\d+$/.test(args.offset)) { args = { ...args, offset: parseInt(args.offset, 10) }; }
                     if (typeof args.limit === 'string' && /^\d+$/.test(args.limit)) { args = { ...args, limit: parseInt(args.limit, 10) }; }
                     // Pre-hook middleware
-                    // Safety note: Agent._middlewares is a static array. In the parallel batch
-                    // path this loop runs concurrently for each tool call. Iteration is safe
-                    // because: (1) Node is single-threaded — no true concurrent mutation,
-                    // (2) we iterate the array directly (not a copy), so if a middleware
-                    // unregisters itself mid-loop the iterator will skip it, which is
-                    // acceptable for pre-hooks (they are expected to be idempotent),
-                    // (3) post-hooks use [...Agent._middlewares].reverse() to snapshot
-                    // before iterating, preventing the same issue.
+                    // Safety note: Agent._middlewares is a static array shared across all
+                    // Agent instances. Snapshot it before iterating so a middleware that
+                    // unregisters itself (or another instance registers) mid-loop cannot
+                    // shift the iteration. Mirrors the post-hook snapshot pattern below.
                     let aborted = false;
-                    for (const mw of Agent._middlewares) {
+                    for (const mw of [...Agent._middlewares]) {
                         if (!mw.preHook) { continue; }
                         try {
                             const r = mw.preHook(name, args);
@@ -7320,6 +7317,8 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     const s = settled[i];
                     batchToolsAttempted++;
                     if (pc.aborted) {
+                        this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
+                        this.history.push({ role: 'tool', content: `[TOOL ABORTED: ${pc.name}]\n(aborted by middleware)` });
                         post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: '(aborted by middleware)' });
                         continue;
                     }
@@ -13879,9 +13878,10 @@ ${sampleHtml}
             const timeoutMs = isSshCmd ? 120_000 : 60_000;
             const timer = setTimeout(() => {
                 if (!finished) {
-                    child.kill();
-                    post({ type: 'commandChunk', id: cmdId, text: `\n(timed out after ${timeoutMs / 1000}s)`, stream: 'stderr' });
+                    // Resolve the promise first so a throw from kill() cannot leave the caller hanging.
                     finish(-1);
+                    try { child.kill(); } catch { /* already gone */ }
+                    post({ type: 'commandChunk', id: cmdId, text: `\n(timed out after ${timeoutMs / 1000}s)`, stream: 'stderr' });
                 }
             }, timeoutMs);
         });
