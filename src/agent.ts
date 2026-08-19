@@ -600,7 +600,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
                 type: 'object',
                 properties: {
                     tier: { type: 'number', description: 'Memory tier (0-5)', enum: [0, 1, 2, 3, 4, 5] },
-                    content: { type: 'string', description: 'ONE focused piece of information to remember (max 4000 chars). Keep it atomic - one concept per entry.' },
+                    content: { type: 'string', description: 'The actual text to save — must be a non-empty string containing the fact, finding, or decision. Do NOT pass an empty string or a placeholder. ONE focused piece of information (max 4000 chars). Keep it atomic — one concept per entry.' },
                     tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization (e.g., ["server", "infrastructure"])' },
                 },
                 required: ['tier', 'content'],
@@ -12662,7 +12662,7 @@ if errors:
                 const tags = args.tags ? (args.tags as string[]) : undefined;
                 
                 if (tier < 0 || tier > 5) { return 'Error: tier must be 0-5'; }
-                if (!content.trim()) { return 'Error: content is required — nothing was saved. Call memory_tier_write again with the actual content to remember.'; }
+                if (!content.trim()) { return 'Error: content is empty — nothing was saved. You passed an empty string. Call memory_tier_write again and put the actual fact/finding/decision text into the "content" field (not a placeholder, not empty — the real text).'; }
 
                 // Rate-limit: max 3 memory writes per agent response
                 if (this.memoryWritesThisResponse >= Agent.MAX_MEMORY_WRITES_PER_RESPONSE) {
