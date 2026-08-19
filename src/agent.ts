@@ -7293,7 +7293,13 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             const r = mw.preHook(name, args);
                             if (r === null) { aborted = true; break; }
                             if (r !== undefined) { args = r; }
-                        } catch { /* continue */ }
+                        } catch (e) {
+                            // A middleware that throws is treated as a veto (aborted) to
+                            // prevent silent permission bypass. Log for diagnostics.
+                            logWarn(`[agent] preHook middleware threw for tool "${name}": ${e instanceof Error ? e.message : String(e)}`);
+                            aborted = true;
+                            break;
+                        }
                     }
                     return { tc, name, args, toolId: `t_${Date.now()}_${++Agent._parallelBatchCounter}`, aborted };
                 });
@@ -13943,6 +13949,7 @@ ${sampleHtml}
                     args.unshift('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new');
                 }
                 logInfo(`[ssh/shell_read] Spawning without shell: ${exe} ${args.map(a => JSON.stringify(a)).join(' ')}`);
+                post({ type: 'commandChunk', id: cmdId, text: `\n\u26a0\ufe0f Git Bash not found \u2014 running ${exe} directly (no shell features). Install Git for Windows for full support.`, stream: 'stderr' });
                 child = spawn(exe, args, { cwd, env: { ...process.env }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
             } else {
                 child = spawn(cmdR, [], { cwd, env: { ...process.env }, shell: true });
