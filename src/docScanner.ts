@@ -193,7 +193,9 @@ function splitIntoChunks(content: string): string[] {
 export const GARBAGE_PATTERNS: RegExp[] = [
     // External URLs / links
     /marketplace\.visualstudio/i,
-    /github\.com/i,
+    // Block bare/generic github.com references (boilerplate), but allow specific repo URLs
+    // (github.com/user/repo) which are actionable remote references worth saving.
+    /\bgithub\.com(?!\/[\w.-]+\/[\w.-])/i,
     /stackoverflow/i,
     /npmjs\.com/i,
     /pypi\.org/i,

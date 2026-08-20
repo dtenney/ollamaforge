@@ -1239,7 +1239,7 @@ For any logic that needs to run on a remote host, the sequence is always:
   3. run_command: ssh HOST test -f /tmp/myscript.py && echo EXISTS
   4. run_command: ssh HOST python3 /tmp/myscript.py
 
-Never use ssh with inline Python (python3 -c), heredocs (<< EOF), or awk scripts -- BusyBox/ash does not support them. Simple commands over ssh are always fine: "ssh host ls /path", "ssh host systemctl restart svc", "ssh host 'cd /dir && ./run.sh'". Only multi-line interpreters (python3 -c, awk) and heredocs need the write_file + scp + ssh pattern.
+Never use ssh with inline Python (python3 -c) or heredocs (<< EOF). On Windows, Git Bash mangles quote nesting before ssh sees it -- even single-line python3 -c fails. On BusyBox/ash targets, neither form is supported. Simple commands over ssh are always fine: "ssh host ls /path", "ssh host systemctl restart svc", "ssh host 'cd /dir && ./run.sh'". Anything beyond a short one-liner must use the write_file + scp + ssh pattern -- do not attempt inline python first.
 **NEVER use ssh ... sed -i to edit a remote file** -- the local shell mangles quotes and backslashes before ssh sees them, corrupting the file. To edit a remote file: edit the local copy with edit_file, then scp it up, then ssh to move it into place.
 **Avoid long ssh && chains** -- when chaining "cmd1 && cmd2 && cmd3" over ssh, a silent failure in cmd1 can leave the system in a half-applied state. For multi-step remote operations, write a script locally and scp+run it instead.
 After every scp, verify the file exists on the remote before running it -- once. If the file was confirmed present, proceed immediately without re-checking.
@@ -1325,6 +1325,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Configuration spirals: stop at 2.** If you write a config file and the service fails to start or rejects it twice, do NOT keep tweaking the config from memory or guesswork. Stop immediately, fetch the official documentation or a working example from the web (web_search or web_fetch the GitHub README/docs), and only rewrite the config once you have confirmed the correct format from a real source.
 **One question at a time.** If you must ask the user something, ask the single most important question. Never ask for information you can discover yourself with a tool.
 **Clean up temp scripts when done.** Any helper scripts you wrote to accomplish the task (files in scripts/, /tmp/, or named like stage_*.py, check_*.py, fix_*.py, validate_*.py, migrate_*.py, convert_*.py) are temporary. Delete them with run_command before declaring the task complete, unless the user explicitly asked you to keep the script.
+**Local scratch work stays in the workspace.** Never use /tmp or the OS temp dir for local clones, scratch files, or intermediate data. Use .ollamaforge/tmp/ instead (it is gitignored and workspace-local). /tmp is only acceptable for scripts being scp'd to a remote host.
 **Don't run long scripts — hand them to the user.** Before running a Python script with run_command, ask yourself: will this finish in under 60 seconds? If it crawls files (os.walk, glob **), reads large datasets (pd.read_csv, iterrows), makes network calls in a loop (requests, paramiko, scp), or touches a large database (cursor.execute over many rows), it will timeout. Instead: (1) tell the user the script is ready and give them the exact command to run themselves, OR (2) add a --limit N flag and run only a small sample to verify it works, then hand the full run to the user. Never silently let a long-running script time out and then retry it.
 
 ## File editing
@@ -1716,15 +1717,24 @@ function repairToolJson(raw: string): string | null {
             // No-arg tool
             return `{"name":"${toolName}","arguments":{}}`;
         }
-        // Try to extract the primary argument value
-        const argMatch = raw.match(new RegExp(`"${argKey}"\\s*:\\s*"([^"]*)"`, 's'));
+        // Try to extract the primary argument value.
+        // Use a JSON-string-aware pattern that honours \" escapes inside the value,
+        // so content like "key: \"value\"" or sentences with "quotes" isn't truncated.
+        const argRe = new RegExp(`"${argKey}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, 's');
+        const argMatch = raw.match(argRe);
         if (argMatch) {
+            // Unescape the extracted value so JSON.stringify re-encodes it cleanly.
+            let extracted = argMatch[1]
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\')
+                .replace(/\\n/g, '\n')
+                .replace(/\\t/g, '\t');
             // Also try to extract tier and tags for memory_tier_write
             const tierMatch = raw.match(/"tier"\s*:\s*(\d)/);
             const tagsMatch = raw.match(/"tags"\s*:\s*(\[[^\]]*\])/);
             const tierPart = tierMatch ? `,"tier":${tierMatch[1]}` : '';
             const tagsPart = tagsMatch ? `,"tags":${tagsMatch[1]}` : '';
-            return `{"name":"${toolName}","arguments":{"${argKey}":${JSON.stringify(argMatch[1])}${tierPart}${tagsPart}}}`;
+            return `{"name":"${toolName}","arguments":{"${argKey}":${JSON.stringify(extracted)}${tierPart}${tagsPart}}}`;
         }
         return null;
     }
@@ -3604,8 +3614,15 @@ export class Agent {
                 this.history.push({ role: 'user', content: `${userMessage}\n\n[SYSTEM: The user mentioned file "${filePath}". Use shell_read with command "cat ${filePath}" to read it immediately. Do NOT list the directory.]${conflictNote}${scopeNote}` });
             } else {
                 // Detect operational requests (sync/copy/run/execute) -- nudge agent to run, not describe
-                const isOperationalRequest = /\b(sync|copy|run|execute|download|upload|fetch|pull|push|transfer|do it|go ahead|use the script|start)\b/i.test(userMessage)
-                    || /\b(copy.{0,30}(from|to|down)|bring.{0,30}(down|over)|get.{0,30}(files|loot|data))\b/i.test(userMessage);
+                // Detect when the user is asking for a command to run themselves rather than
+                // asking the agent to execute it (e.g. "what's the command", "give me the command").
+                // In that case, suppress the "do it now" nudge so the agent just prints the command.
+                const isAskingForCommand = /\b(what(?:'s| is) the command|give me the command|show me the command|what command|what do I (run|type)|how do I (run|start|kick))\b/i.test(userMessage)
+                    || /\bI(?:'d| would) like to (start|run|kick|do) it\b/i.test(userMessage);
+                const isOperationalRequest = !isAskingForCommand && (
+                    /\b(sync|copy|run|execute|download|upload|fetch|pull|push|transfer|do it|go ahead|use the script|start)\b/i.test(userMessage)
+                    || /\b(copy.{0,30}(from|to|down)|bring.{0,30}(down|over)|get.{0,30}(files|loot|data))\b/i.test(userMessage)
+                );
                 if (isOperationalRequest && this.toolMode === 'text') {
                     this.history.push({ role: 'user', content: `${userMessage}\n\n[SYSTEM: This is an operational request -- the user wants you to DO something, not describe it. Call run_command immediately with the relevant script or command. Do NOT list features, do NOT summarize what the script does. Just run it.]${conflictNote}${scopeNote}` });
                 } else {
@@ -7709,14 +7726,17 @@ Do NOT use ssh + sed -i. Edit the file locally and scp it up.]`;
                             break;
                         }
 
-                        // Hard block: multi-line python3 -c or heredoc -- guaranteed to fail on BusyBox
-                        const SSH_HARD_BLOCK_RE = /\bssh\b.*(?:python3\s+-c\s+["'][^"']*\n|<<\s*['"]?EOF)/s;
-                        // Soft nudge: single-line python3 -c, awk, or find -printf (may work, but fragile)
-                        const SSH_SOFT_NUDGE_RE = /\bssh\b.*(?:python3\s+-c\s+["']|find\s+[^|]*-printf\s+|awk\s+["'])/s;
+                        // Hard block: any python3 -c or heredoc over ssh.
+                        // Multi-line: guaranteed to fail on BusyBox/ash (quoting mangled by shell).
+                        // Single-line: also fails on Windows -- Git Bash mangles quote nesting before
+                        //   ssh sees it, causing syntax errors. Always use write_file + scp + ssh instead.
+                        const SSH_HARD_BLOCK_RE = /\bssh\b.*(?:python3\s+-c\s+["']|<<\s*['"]?EOF)/s;
+                        // Soft nudge: awk or find -printf inline (may work on real Linux, but fragile)
+                        const SSH_SOFT_NUDGE_RE = /\bssh\b.*(?:find\s+[^|]*-printf\s+|awk\s+["'])/s;
                         if (SSH_HARD_BLOCK_RE.test(cmd)) {
                             this._sshInlineGuardFired = true;
-                            logWarn('[agent] SSH inline multi-line script blocked -- redirecting to write_file + scp + ssh');
-                            const hint = `[SYSTEM: That ssh command contains a multi-line script or heredoc that will always fail on BusyBox/ash (quoting is mangled by the shell before ssh sees it).
+                            logWarn('[agent] SSH inline python3 -c / heredoc blocked -- redirecting to write_file + scp + ssh');
+                            const hint = `[SYSTEM: That ssh command uses python3 -c or a heredoc. This always fails on Windows (Git Bash mangles quote nesting before ssh sees it) and on BusyBox/ash targets. Do not retry inline python over ssh.
 
 Use the reliable pattern instead:
   1. write_file: scripts/myscript.py
@@ -9578,7 +9598,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // should not auto-continue.
             const lastUserMsg = (this.lastUserMessage ?? '').trim().toLowerCase();
             const userDismissedSession = lastUserMsg.length < 150
-                && /^(?:ok(?:ay)?[,.]?|got it[,.]?|sounds good[,.]?|thanks?[!.,]?|thank you[!.,]?|cool[,.]?|alright[,.]?|perfect[,.]?|no[,.]?\s+just\b|never mind|nvm|not now|i(?:'ll| will) (?:check|try|look|let you know|come back)|just (?:let me know|checking)|no[,.]?\s+(?:thanks?|that'?s? (?:fine|ok|good|all|enough))|just leave|leave (?:it|them) for now|that(?:'s| is) (?:fine|ok|good|all|enough)[.!]?)\b/i.test(lastUserMsg);
+                && /^(?:ok(?:ay)?[,.]?|got it[,.]?|sounds good[,.]?|thanks?[!.,]?|thank you[!.,]?|cool[,.]?|alright[,.]?|perfect[,.]?|no[,.]?\s+just\b|never mind|nvm|not now|i(?:'ll| will) (?:check|try|look|let you know|come back)|just (?:let me know|checking)|no[,.]?\s+(?:thanks?|that'?s? (?:fine|ok|good|all|enough))|just leave|leave (?:it|them) for now|that(?:'s| is) (?:fine|ok|good|all|enough)[.!]?|this (?:is|looks) (?:fine|ok|good|great|perfect)[,.]?)\b/i.test(lastUserMsg)
+                // Also catch "X, thanks" / "X. thanks" endings — any short message ending with thanks/thank you
+                // is a conversational close regardless of what comes before it.
+                || (lastUserMsg.length < 150 && /[,.]?\s*thanks?[!.]?\s*$/i.test(lastUserMsg));
             // Pure Q&A detection: zero tools used + response is substantial (>400 chars = real answer, not a status note)
             // A short text-only turn mid-task ("Checking now...") should still auto-continue.
             const isPureQA = !usedToolsThisRun && !lastToolCall && lastAssistantText.length > 400;
@@ -11735,7 +11758,10 @@ if errors:
                 // user for permission. SSH commands are exempt — the remote host enforces its
                 // own access controls and blocking them here would break SSH workflows.
                 {
-                    const isSshShellRead = /^\s*(ssh|scp|sftp)\b/i.test(cmd);
+                    // Exempt SSH/SCP/SFTP commands — whether they lead the command or are
+                    // wrapped in nohup/bash/sh (e.g. "nohup bash -c 'ssh host ...'").
+                    // Any absolute path inside such a command is on the remote host, not local.
+                    const isSshShellRead = /\b(ssh|scp|sftp)\s+(-\S+\s+)*\w/i.test(cmd);
                     if (!isSshShellRead) {
                         // Extract the first absolute path argument from common read commands
                         // (cat, head, tail, grep, less, wc, diff, stat, file).
