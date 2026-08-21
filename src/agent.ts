@@ -10841,7 +10841,7 @@ If the code looks correct, respond with exactly: OK`;
                 }
 
                 // Post-edit snippet: show ±4 lines around the changed region so the model can
-                // self-verify without a follow-up shell_read. Pattern from nanoclaude.
+                // self-verify without a follow-up shell_read.
                 // Strategy: find the first line in newString that is NOT in oldString -- that's a
                 // line that was genuinely added, giving us a unique anchor in the post-edit file.
                 let snippetFeedback = '';
@@ -12456,7 +12456,7 @@ if errors:
                     }
                 }
 
-                // Inject CWD so the model stays oriented (pattern from nanoclaude)
+                // Inject CWD so the model stays oriented
                 const shellCwdNote = root ? `\n[CWD: ${root.replace(/\\/g, '/')}]` : '';
                 const srRedacted = redactSecrets(shellResult);
                 if (srRedacted.count > 0) logInfo(`[shell_read] Redacted ${srRedacted.count} secret(s) from output`);
@@ -13087,7 +13087,7 @@ if errors:
                 }
 
                 // Inject working-directory context into every bash result so the model
-                // stays oriented across multi-step tasks. Pattern from nanoclaude.
+                // stays oriented across multi-step tasks.
                 const cwdNote = root ? `\n[CWD: ${root.replace(/\\/g, '/')}]` : '';
                 return runResult + cwdNote;
             }
