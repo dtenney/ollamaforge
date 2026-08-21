@@ -3,7 +3,7 @@
 
   // ── Core model ──────────────────────────────────────────────────────────────
   "ollamaForge.serverUrl": "http://localhost:11434",
-  "ollamaForge.model": "qwen2.5-coder:7b",
+  "ollamaForge.model": "qwen3.8:27b",
   "ollamaForge.temperature": 0.7,
 
   // ── Multi-model routing ─────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ export interface ModelPreset {
 export const MODEL_PRESETS: Record<string, ModelPreset> = {
     fast: {
         name: 'Fast',
-        model: 'qwen2.5-coder:7b',
+        model: 'qwen3.8:27b',
         temperature: 0.5,
         description: 'Quick responses, lower quality'
     },

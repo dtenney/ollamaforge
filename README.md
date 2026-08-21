@@ -42,9 +42,8 @@ A 100% local AI coding agent for VS Code powered by Ollama. No telemetry, no int
 1. **Install Ollama** — download from [ollama.ai](https://ollama.ai) and run it
 2. **Pull a model** — in a terminal:
    ```
-   ollama pull qwen2.5-coder:7b
+   ollama pull qwen3.8:27b
    ```
-   For larger machines (16GB+ VRAM): `ollama pull qwen3:14b`
 3. **Install Ollama Forge** — download `ollamaforge-<version>.vsix` from [Releases](https://github.com/dtenney/ollamaforge/releases), then:
    ```
    code --install-extension ollamaforge-<version>.vsix

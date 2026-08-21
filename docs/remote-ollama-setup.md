@@ -66,7 +66,7 @@ You should see a JSON response listing available models.
 ```bash
 # On the server
 ollama pull gemma4:26b       # 17GB, needs 24GB+ VRAM
-ollama pull qwen2.5-coder:7b # 4GB, good starting point
+ollama pull qwen3.8:27b      # good starting point
 ollama pull llama3.1:8b      # 5GB, general purpose
 ```
 
