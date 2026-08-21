@@ -11575,9 +11575,44 @@ if errors:
                 walkSearch(sfDir);
                 const sfTruncated = results.length >= MAX_RESULTS || totalOutputChars >= MAX_OUTPUT_CHARS;
                 const sfTrunc = sfTruncated ? `\n[...results truncated -- use a more specific pattern or glob to narrow results]` : '';
-                return results.length
-                    ? `[CWD: ${this.workspaceRoot}]\n${results.join('\n')}${sfTrunc}`
-                    : `[search_files] No matches for "${sfPattern}"${sfGlob !== '*' ? ` in ${sfGlob} files` : ''}`;
+                if (!results.length) {
+                    return `[search_files] No matches for "${sfPattern}"${sfGlob !== '*' ? ` in ${sfGlob} files` : ''}`;
+                }
+
+                // 2.2 Speculative pre-fetch: read the top 3 unique hit files (bounded) and
+                // attach them as "likely next reads" so the model can skip a round-trip.
+                let prefetch = '';
+                try {
+                    const seen = new Map<string, number>(); // relPath -> first hit line
+                    for (const r of results) {
+                        const m = r.match(/^([^:]+):(\d+):/);
+                        if (m && !seen.has(m[1])) { seen.set(m[1], Number(m[2])); }
+                    }
+                    const topFiles = [...seen.entries()].slice(0, 3);
+                    const PREFETCH_MAX_CHARS = 4000;
+                    let pfChars = 0;
+                    const blocks: string[] = [];
+                    for (const [rel, line] of topFiles) {
+                        if (pfChars >= PREFETCH_MAX_CHARS) { break; }
+                        const fp = path.join(this.workspaceRoot, rel);
+                        try {
+                            if (fs.statSync(fp).size > MAX_FILE_SIZE) { continue; }
+                            const lines = fs.readFileSync(fp, 'utf8').split('\n');
+                            const start = Math.max(0, line - 3);
+                            const end = Math.min(lines.length, line + 12);
+                            const snippet = lines.slice(start, end)
+                                .map((l, i) => `${start + i + 1}: ${l}`).join('\n');
+                            const block = `\n--- likely next read: ${rel} (around line ${line}) ---\n${snippet}`;
+                            blocks.push(block);
+                            pfChars += block.length;
+                        } catch { /* skip */ }
+                    }
+                    if (blocks.length) {
+                        prefetch = `\n\n[LIKELY NEXT READS -- already fetched, use these before calling read_file]${blocks.join('')}`;
+                    }
+                } catch { /* prefetch is best-effort */ }
+
+                return `[CWD: ${this.workspaceRoot}]\n${results.join('\n')}${sfTrunc}${prefetch}`;
             }
 
             // â"€â"€ find_files (native, no shell) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€

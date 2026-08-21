@@ -123,11 +123,15 @@ execute them concurrently (Promise.all), returning results in original order. `i
 (`agent.ts:2535`) already classifies safe commands — extend it to drive a real
 concurrency pool (cap at 4–6) for `shell_read` too.
 
-### 2.2 Speculative context pre-fetch — **P1 / M**
+### 2.2 Speculative context pre-fetch — **P1 / M** ✅
 When the model calls `search_files` and gets N hits, the next turn is almost always
 "read those files." **Add:** after a search returns hits, speculatively read the top
 3–5 (bounded by tokens) and attach them to the result as "likely next reads," so the
 model can skip a round-trip. Gate on context budget.
+
+**Implemented.** `search_files` handler (agent.ts ~11575) now reads the top 3 unique
+hit files (bounded at 4000 chars total) and appends a `[LIKELY NEXT READS]` block with
+a 15-line snippet around each hit. Best-effort — failures are silently skipped.
 
 ### 2.3 Smarter compaction: keep the task, drop the noise — **P1 / L**
 `compactHistory` trims from the front. **Improve:**
