@@ -221,10 +221,15 @@ header); the completion gate now counts them and, if any remain, suppresses "don
 injects a `DONE GATE` system message forcing the agent to continue or explicitly defer
 each item. Fires once per run to avoid a block-stop spiral.
 
-### 4.2 Failure taxonomy + auto-recovery — **P1 / M**
+### 4.2 Failure taxonomy + auto-recovery — **P1 / M** ✅
 Classify tool failures (network, permission, syntax, not-found, timeout) and apply a
 targeted recovery (retry with backoff for network, re-read for not-found, switch tool
 for syntax) instead of a generic "try again." Log the taxonomy to `session_trace` (3.4).
+
+**Implemented.** Soft-failure block (agent.ts ~8480) now classifies errors into:
+`not-found`, `permission`, `network`, `syntax`, `missing-dep`, `port-conflict`.
+Each class appends a `[FAILURE TAXONOMY: <class>]` line with a targeted recovery hint
+so the model takes the right corrective action instead of blindly retrying.
 
 ### 4.3 Context-usage HUD in the webview — **P2 / S** ✅
 `calculateContextStats` already computes usage. **Add** a live bar in the chat header
