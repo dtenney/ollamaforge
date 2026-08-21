@@ -8478,6 +8478,37 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             || /^(?:bash|sh|zsh|cmd|python\d?):[^\n]*(?:command not found|No such file|Permission denied|not found)/m.test(toolResult))
                         && !toolResult.includes('file(s) moved');
                     if (isSoftFailure) {
+                        // 4.2 Failure taxonomy: classify the error and attach a targeted recovery hint.
+                        const _failText = toolResult.slice(0, 600);
+                        let _failClass = 'unknown';
+                        let _failHint = '';
+                        if (/command not found|No such file|not found|ENOENT/i.test(_failText)) {
+                            _failClass = 'not-found';
+                            _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
+                        } else if (/Permission denied|EACCES|EPERM/i.test(_failText)) {
+                            _failClass = 'permission';
+                            _failHint = 'Permission denied. Check file ownership (ls -la) or try with elevated privileges. Do NOT retry the same command.';
+                        } else if (/timed out|timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|socket hang up/i.test(_failText)) {
+                            _failClass = 'network';
+                            _failHint = 'Network/timeout error. Wait a moment and retry once. If it fails again, check connectivity (ping/curl) before retrying.';
+                        } else if (/SyntaxError|Syntax error|parse error|unexpected token|TS\d{4}/i.test(_failText)) {
+                            _failClass = 'syntax';
+                            _failHint = 'Syntax/parse error. Read the exact line number from the error, open that file with read_file, and fix the specific syntax issue. Do NOT re-run the same command without fixing the code.';
+                        } else if (/Module not found|Cannot find module|ImportError|No module named/i.test(_failText)) {
+                            _failClass = 'missing-dep';
+                            _failHint = 'Missing dependency. Install it (pip install / npm install) or check the import path. Do NOT retry the same command without installing.';
+                        } else if (/EADDRINUSE|address already in use|port.*in use/i.test(_failText)) {
+                            _failClass = 'port-conflict';
+                            _failHint = 'Port already in use. Find the process (lsof -i :PORT or netstat) and stop it, or use a different port.';
+                        } else if (/ENOENT|no such directory/i.test(_failText)) {
+                            _failClass = 'not-found';
+                            _failHint = 'Directory does not exist. Create it first (mkdir -p) or check the path.';
+                        }
+                        if (_failClass !== 'unknown') {
+                            toolResult += `\n\n[FAILURE TAXONOMY: ${_failClass}] ${_failHint}`;
+                            logInfo(`[agent] 4.2 failure classified as ${_failClass} for ${name}`);
+                        }
+
                         // D-Bus / Wayland session not available over SSH.
                         // Commands like "waydroid session start", "systemctl --user", or any
                         // GUI app launcher will fail with this error when run over SSH because
