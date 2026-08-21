@@ -18,6 +18,7 @@ import { SymbolProvider } from './symbolProvider';
 import { DiffViewManager } from './diffView';
 import { MultiWorkspaceManager } from './multiWorkspace';
 import { runDreamCycle } from './dreamAgent';
+import { isValidWebviewMsg } from './webviewMsgGuard';
 
 /** Strip <tool>{...}</tool> blocks using brace-counting for nested JSON.
  *  Also strips <function_calls>/<invoke> Claude-format blocks and bare stray tags. */
@@ -110,6 +111,8 @@ type WebviewMsg =
     | { command: 'openFile'; path: string }
     | { command: 'reviewProject' }
     | { command: 'compactContext' }
+    | { command: 'pauseExplain' }
+    | { command: 'showTrace' }
     | { command: 'undoLastTool' }
     | { command: 'confirmResponse'; id: string; accepted: boolean }
     | { command: 'confirmResponseAll'; id: string; toolName: string }
@@ -542,7 +545,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
         this._messageListener?.dispose();
         this._messageListener = webviewView.webview.onDidReceiveMessage(async (raw: WebviewMsg) => {
             // Guard: malformed message (missing or non-string command) — log and drop
-            if (!raw || typeof raw.command !== 'string') {
+            if (!isValidWebviewMsg(raw)) {
                 logWarn(`[webview→ext] Received malformed message: ${JSON.stringify(raw)}`);
                 return;
             }
@@ -1480,6 +1483,51 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                 // ── Project code review (git diff) ────────────────────────
                 case 'reviewProject': {
                     vscode.commands.executeCommand('ollamaForge.reviewChanges');
+                    break;
+                }
+
+                // ── 3.4 "Why did you do that" trace: render the last turn's audit ──
+                case 'showTrace': {
+                    if (!this._agent) { break; }
+                    const trace = this._agent.getTrace();
+                    post({
+                        type: 'sessionTrace',
+                        turns:        trace.turns,
+                        outcome:      trace.outcome,
+                        contextPct:   trace.contextPct,
+                        toolCalls:    trace.toolCalls,
+                        guardEvents:  trace.guardEvents,
+                        filesChanged: trace.filesChanged,
+                    });
+                    logInfo(`[provider] 3.4 showTrace: ${trace.toolCalls.length} tool calls, ${trace.guardEvents.length} guard events`);
+                    break;
+                }
+
+                // ── 4.4 Stop & explain: pause the run and ask the model to state its plan ──
+                case 'pauseExplain': {
+                    if (!this._agent) { break; }
+                    // Stop the in-flight run (kills children, aborts HTTP) but do NOT clear history.
+                    this._agent.stop();
+                    this._running = false;
+                    post({ type: 'agentDone' });
+                    // Re-run with a read-only "explain your plan" prompt so the session is preserved.
+                    const explainModel = getConfig().model;
+                    this._running = true;
+                    (async () => {
+                        try {
+                            await this._agent!.run(
+                                '[system: PAUSE & EXPLAIN (4.4) — Do NOT call any tools and do NOT take any action. In plain text, state: (1) your current goal, (2) what you have completed so far, (3) your exact next step, and (4) any blockers or open questions. Then stop and wait for my reply.]',
+                                explainModel,
+                                post
+                            );
+                        } finally {
+                            this._running = false;
+                            post({ type: 'agentDone' });
+                            this.currentSession.agentHistory = this._agent!.conversationHistory;
+                            this.persistSession();
+                        }
+                    })();
+                    logInfo('[provider] 4.4 pauseExplain: stopped run, requesting plan explanation');
                     break;
                 }
 

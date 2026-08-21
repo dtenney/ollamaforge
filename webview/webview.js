@@ -1069,6 +1069,131 @@ function appendSystemNote(text) {
 }
 
 /**
+ * Render a collapsible session-trace panel showing the agent's full run:
+ * turns, outcome, context %, tool calls, guard events, and files changed.
+ */
+function renderTracePanel(msg) {
+    // Remove any existing trace panel
+    document.getElementById('session-trace-panel')?.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'session-trace-panel';
+    panel.style.cssText = `margin:8px 0;border:1px solid var(--vscode-editorWidget-border);` +
+        `border-radius:6px;background:var(--vscode-editorWidget-background);overflow:hidden;`;
+
+    // Header (clickable to toggle)
+    const header = document.createElement('div');
+    header.style.cssText = `display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;` +
+        `font-weight:600;font-size:0.88em;background:var(--vscode-editorWidget-background);` +
+        `user-select:none;`;
+    const chevron = document.createElement('span');
+    chevron.textContent = '▸';
+    chevron.style.cssText = 'transition:transform 0.15s;';
+    const title = document.createElement('span');
+    title.textContent = `🔍 Session Trace — ${msg.turns ?? 0} turn(s), ${msg.toolCalls?.length ?? 0} tool call(s)`;
+    const outcomeBadge = document.createElement('span');
+    const outcome = msg.outcome || 'unknown';
+    outcomeBadge.textContent = outcome;
+    outcomeBadge.style.cssText = `margin-left:auto;font-size:0.8em;padding:2px 8px;border-radius:10px;` +
+        `background:${outcome === 'success' ? 'rgba(64,192,64,0.15)' : outcome === 'stopped' ? 'rgba(204,167,0,0.15)' : 'rgba(239,69,69,0.15)'};` +
+        `color:${outcome === 'success' ? '#40c040' : outcome === 'stopped' ? '#cca700' : '#ef4545'};`;
+    header.appendChild(chevron);
+    header.appendChild(title);
+    header.appendChild(outcomeBadge);
+
+    // Body
+    const body = document.createElement('div');
+    body.style.cssText = 'padding:8px 12px;font-size:0.82em;display:none;';
+
+    // Context bar
+    if (msg.contextPct != null) {
+        const ctxRow = document.createElement('div');
+        ctxRow.style.cssText = 'margin-bottom:10px;';
+        ctxRow.innerHTML = `<span style="opacity:0.7">Context usage:</span> <strong>${msg.contextPct}%</strong>`;
+        body.appendChild(ctxRow);
+    }
+
+    // Tool calls
+    if (msg.toolCalls && msg.toolCalls.length > 0) {
+        const tcSection = document.createElement('div');
+        tcSection.style.cssText = 'margin-bottom:10px;';
+        const tcTitle = document.createElement('div');
+        tcTitle.style.cssText = 'font-weight:600;margin-bottom:4px;opacity:0.8;';
+        tcTitle.textContent = `Tool Calls (${msg.toolCalls.length})`;
+        tcSection.appendChild(tcTitle);
+        const tcList = document.createElement('div');
+        tcList.style.cssText = 'display:flex;flex-direction:column;gap:3px;';
+        msg.toolCalls.forEach((tc, i) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;' +
+                'background:var(--vscode-textCodeBlock-background);';
+            const icon = tc.success === false ? '❌' : '✅';
+            const name = document.createElement('span');
+            name.textContent = `${icon} ${tc.name}`;
+            name.style.cssText = 'font-weight:500;';
+            const detail = document.createElement('span');
+            detail.textContent = tc.detail || '';
+            detail.style.cssText = 'opacity:0.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%;';
+            row.appendChild(name);
+            row.appendChild(detail);
+            tcList.appendChild(row);
+        });
+        tcSection.appendChild(tcList);
+        body.appendChild(tcSection);
+    }
+
+    // Guard events
+    if (msg.guardEvents && msg.guardEvents.length > 0) {
+        const geSection = document.createElement('div');
+        geSection.style.cssText = 'margin-bottom:10px;';
+        const geTitle = document.createElement('div');
+        geTitle.style.cssText = 'font-weight:600;margin-bottom:4px;opacity:0.8;';
+        geTitle.textContent = `Guard Events (${msg.guardEvents.length})`;
+        geSection.appendChild(geTitle);
+        msg.guardEvents.forEach(ge => {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:3px 6px;border-radius:4px;margin-bottom:2px;' +
+                'background:rgba(204,167,0,0.08);border-left:3px solid #cca700;';
+            row.textContent = ge.message || ge.type || 'guard event';
+            geSection.appendChild(row);
+        });
+        body.appendChild(geSection);
+    }
+
+    // Files changed
+    if (msg.filesChanged && msg.filesChanged.length > 0) {
+        const fcSection = document.createElement('div');
+        fcSection.style.cssText = 'margin-bottom:4px;';
+        const fcTitle = document.createElement('div');
+        fcTitle.style.cssText = 'font-weight:600;margin-bottom:4px;opacity:0.8;';
+        fcTitle.textContent = `Files Changed (${msg.filesChanged.length})`;
+        fcSection.appendChild(fcTitle);
+        msg.filesChanged.forEach(f => {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:2px 6px;font-family:var(--vscode-editor-font-family);font-size:0.95em;';
+            row.textContent = `  ${f}`;
+            fcSection.appendChild(row);
+        });
+        body.appendChild(fcSection);
+    }
+
+    // Toggle
+    let expanded = false;
+    header.addEventListener('click', () => {
+        expanded = !expanded;
+        body.style.display = expanded ? 'block' : 'none';
+        chevron.style.transform = expanded ? 'rotate(90deg)' : '';
+    });
+
+    panel.appendChild(header);
+    panel.appendChild(body);
+
+    // Insert before the input area (at the end of messagesEl)
+    messagesEl.appendChild(panel);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+/**
  * Show a persistent resume banner at the top of the restored chat.
  * If the summary contains "⏸ Paused:" (set when pendingContinuation is present),
  * shows a ▶ Resume button that sends "continue" on click.
@@ -2443,6 +2568,21 @@ stopBtn.addEventListener('click', () => {
     setStreaming(false);
 });
 
+// 4.4 Stop & explain: pause the run and ask the agent to state its current plan.
+const pauseExplainBtn = /** @type {HTMLButtonElement} */ (document.getElementById('pause-explain-btn'));
+if (pauseExplainBtn) {
+    pauseExplainBtn.addEventListener('click', () => {
+        vscode.postMessage({ command: 'pauseExplain' });
+    });
+}
+
+const showTraceBtn = /** @type {HTMLButtonElement} */ (document.getElementById('show-trace-btn'));
+if (showTraceBtn) {
+    showTraceBtn.addEventListener('click', () => {
+        vscode.postMessage({ command: 'showTrace' });
+    });
+}
+
 promptEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -3141,6 +3281,10 @@ window.addEventListener('message', (event) => {
             document.querySelectorAll('.tool-card:not(.success):not(.error) .dots').forEach(dots => {
                 dots.remove();
             });
+            break;
+
+        case 'sessionTrace':
+            renderTracePanel(msg);
             break;
 
         case 'info':

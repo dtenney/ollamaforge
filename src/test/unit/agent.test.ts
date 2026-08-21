@@ -244,3 +244,40 @@ describe('Agent Module', () => {
     });
   });
 });
+
+// ── 1.5 Webview postMessage validation ───────────────────────────────────────
+describe('Webview postMessage validation (1.5)', () => {
+  // Import lazily so the test does not pull in the full VS Code extension host.
+  let isValidWebviewMsg: (raw: unknown) => boolean;
+  before(async () => {
+    const mod = await import('../../webviewMsgGuard');
+    isValidWebviewMsg = mod.isValidWebviewMsg;
+  });
+
+  it('accepts a well-formed message with a string command', () => {
+    assert.strictEqual(isValidWebviewMsg({ command: 'getModels' }), true);
+    assert.strictEqual(isValidWebviewMsg({ command: 'sendMessage', text: 'hi' }), true);
+  });
+
+  it('rejects null / undefined / non-object payloads', () => {
+    assert.strictEqual(isValidWebviewMsg(null), false);
+    assert.strictEqual(isValidWebviewMsg(undefined), false);
+    assert.strictEqual(isValidWebviewMsg('getModels'), false);
+    assert.strictEqual(isValidWebviewMsg(42), false);
+  });
+
+  it('rejects a message missing the command field', () => {
+    assert.strictEqual(isValidWebviewMsg({}), false);
+    assert.strictEqual(isValidWebviewMsg({ text: 'no command' }), false);
+  });
+
+  it('rejects a message whose command is not a string', () => {
+    assert.strictEqual(isValidWebviewMsg({ command: 123 }), false);
+    assert.strictEqual(isValidWebviewMsg({ command: null }), false);
+    assert.strictEqual(isValidWebviewMsg({ command: {} }), false);
+  });
+
+  it('rejects an empty-string command', () => {
+    assert.strictEqual(isValidWebviewMsg({ command: '' }), false);
+  });
+});

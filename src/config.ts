@@ -69,6 +69,8 @@ export interface OllamaConfig {
     keepAlive: string;
     /** reasoning_effort for Qwen3.8+ models: "low", "medium", or "xhigh". Empty = use model default (xhigh). */
     reasoningEffort: string;
+    /** Command policy engine (Wave 1 security). deny/confirm/allow patterns + egress allowlist. */
+    commandPolicy?: import('./commandPolicy').CommandPolicyConfig;
 }
 
 // ── Model routing helpers ─────────────────────────────────────────────────────
