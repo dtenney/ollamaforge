@@ -59,7 +59,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (mcpConfigs.length > 0) {
         logInfo(`Starting ${mcpConfigs.length} MCP server(s)...`);
         const serverPromises = mcpConfigs.map(cfg => 
-            startMCPServer(cfg.name, cfg.command, cfg.args, cfg.env || {})
+            startMCPServer(cfg.name, cfg.command, cfg.args, cfg.env || {}, cfg.allowedTools)
                 .catch(err => {
                     logError(`MCP server ${cfg.name} failed to start: ${toErrorMessage(err)}`);
                     return null;

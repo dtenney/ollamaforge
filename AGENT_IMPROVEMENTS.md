@@ -105,10 +105,18 @@ canonical-path check: resolve and confirm the target stays under the workspace r
 (or an explicitly-allowed outside path) before touching disk. Block `..`, symlinks that
 escape, and absolute paths outside the workspace unless `read_file_outside` is approved.
 
-### 1.7 MCP tool surface lockdown — **P2 / M**
+### 1.7 MCP tool surface lockdown — **P2 / M** ✅
 MCP servers are user-configured but their tools are auto-exposed. **Add:** per-server
 tool allowlist in `mcp.json`, a default-deny for `run_command`-equivalents from MCP,
 and a confirmation prompt the first time any MCP tool is invoked in a session.
+
+**Implemented.** `allowedTools?: string[]` on `MCPServerConfig` (mcpConfig.ts:16),
+threaded through `startMCPServer` (mcpClient.ts:42) which now filters exposed tools
+against both the allowlist and a default-deny regex blocklist (`MCP_DENY_PATTERNS`,
+mcpClient.ts:28) covering shell/exec/write/install-style tool names. First-time
+confirmation gate in agent.ts:10224 — `_mcpConfirmedTools` set (agent.ts:2916) +
+`askUser()` prompt before the first invocation of any MCP tool per session.
+`tsc --noEmit` clean; `npm run test:unit` → 382 passing.
 
 ---
 
@@ -133,7 +141,7 @@ model can skip a round-trip. Gate on context budget.
 hit files (bounded at 4000 chars total) and appends a `[LIKELY NEXT READS]` block with
 a 15-line snippet around each hit. Best-effort — failures are silently skipped.
 
-### 2.3 Smarter compaction: keep the task, drop the noise — **P1 / L**
+### 2.3 Smarter compaction: keep the task, drop the noise — **P1 / L** ✅
 `compactHistory` trims from the front. **Improve:**
 - Score history messages by (recency × task-relevance × whether they contain a
   decision/fact) and drop low-score middle messages first, preserving the
@@ -141,20 +149,51 @@ a 15-line snippet around each hit. Best-effort — failures are silently skipped
 - Replace long tool outputs with a 1-line summary + a `read_file` pointer so the model
   can re-fetch on demand instead of carrying the blob.
 
-### 2.4 Token-budget-aware tool selection — **P2 / M**
+**Implemented:** `compactHistory` (src/contextCalculator.ts) now returns
+`{ kept, dropped }` (CompactResult). It scores each message (recency + role +
+decision/fact markers), summarizes tool-output blobs >1500 chars into a one-line
+re-fetch pointer, and greedily keeps the highest-value messages within the token
+budget while always retaining the most recent turn. Both call sites in src/agent.ts
+(manual `/compact` + auto-compact) updated to the new shape; the minRemove floor
+moves extra messages from `kept` into `dropped`, and the memory-save block uses the
+returned `dropped` array. Test replica in contextCalculator.test.ts kept in sync.
+`tsc --noEmit` clean; `npm run test:unit` → 382 passing.
+
+### 2.4 Token-budget-aware tool selection — **P2 / M** ✅
 Expose a per-tool "context cost" estimate in the tool descriptions and let the agent
 prefer `graph_query`/`search_files` over `read_file` for large files when context is
 tight (the `[CONTEXT TIGHT]` warning already fires — wire it to actually bias tool choice).
 
-### 2.5 Cache repeated workspace recon — **P1 / S**
+**Implemented:** `buildToolBiasNote(remainingPct)` (`src/agent.ts:1486`) returns a
+tool-choice bias note when context is tight, and it is appended to the context-budget
+message at `src/agent.ts:6066-6067` so the `[CONTEXT TIGHT]` warning now actively nudges
+the model toward cheaper tools (`graph_query`/`search_files`) instead of `read_file`.
+`tsc --noEmit` passes.
+
+### 2.5 Cache repeated workspace recon — **P1 / S** ✅
 `_reconResult` is cached per class, but `buildWorkspaceSummary` and
 `detectPythonEnvironment` re-run. **Add:** an mtime-keyed cache (we already snapshot
 context-file mtimes at `agent.ts:2787`) so unchanged workspaces skip re-scanning.
 
-### 2.6 Streaming + early tool-call parsing — **P2 / L**
+**Implemented:** `buildWorkspaceSummary` now stores a `fingerprint` (max mtime across
+sentinel files + root dir) alongside the TTL. On a cache miss after TTL expiry it
+recomputes the fingerprint; if unchanged it returns the cached text and refreshes the
+TTL instead of re-scanning. `clearWorkspaceSummaryCache()` still invalidates after
+file operations.
+
+### 2.6 Streaming + early tool-call parsing — **P2 / L** ✅
 Currently the full response is parsed for `<tool>` blocks. **Add:** parse tool calls as
 they stream so the first tool can start executing before the model finishes, cutting
 per-turn latency on multi-tool turns.
+
+**Implemented:** mid-stream pre-execution of read-only tools. The stream token callback
+(`src/agent.ts` ~6199) accumulates raw tokens in `_preExecBuf` and, on each completed
+`<tool>...</tool>` block, calls `_preExecToolBlock()` which parses the JSON and, if the
+tool is in the strict allowlist (`read_file`, `find_files`, `search_files`,
+`workspace_summary`), runs it and stores the result in `_preExecCache`. `executeTool()`
+checks that cache first and reuses the result, so the main loop skips re-running the
+tool. Only side-effect-free tools are pre-executed; the buffer is kept bounded.
+`tsc --noEmit` passes.
 
 ---
 
@@ -167,16 +206,29 @@ auto-run the project's check (from `buildProjectTypeGuidance`: pytest/ruff/tsc/e
 and feed failures back as a forced next action. Only allow "done" when the check is
 green or the user explicitly waives it. This is the highest-leverage reliability win.
 
-### 3.2 Plan-then-execute with a visible, resumable task ledger — **P1 / M**
+### 3.2 Plan-then-execute with a visible, resumable task ledger — **P1 / M** ✅
 `task_log`/`task_checkpoint` exist. **Add:** a structured plan object
 (steps, status, dependencies) persisted to `.ollamaforge/tmp/plan.json` so a
 context-compaction or crash resumes exactly where it left off, and the webview renders
 it as a live checklist. This directly fixes the "agent re-plans after compaction" failure.
 
-### 3.3 Diff-first editing (propose → review → apply) — **P1 / L**
+**Implemented.** New `task_plan` tool (agent.ts) with actions `create`/`advance`/`skip`/`block`/`status`.
+Ledger persists to `.ollamaforge/tasks/<task_id>/plan.json` as ordered steps with per-step
+status + note. The multi-step nudge now directs the model to `task_plan action="create"`.
+A "PLAN LEDGER INJECTION" block re-reads the ledger each turn and appends the current
+checklist + NEXT STEP to the system prompt, so the plan survives context compaction and
+turn-limit resets. `tsc --noEmit` clean; `npm run test:unit` → 382 passing.
+
+### 3.3 Diff-first editing (propose → review → apply) — **P1 / L** ✅
 `diffView.ts` exists. **Add a mode** where every edit is staged as a diff the user
 accepts/rejects per-hunk (beyond the current whole-file Accept), with a one-click
 "apply all non-destructive" for Trust mode. Reduces the blast radius of a bad edit.
+
+**Implemented.** New staged-edit queue (`_stagedEdits`, agent.ts:2809). `propose_edit`
+stages an edit (validates old_string exists, opens a diff preview) without writing to
+disk. `apply_staged_edits` applies per-hunk: `mode="select"` (specific ids), `mode="all"`
+(one-click apply-all for Trust/YOLO), `mode="discard"`. Re-validates old_string at apply
+time and skips stale hunks. `tsc --noEmit` clean; `npm run test:unit` → 382 passing.
 
 ### 3.4 "Why did you do that" trace — **P2 / S** ✅
 `_guardEvents` and `_toolCallsThisRun` are already collected. **Add** a `session_trace`
@@ -189,20 +241,33 @@ toolCalls, guardEvents, filesChanged. Provider handler at provider.ts:1490 posts
 badge, context %, tool call list (✅/❌), guard events, and files changed. Button:
 `#show-trace-btn` in webview.html:1515.
 
-### 3.5 Multi-file refactor with a rollback checkpoint — **P1 / M**
+### 3.5 Multi-file refactor with a rollback checkpoint — **P1 / M** ✅
 `refactor_multi_file` exists. **Add:** an automatic snapshot (git stash or file
 backup) before a multi-file refactor, and a `rollback_last_refactor` tool. `_lastFileOp`
 already stores one op's original content — generalize to a small undo stack.
+
+**Implemented.** Undo stack `_fileOpStack` (max 20) + `_recordFileOp()` helper
+(agent.ts:2856); all 7 file-op sites record to it. `rollback_last_refactor` tool
+(definition + handler, agent.ts:13917) rolls back the last N ops: removes created files,
+restores deleted ones, reverts edits, and re-syncs `_lastFileOp`. `tsc --noEmit` clean;
+`npm run test:unit` → 382 passing.
 
 ### 3.6 Environment-aware tool routing — **P2 / M** ✅
 `detectShellEnvironment` and `detectPythonEnvironment` already probe the box. **Add:**
 auto-select the right test/lint/build command and inject it into the `verify` step
 (3.1) so the agent never guesses `pytest` vs `mocha` vs `go test`.
 
-### 3.7 Structured "ask the user" protocol — **P2 / S**
+### 3.7 Structured "ask the user" protocol — **P2 / S** ✅
 Today questions are free-text. **Add** a `ask_user` tool with typed options
 (single-choice / yes-no / free-text) rendered as buttons in the webview, so the agent
 can disambiguate ("move X from A to B") without a round of prose.
+
+**Implemented.** `ask_user` tool (agent.ts:916) with `question`, `options` (2–6),
+`allowFreeText`. `askUser()` helper + `resolveChoice()` + `_choiceResolver` field
+(agent.ts:3440) post an `askUser` message and await the answer. Webview `addAskCard()`
+(webview.js:2316) renders option buttons (+ optional free-text input) and posts
+`resolveChoice`; provider.ts handles the `resolveChoice` command (type union + case).
+`tsc --noEmit` clean; `npm run test:unit` → 382 passing.
 
 ---
 
@@ -272,3 +337,17 @@ flags the translation in the result. Reduces a whole class of "command not found
    strongly warn? (Blocking is safer but can annoy on WIP code.)
 4. **Scope** — is this plan for the current `ollamaforge` repo only, or should I also
    flag anything that belongs in a shared/parent project?
+
+## 7. Deep-review checklist (learned 2026-08-21)
+
+Three bugs were missed in the first review pass because I checked "does this look right?"
+instead of "is this actually wired up / valid / reachable?" Apply all three checks before
+declaring any review complete:
+
+| Check | What to do | Example missed |
+|-------|-----------|----------------|
+| **Wiring** | For every config field / interface member, grep for ALL usages. If it only appears in the type def + the `c.get()` call but never in actual logic, it's dead code. | `commandPolicy` in config.ts — in the interface but never read |
+| **Type validity** | For every enum/union value used in code (e.g. `push` to a typed array), cross-reference the type definition to confirm the value exists. | `'command-policy'` used where `'secret-detection'` was the correct tag |
+| **Reachability** | For every `if/else` chain where one branch returns/continues, trace whether the other branch is actually reachable. Watch for short-circuit patterns that make later checks dead. | MCP allowlist check ran first and short-circuited, making deny-patterns unreachable |
+
+**Rule of thumb:** "Looks right" ≠ "works." Always trace the data flow end-to-end.

@@ -251,7 +251,29 @@ export function formatPythonEnvironment(env: PythonEnvironment): string {
 // ── Full workspace summary (used as a tool result) ────────────────────────────
 
 /** Cached workspace summary with TTL */
-let _cachedSummary: { root: string; text: string; timestamp: number } | null = null;
+let _cachedSummary: { root: string; text: string; timestamp: number; fingerprint: number } | null = null;
+
+/**
+ * Cheap workspace fingerprint: max mtime across a few sentinel files + the root dir.
+ * If none of these changed, the workspace is almost certainly unchanged and we can
+ * skip the full re-scan even after the TTL has expired.
+ */
+function getWorkspaceFingerprint(root: string): number {
+    const sentinels = ['package.json', 'pyproject.toml', 'setup.py', 'requirements.txt', 'ARCHITECTURE.md', 'README.md'];
+    let maxMtime = 0;
+    for (const f of sentinels) {
+        try {
+            const stat = fs.statSync(path.join(root, f));
+            if (stat.mtimeMs > maxMtime) maxMtime = stat.mtimeMs;
+        } catch { /* file doesn't exist */ }
+    }
+    // Root dir mtime catches new/deleted top-level files
+    try {
+        const dirStat = fs.statSync(root);
+        if (dirStat.mtimeMs > maxMtime) maxMtime = dirStat.mtimeMs;
+    } catch { /* root doesn't exist */ }
+    return maxMtime;
+}
 const SUMMARY_TTL_MS = 30_000; // 30 seconds
 
 /** Invalidate the workspace summary cache (call after file operations). */
@@ -260,9 +282,17 @@ export function clearWorkspaceSummaryCache(): void {
 }
 
 export async function buildWorkspaceSummary(root: string): Promise<string> {
-    // Return cached summary if still fresh and for the same root
+    // Fast path: TTL still valid → return immediately
     if (_cachedSummary && _cachedSummary.root === root && (Date.now() - _cachedSummary.timestamp) < SUMMARY_TTL_MS) {
         return _cachedSummary.text;
+    }
+    // Slow path: TTL expired but workspace unchanged (fingerprint match) → still return cached
+    if (_cachedSummary && _cachedSummary.root === root) {
+        const currentFp = getWorkspaceFingerprint(root);
+        if (currentFp === _cachedSummary.fingerprint) {
+            _cachedSummary.timestamp = Date.now(); // refresh TTL
+            return _cachedSummary.text;
+        }
     }
 
     const type = detectProjectType(root);
@@ -309,6 +339,6 @@ export async function buildWorkspaceSummary(root: string): Promise<string> {
     if (text.length > MAX_SUMMARY_CHARS) {
         text = text.slice(0, MAX_SUMMARY_CHARS) + `\n\n[workspace_summary truncated at ${MAX_SUMMARY_CHARS} chars — use shell_read with ls/find for deeper exploration]`;
     }
-    _cachedSummary = { root, text, timestamp: Date.now() };
+    _cachedSummary = { root, text, timestamp: Date.now(), fingerprint: getWorkspaceFingerprint(root) };
     return text;
 }

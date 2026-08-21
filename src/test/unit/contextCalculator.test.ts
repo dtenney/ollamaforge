@@ -63,26 +63,63 @@ function getModelContextLimit(model: string): number {
     return DEFAULT_CONTEXT_LIMIT;
 }
 
+interface CompactResult {
+    kept: Array<{ role: string; content: string }>;
+    dropped: Array<{ role: string; content: string }>;
+}
+
+function scoreMessage(msg: { role: string; content: string }, index: number, total: number): number {
+    let score = 0;
+    score += (index / Math.max(total - 1, 1)) * 2;
+    if (msg.role === 'user' || msg.role === 'assistant') score += 1;
+    const lower = msg.content.toLowerCase();
+    if (/decision|saved to memory|remember|important|conclusion|final answer|resolved|implemented|done/.test(lower)) score += 2;
+    if (/\[tool\]|tool result|tool output/.test(lower)) score -= 1;
+    return score;
+}
+
+function summarizeToolOutput(msg: { role: string; content: string }): { role: string; content: string } {
+    const THRESHOLD = 1500;
+    if (msg.content.length <= THRESHOLD) return msg;
+    const firstLine = msg.content.split('\n').find(l => l.trim()) || '';
+    const preview = firstLine.slice(0, 120);
+    return { ...msg, content: `[tool output omitted — ${msg.content.length} chars] ${preview}… (re-fetch with read_file/search_files if needed)` };
+}
+
 function compactHistory(
     history: Array<{ role: string; content: string }>,
     targetPercentage: number, modelLimit: number,
     systemPromptTokens: number, memoryTokens: number
-): Array<{ role: string; content: string }> {
-    if (history.length === 0) return [];
+): CompactResult {
+    if (history.length === 0) return { kept: [], dropped: [] };
     const targetTotalTokens = Math.floor((modelLimit * targetPercentage) / 100);
     const targetHistoryTokens = targetTotalTokens - systemPromptTokens - memoryTokens;
-    if (targetHistoryTokens <= 0) return history.slice(-1);
+    if (targetHistoryTokens <= 0) return { kept: history.slice(-1), dropped: history.slice(0, -1) };
 
-    const compacted: Array<{ role: string; content: string }> = [];
-    let currentTokens = 0;
-    for (let i = history.length - 1; i >= 0; i--) {
-        const msg = history[i];
+    const summarized = history.map(summarizeToolOutput);
+    const total = summarized.length;
+    const scored = summarized.map((msg, i) => ({ msg, i, score: scoreMessage(msg, i, total) }));
+
+    const keptIdx = new Set<number>();
+    keptIdx.add(total - 1);
+    let currentTokens = estimateTokens(summarized[total - 1].content) + MESSAGE_OVERHEAD_TOKENS;
+
+    const order = [...scored].sort((a, b) => b.score - a.score || b.i - a.i);
+    for (const { msg, i } of order) {
+        if (keptIdx.has(i)) continue;
         const msgTokens = estimateTokens(msg.content) + MESSAGE_OVERHEAD_TOKENS;
-        if (currentTokens + msgTokens > targetHistoryTokens && compacted.length > 0) break;
-        compacted.unshift(msg);
+        if (currentTokens + msgTokens > targetHistoryTokens) continue;
+        keptIdx.add(i);
         currentTokens += msgTokens;
     }
-    return compacted;
+
+    const kept: Array<{ role: string; content: string }> = [];
+    const dropped: Array<{ role: string; content: string }> = [];
+    for (let i = 0; i < total; i++) {
+        if (keptIdx.has(i)) kept.push(summarized[i]);
+        else dropped.push(summarized[i]);
+    }
+    return { kept, dropped };
 }
 
 describe('ContextCalculator Module', () => {
@@ -203,8 +240,9 @@ describe('ContextCalculator Module', () => {
     });
 
     describe('compactHistory', () => {
-        it('should return empty array for empty history', () => {
-            assert.deepStrictEqual(compactHistory([], 50, 8192, 100, 100), []);
+        it('should return empty kept/dropped for empty history', () => {
+            const result = compactHistory([], 50, 8192, 100, 100);
+            assert.deepStrictEqual(result, { kept: [], dropped: [] });
         });
 
         it('should keep recent messages and remove older ones', () => {
@@ -214,9 +252,13 @@ describe('ContextCalculator Module', () => {
             }));
             // Use a small model limit so compaction is forced
             const result = compactHistory(history, 30, 2000, 100, 100);
-            assert.ok(result.length < history.length);
-            assert.ok(result.length > 0);
-            assert.strictEqual(result[result.length - 1].content, history[history.length - 1].content);
+            assert.ok(result.kept.length < history.length);
+            assert.ok(result.kept.length > 0);
+            assert.ok(result.dropped.length > 0);
+            // kept + dropped should account for every message
+            assert.strictEqual(result.kept.length + result.dropped.length, history.length);
+            // the most recent message is always retained
+            assert.strictEqual(result.kept[result.kept.length - 1].content, history[history.length - 1].content);
         });
 
         it('should keep at least one message when target is very small', () => {
@@ -225,7 +267,7 @@ describe('ContextCalculator Module', () => {
                 { role: 'assistant', content: 'y'.repeat(1000) },
             ];
             const result = compactHistory(history, 1, 100, 50, 50);
-            assert.ok(result.length >= 1);
+            assert.ok(result.kept.length >= 1);
         });
 
         it('should not compact when history fits within target', () => {
@@ -234,7 +276,8 @@ describe('ContextCalculator Module', () => {
                 { role: 'assistant', content: 'Hello' },
             ];
             const result = compactHistory(history, 50, 100000, 100, 100);
-            assert.strictEqual(result.length, history.length);
+            assert.strictEqual(result.kept.length, history.length);
+            assert.strictEqual(result.dropped.length, 0);
         });
     });
 });

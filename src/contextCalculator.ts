@@ -463,45 +463,102 @@ export function shrinkLargeToolMessages(
  * @param memoryTokens Tokens used by memory context
  * @returns Compacted history
  */
+export interface CompactResult {
+    kept: OllamaMessage[];
+    dropped: OllamaMessage[];
+}
+
+/**
+ * Score a message for compaction priority. Higher = more important, keep longer.
+ * Factors: recency, task-relevance, and whether it carries a decision/fact marker.
+ */
+function scoreMessage(msg: OllamaMessage, index: number, total: number): number {
+    let score = 0;
+    // Recency: newer messages score higher (0..1)
+    score += (index / Math.max(total - 1, 1)) * 2;
+    // Role: user/assistant carry more signal than tool output
+    if (msg.role === 'user' || msg.role === 'assistant') score += 1;
+    // Decision/fact markers
+    const lower = msg.content.toLowerCase();
+    if (/decision|saved to memory|remember|important|conclusion|final answer|resolved|implemented|done/.test(lower)) score += 2;
+    if (/\[tool\]|tool result|tool output/.test(lower)) score -= 1; // tool blobs are droppable
+    return score;
+}
+
+/**
+ * Replace a long tool-output blob with a 1-line summary + a re-fetch pointer so the
+ * model can pull it back on demand instead of carrying the full text.
+ */
+function summarizeToolOutput(msg: OllamaMessage): OllamaMessage {
+    const THRESHOLD = 1500;
+    if (msg.content.length <= THRESHOLD) return msg;
+    const firstLine = msg.content.split('\n').find(l => l.trim()) || '';
+    const preview = firstLine.slice(0, 120);
+    return {
+        ...msg,
+        content: `[tool output omitted — ${msg.content.length} chars] ${preview}… (re-fetch with read_file/search_files if needed)`,
+    };
+}
+
+/**
+ * Compact conversation history by scoring messages and dropping the lowest-value
+ * middle messages first, while always preserving the most recent turns and any
+ * decision/fact markers. Long tool outputs are summarized in place.
+ *
+ * @returns { kept, dropped } — kept is the new history (in original order),
+ *          dropped is the list of removed messages (in original order).
+ */
 export function compactHistory(
     history: OllamaMessage[],
     targetPercentage: number,
     modelLimit: number,
     systemPromptTokens: number,
     memoryTokens: number
-): OllamaMessage[] {
+): CompactResult {
     if (history.length === 0) {
-        return [];
+        return { kept: [], dropped: [] };
     }
-    
+
     // Calculate target tokens for history (accounting for system prompt and memory)
     const targetTotalTokens = Math.floor((modelLimit * targetPercentage) / 100);
     const targetHistoryTokens = targetTotalTokens - systemPromptTokens - memoryTokens;
-    
+
     if (targetHistoryTokens <= 0) {
         logWarn('[context] Target history tokens is negative, keeping only last message');
-        return history.slice(-1);
+        return { kept: history.slice(-1), dropped: history.slice(0, -1) };
     }
-    
-    // Work backwards from the end, keeping messages until we hit the target
-    const compacted: OllamaMessage[] = [];
-    let currentTokens = 0;
-    
-    for (let i = history.length - 1; i >= 0; i--) {
-        const msg = history[i];
+
+    // Step 1: Summarize long tool-output blobs in place (cheap, preserves turn count)
+    const summarized = history.map(summarizeToolOutput);
+
+    // Step 2: Score every message
+    const total = summarized.length;
+    const scored = summarized.map((msg, i) => ({ msg, i, score: scoreMessage(msg, i, total) }));
+
+    // Step 3: Greedily keep highest-score messages until we hit the token budget.
+    // Always keep the most recent message (the live turn) regardless of score.
+    const keptIdx = new Set<number>();
+    keptIdx.add(total - 1);
+    let currentTokens = estimateTokens(summarized[total - 1].content) + MESSAGE_OVERHEAD_TOKENS;
+
+    // Sort by score descending, ties broken by recency (newer first)
+    const order = [...scored].sort((a, b) => b.score - a.score || b.i - a.i);
+    for (const { msg, i } of order) {
+        if (keptIdx.has(i)) continue;
         const msgTokens = estimateTokens(msg.content) + MESSAGE_OVERHEAD_TOKENS;
-        
-        if (currentTokens + msgTokens > targetHistoryTokens && compacted.length > 0) {
-            // Would exceed target, stop here
-            break;
-        }
-        
-        compacted.unshift(msg);
+        if (currentTokens + msgTokens > targetHistoryTokens) continue;
+        keptIdx.add(i);
         currentTokens += msgTokens;
     }
-    
-    const removedCount = history.length - compacted.length;
-    logInfo(`[context] Compacted history: removed ${removedCount} messages, kept ${compacted.length} (${currentTokens} tokens)`);
-    
-    return compacted;
+
+    // Rebuild kept in original order; dropped = everything else, original order
+    const kept: OllamaMessage[] = [];
+    const dropped: OllamaMessage[] = [];
+    for (let i = 0; i < total; i++) {
+        if (keptIdx.has(i)) kept.push(summarized[i]);
+        else dropped.push(summarized[i]);
+    }
+
+    logInfo(`[context] Compacted history: kept ${kept.length}, dropped ${dropped.length} (${currentTokens} tokens)`);
+    return { kept, dropped };
 }

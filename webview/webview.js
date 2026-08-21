@@ -2313,6 +2313,34 @@ function addFileToastSimple(icon, text) {
  * @param {string} action  Action type: 'run', 'write', 'rename', 'delete'
  * @param {string} detail  Human-readable description
  */
+function addAskCard(id, question, options, allowFreeText) {
+    const div = document.createElement('div');
+    div.className = 'confirm-card ask-card';
+    div.id = `ask-${id}`;
+    const optsHtml = options.map(o => `<button class="confirm-btn accept ask-opt" data-opt="${escHtml(o)}">${escHtml(o)}</button>`).join('');
+    const freeHtml = allowFreeText ? `<input type="text" class="ask-free" placeholder="Or type your answer…" style="width:100%;margin-top:6px;box-sizing:border-box;">` : '';
+    div.innerHTML =
+        `<div class="confirm-header"><span class="confirm-icon">❓</span><span class="confirm-detail">${escHtml(question)}</span></div>` +
+        `<div class="confirm-actions ask-actions">${optsHtml}</div>` + freeHtml;
+    messagesEl.appendChild(div);
+    div.scrollIntoView({ behavior: 'smooth', block: 'end' });
+
+    let resolved = false;
+    function resolve(choice) {
+        if (resolved) return;
+        resolved = true;
+        div.classList.add('accepted');
+        div.querySelector('.ask-actions').innerHTML = `<span class="confirm-resolved">→ ${escHtml(choice)}</span>`;
+        const free = div.querySelector('.ask-free'); if (free) free.remove();
+        vscode.postMessage({ command: 'resolveChoice', choice });
+    }
+    div.querySelectorAll('.ask-opt').forEach(btn => btn.addEventListener('click', () => resolve(btn.dataset.opt)));
+    const free = div.querySelector('.ask-free');
+    if (free) {
+        free.addEventListener('keydown', e => { if (e.key === 'Enter' && free.value.trim()) resolve(free.value.trim()); });
+    }
+}
+
 function addConfirmCard(id, action, detail, toolName) {
     const icons = { run: '⚡', write: '💾', rename: '🔄', delete: '🗑️', edit: '✏️' };
     const icon = icons[action] || '❓';
@@ -3653,6 +3681,10 @@ window.addEventListener('message', (event) => {
 
         case 'confirmAction':
             addConfirmCard(msg.id, msg.action, msg.detail, msg.toolName);
+            break;
+
+        case 'askUser':
+            addAskCard(msg.id, msg.question, msg.options || [], Boolean(msg.allowFreeText));
             break;
 
         case 'autoApproved': {

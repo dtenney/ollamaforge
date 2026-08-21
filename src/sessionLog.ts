@@ -12,7 +12,8 @@ export interface ToolCallRecord {
 export interface GuardEvent {
     /** Short identifier for the guard that fired. */
     type: 'logprob' | 'schema-guard' | 'merge-guard' | 'undef-guard' | 'stub-file'
-        | 'import-guard' | 'syntax-error' | 'repeat-guard' | 'scope-guard' | 'command-policy';
+        | 'import-guard' | 'syntax-error' | 'repeat-guard' | 'scope-guard' | 'command-policy'
+        | 'secret-detection';
     /** Human-readable reason string. */
     reason: string;
     /** File affected, if applicable. */

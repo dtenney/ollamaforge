@@ -854,6 +854,84 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
     {
         type: 'function',
         function: {
+            name: 'task_plan',
+            description: 'Maintain a structured plan ledger for a multi-step task. Call once with action="create" to declare the full step list, then action="advance" after each step completes (or action="skip"/"block" with a reason). The ledger persists to .ollamaforge/tasks/<task_id>/plan.json and is injected into your system prompt every turn so you never lose track of what is done vs. pending across context compactions. Use this for any task with 3+ steps. Prefer this over free-form task_log for the step checklist; use task_log for the narrative log.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    task_id: { type: 'string', description: 'Short snake_case identifier, e.g. "wave4_plan_ledger". Same id across all calls for this task.' },
+                    action: { type: 'string', enum: ['create', 'advance', 'skip', 'block', 'status'], description: 'create = declare the full step list. advance = mark the next pending step done (optionally with a note). skip = mark the next pending step skipped (give a reason). block = mark the next pending step blocked (give the blocker). status = read the current ledger without changing it.' },
+                    steps: { type: 'array', items: { type: 'string' }, description: 'Required for action=create. Ordered list of step descriptions, e.g. ["Read existing task_log handler", "Add task_plan tool definition", "Add handler case", "Inject ledger into system prompt", "Verify with tests"].' },
+                    note: { type: 'string', description: 'Optional note for the step being advanced/skipped/blocked. Max 200 chars.' },
+                },
+                required: ['task_id', 'action'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'propose_edit',
+            description: 'Stage an edit for review WITHOUT writing it to disk (diff-first mode, item 3.3). Opens a VS Code diff preview of old_string → new_string and queues the change. The user (or apply_staged_edits) decides whether to apply it. Use this for risky or multi-hunk edits to reduce blast radius. Non-destructive by default; set destructive=true only if the change deletes data or is hard to reverse.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'File path relative to workspace root.' },
+                    old_string: { type: 'string', description: 'Exact current text to replace (or "" for a pure insertion at top).' },
+                    new_string: { type: 'string', description: 'Replacement text.' },
+                    destructive: { type: 'boolean', description: 'Set true if the change is hard to reverse (deletes data, drops columns, etc.). Defaults to false.' },
+                },
+                required: ['path', 'old_string', 'new_string'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'apply_staged_edits',
+            description: 'Apply previously staged edits (from propose_edit) to disk. mode="all" applies every staged edit (use in Trust/YOLO for one-click apply-all). mode="select" applies only the given edit_ids. mode="discard" drops the given edit_ids without applying. Returns a per-edit result. Reduces blast radius by letting the user accept/reject hunks individually.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    mode: { type: 'string', enum: ['all', 'select', 'discard'], description: 'all = apply every staged edit. select = apply only edit_ids. discard = drop edit_ids without applying.' },
+                    edit_ids: { type: 'array', items: { type: 'number' }, description: 'Required for select/discard. The ids returned by propose_edit.' },
+                },
+                required: ['mode'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'rollback_last_refactor',
+            description: 'Roll back the most recent multi-file refactor (item 3.5). Restores every file touched since the last rollback to its pre-edit content (or removes files that were created). count=N rolls back the last N file operations from the undo stack (default 1 = the whole last batch). Use after a refactor that broke something, to restore the prior state before retrying.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    count: { type: 'number', description: 'How many recent file operations to roll back (default 1). Each operation is one file edit/create/delete.' },
+                },
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'ask_user',
+            description: 'Ask the user a typed question with options (item 3.7). Renders buttons in the webview. Use when you need to disambiguate a request (e.g. "move X from A to B" — update code vs move files). options: list of 2-6 short choices. allowFreeText: true adds a free-text input below the buttons.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    question: { type: 'string', description: 'The question to ask the user.' },
+                    options: { type: 'array', items: { type: 'string' }, description: '2-6 short option labels the user can click.' },
+                    allowFreeText: { type: 'boolean', description: 'If true, also show a free-text input. Default false.' },
+                },
+                required: ['question', 'options'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'task_log',
             description: 'Write a structured log entry to the task scratchpad at .ollamaforge/tasks/<task_id>/log.md. Use this to track progress, record script paths, capture output summaries, and note validation results for long-running data tasks. Call at the start of a task (status=started), after each major step (status=step), after validation (status=validated or status=failed), and when done (status=done).',
             parameters: {
@@ -1331,6 +1409,13 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Local scratch work stays in the workspace.** Never use /tmp or the OS temp dir for local clones, scratch files, or intermediate data. Use .ollamaforge/tmp/ instead (it is gitignored and workspace-local). /tmp is only acceptable for scripts being scp'd to a remote host.
 **Don't run long scripts — hand them to the user.** Before running a Python script with run_command, ask yourself: will this finish in under 60 seconds? If it crawls files (os.walk, glob **), reads large datasets (pd.read_csv, iterrows), makes network calls in a loop (requests, paramiko, scp), or touches a large database (cursor.execute over many rows), it will timeout. Instead: (1) tell the user the script is ready and give them the exact command to run themselves, OR (2) add a --limit N flag and run only a small sample to verify it works, then hand the full run to the user. Never silently let a long-running script time out and then retry it.
 
+## Deep review checklist (apply before declaring any review/audit complete)
+When reviewing code, config, or a security feature, do NOT stop at "does this look right?" — trace the data flow end-to-end. Apply all three checks:
+**Wiring.** For every config field, interface member, or exported symbol you reviewed, grep for ALL usages. If it only appears in the type definition and the c.get() call but never in actual logic, it is dead code — flag it.
+**Type validity.** For every enum/union value used in code (e.g. push to a typed array, a string tag passed to a logger), cross-reference the type definition to confirm the value actually exists in the union. A value that compiles but is semantically wrong (e.g. wrong event tag) is a bug.
+**Reachability.** For every if/else chain where one branch returns or continues, trace whether the other branch is actually reachable. Watch for short-circuit patterns (early return, nullish coalescing, logical OR) that silently make later checks dead code.
+Rule of thumb: Looks right does not mean it works. Always verify the full call chain before signing off.
+
 ## File editing
 - New file or full rewrite (<30 lines): write_file.
 - Modify any existing file (any type -- .py, .ts, .scad, .yaml, .json, .html, .css, etc.): call read_file first. Use the exact content returned by read_file as the basis for old_string in edit_file, or as the basis for write_file content. Never write from memory -- not for any file type.
@@ -1365,6 +1450,55 @@ ${projectGuidance ?? (workspaceRoot ? buildProjectTypeGuidance(workspaceRoot) : 
 export const SMALL_MODEL_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter(t =>
     ['edit_file', 'edit_file_at_line', 'run_command'].includes(t.function.name)
 );
+
+/**
+ * Per-tool "context cost" estimate (item 2.4). Rough token cost of a typical
+ * call's OUTPUT (not the call itself). Used to bias tool choice when context
+ * is tight: prefer cheap, targeted tools (search_files, graph_query) over
+ * expensive whole-file reads (read_file on a large file).
+ *
+ *   low    — targeted, small output (search, graph, find)
+ *   medium — bounded output (single file read, small summary)
+ *   high   — large output (whole-file read, full workspace scan, web fetch)
+ */
+export type ToolContextCost = 'low' | 'medium' | 'high';
+
+export const TOOL_CONTEXT_COST: Record<string, ToolContextCost> = {
+    // Cheap, targeted
+    search_files: 'low',
+    find_files: 'low',
+    graph_query: 'low',
+    get_diagnostics: 'low',
+    memory_search: 'low',
+    memory_list: 'low',
+    memory_stats: 'low',
+    memory_tier_list: 'low',
+    // Medium
+    read_file: 'medium',
+    read_terminal: 'medium',
+    workspace_summary: 'medium',
+    graph_status: 'medium',
+    // High — large output
+    shell_read: 'high',
+    run_command: 'high',
+    web_fetch: 'high',
+    web_search: 'medium',
+    gather_context: 'high',
+};
+
+/**
+ * Build a tool-choice bias note for the current context tier (item 2.4).
+ * Returns '' when context is comfortable (>=30% remaining).
+ */
+export function buildToolBiasNote(remainingPct: number): string {
+    if (remainingPct >= 30) return '';
+    const cheap = ['search_files', 'find_files', 'graph_query', 'get_diagnostics'];
+    const expensive = ['read_file', 'shell_read', 'run_command', 'web_fetch'];
+    if (remainingPct < 15) {
+        return ` [TOOL CHOICE: context is ${remainingPct < 7 ? 'CRITICAL' : 'LOW'}. Prefer cheap targeted tools (${cheap.join(', ')}) over expensive whole-file reads (${expensive.join(', ')}). Use read_file with offset+limit for specific lines, never whole files. Avoid re-reading files already in context.]`;
+    }
+    return ` [TOOL CHOICE: context is TIGHT. Prefer search_files / graph_query / find_files over read_file for locating code. When reading, use offset+limit for the specific region, not the whole file.]`;
+}
 
 /**
  * Minimal system prompt for small models.
@@ -2789,6 +2923,9 @@ export class Agent {
     /** Track auto-learned correction rule IDs so we don't re-learn the same rule twice per session */
     private _autoLearnedRuleIds = new Set<string>();
     private _readOnlyTurnsSinceLastEdit = 0; // tracks consecutive read-only turns without an edit
+    /** Staged-edit queue (item 3.3 diff-first): edits proposed but not yet written to disk. */
+    private _stagedEdits: Array<{ id: number; path: string; oldString: string; newString: string; destructive: boolean }> = [];
+    private _stagedEditSeq = 0;
     private _responseFingerprints: string[] = []; // rolling list of response fingerprints for loop detection
     /** Current execution phase -- drives stall thresholds without task-keyword matching.
      *  RESEARCH: agent is gathering info (read-only tools, no edits yet)
@@ -2801,6 +2938,15 @@ export class Agent {
     private refactorManager: MultiFileRefactoringManager;
     /** Last file operation for undo support */
     private _lastFileOp: { path: string; originalContent: string | null; action: string } | null = null;
+    /** Undo stack (item 3.5): recent file ops, oldest→newest, for multi-file rollback. */
+    private _fileOpStack: Array<{ path: string; originalContent: string | null; action: string }> = [];
+    private readonly MAX_UNDO_STACK = 20;
+    /** Record a file op into the undo stack (keeps _lastFileOp in sync for existing undo). */
+    private _recordFileOp(op: { path: string; originalContent: string | null; action: string }): void {
+        this._lastFileOp = op;
+        this._fileOpStack.push(op);
+        if (this._fileOpStack.length > this.MAX_UNDO_STACK) { this._fileOpStack.shift(); }
+    }
     private _editsThisRun = 0; // count of successful file edits in current agent turn
     private _totalEditsThisSession = 0; // cumulative edits across all turns this chat session
     private _lastEditedFilePath: string = ''; // path of last successfully edited file
@@ -2820,6 +2966,10 @@ export class Agent {
     private _contextDriftWarned = false;
     /** Pending inline confirmation resolver */
     private _confirmResolver: ((accepted: boolean) => void) | null = null;
+    /** Pending ask_user choice resolver (item 3.7) */
+    private _choiceResolver: ((choice: string) => void) | null = null;
+    /** MCP tools the user has already confirmed this session (item 1.7). */
+    private _mcpConfirmedTools = new Set<string>();
     /** Timeout for pending confirmation to prevent hanging forever */
     private _confirmTimeout: ReturnType<typeof setTimeout> | null = null;
     /** True when the confirmation timed out (user stepped away) vs actively rejected */
@@ -2887,6 +3037,12 @@ export class Agent {
     private _guardEvents: GuardEvent[] = [];
     /** Relative paths of files successfully written during the current run -- reset at run start */
     private _filesChangedThisRun: string[] = [];
+    /** 2.6: results of read-only tools pre-executed mid-stream, keyed by name+args. Consumed by executeTool. */
+    private _preExecCache = new Map<string, string>();
+    /** 2.6: raw token buffer used to detect completed <tool>...</tool> blocks during streaming. */
+    private _preExecBuf = '';
+    /** 2.6: strict allowlist of side-effect-free tools eligible for mid-stream pre-execution. */
+    private readonly _PREEXEC_ALLOWLIST = new Set(['read_file', 'find_files', 'search_files', 'workspace_summary']);
     /** Number of model turns completed in the current run */
     private _runTurnCount: number = 0;
     /** Turn at which the most recent web_fetch/web_search returned (1.1 injection firewall) */
@@ -3172,20 +3328,25 @@ export class Agent {
         const stats = calculateContextStats(this.history, this._lastSystemContent, this._lastMemoryContext, model);
         const oldCount = this.history.length;
 
-        // Grab the messages that will be dropped for summarization
-        let compacted = compactHistory(
+        // Score-based compaction: returns kept (new history) + dropped (removed msgs)
+        let result = compactHistory(
             this.history,
             targetPercentage,
             stats.modelLimit,
             stats.systemPromptTokens,
             stats.memoryTokens
         );
+        let compacted = result.kept;
+        let dropped = result.dropped;
 
-        // Guarantee at least 25% of messages are removed -- compactHistory may remove
+        // Guarantee at least 40% of messages are removed -- compactHistory may remove
         // nothing if we're already under the target percentage.
         const minRemove = Math.max(Math.floor(oldCount * 0.4), 4);
         if (oldCount - compacted.length < minRemove && oldCount > minRemove) {
-            compacted = this.history.slice(minRemove);
+            const extra = minRemove - (oldCount - compacted.length);
+            const moved = compacted.slice(0, extra);
+            compacted = compacted.slice(extra);
+            dropped = [...moved, ...dropped];
         }
         const removedCount = oldCount - compacted.length;
 
@@ -3193,7 +3354,6 @@ export class Agent {
 
         // Summarize dropped messages -- structured extraction instead of vague 2-sentence summary
         if (removedCount >= 2) {
-            const dropped = this.history.slice(0, removedCount);
             const allDroppedText = dropped
                 .filter(m => m.role === 'user' || m.role === 'assistant')
                 .map(m => `${m.role}: ${m.content.slice(0, 500)}`)
@@ -3310,6 +3470,10 @@ export class Agent {
         if (!this._lastFileOp) { return null; }
         const op = this._lastFileOp;
         this._lastFileOp = null;
+        // Keep the multi-file rollback stack in sync: pop the op we are undoing.
+        if (this._fileOpStack.length && this._fileOpStack[this._fileOpStack.length - 1] === op) {
+            this._fileOpStack.pop();
+        }
         // Re-validate path even though it was checked when stored — defense in depth.
         let full: string;
         try { full = this.safePath(this.workspaceRoot, op.path); }
@@ -3355,6 +3519,26 @@ export class Agent {
         this._autoApprovedTools.add(toolName);
         logInfo(`[agent] Permanently approved "${toolName}" for this session`);
         this.resolveConfirmation(true);
+    }
+
+    /** Resolve a pending ask_user choice from the webview (item 3.7). */
+    resolveChoice(choice: string): void {
+        if (this._choiceResolver) {
+            this._choiceResolver(choice);
+            this._choiceResolver = null;
+        }
+    }
+
+    /** Ask the user a typed question (single-choice / yes-no / free-text) and wait for the answer. */
+    private askUser(question: string, options: string[], allowFreeText: boolean): Promise<string> {
+        return new Promise<string>((resolve) => {
+            this._choiceResolver = (choice: string) => {
+                this._choiceResolver = null;
+                resolve(choice);
+            };
+            const choiceId = `choice_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            this.postFn({ type: 'askUser', id: choiceId, question, options, allowFreeText });
+        });
     }
 
     /** Returns true if the tool is approved either via trust level or batch "Accept All". */
@@ -4853,7 +5037,33 @@ The user has set trust level to Trust. This means:
         const _taskLogNotYetCalled = !this._activeTask?.taskId;
         if (_isMultiStepTask && _taskLogNotYetCalled && !isConfirmation) {
             baseSystemContent += `\n\n## MULTI-STEP TASK — LOG YOUR PLAN FIRST
-Before executing anything, call task_log once with status "started" and a message listing the steps you plan to take (e.g. "Steps: 1. Review X  2. Fix Y  3. Deploy Z"). Then call task_log with status "step" after each step completes. This keeps your plan visible across context compactions and turn-limit resets — you can always see what's done and what's next.`;
+Before executing anything, call task_plan with action="create" and a "steps" array listing the steps you plan to take (e.g. ["Review X", "Fix Y", "Deploy Z"]). Then call task_plan action="advance" after each step completes. The ledger persists to disk and is re-injected every turn, so you never lose track of what is done vs. pending across context compactions and turn-limit resets.`;
+        }
+
+        // ── Plan ledger injection ─────────────────────────────────────────────────
+        // If a task_plan ledger exists for the active task, re-inject its current
+        // state every turn so the model always knows exactly which step it is on.
+        // This is the durable backbone of the plan-then-execute loop (item 3.2).
+        const _planTaskId = this._activeTask?.taskId;
+        if (_planTaskId) {
+            try {
+                const _planPath = path.join(this.workspaceRoot, '.ollamaforge', 'tasks', _planTaskId, 'plan.json');
+                if (fs.existsSync(_planPath)) {
+                    const _ledger = JSON.parse(fs.readFileSync(_planPath, 'utf8'));
+                    if (Array.isArray(_ledger.steps) && _ledger.steps.length > 0) {
+                        const _done = _ledger.steps.filter((s: any) => s.status === 'done').length;
+                        const _pending = _ledger.steps.filter((s: any) => s.status === 'pending').length;
+                        const _nextIdx = _ledger.steps.findIndex((s: any) => s.status === 'pending');
+                        const _lines = _ledger.steps.map((s: any, i: number) => {
+                            const mark = s.status === 'done' ? '[x]' : s.status === 'pending' ? '[ ]' : `[${s.status}]`;
+                            return `  ${i + 1}. ${mark} ${s.text}${s.note ? ` — ${s.note}` : ''}`;
+                        }).join('\n');
+                        baseSystemContent += `\n\n## ACTIVE PLAN LEDGER — "${_planTaskId}" (${_done}/${_ledger.steps.length} done, ${_pending} pending)
+${_lines}
+${_nextIdx !== -1 ? `NEXT STEP: ${_ledger.steps[_nextIdx].text}. Work on it now, then call task_plan action="advance".` : 'All steps resolved. Call task_log status="done" to close out.'}`;
+                    }
+                }
+            } catch { /* ledger read failure is non-fatal */ }
         }
 
         // ── Project-level task detection ──────────────────────────────────────────
@@ -5593,14 +5803,16 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         - contextStats.systemPromptTokens - contextStats.memoryTokens;
                     this.history = shrinkLargeToolMessages(this.history, targetTokens);
 
-                    // Step 2: Drop oldest messages until we reach the token target
-                    this.history = compactHistory(
+                    // Step 2: Score-based compaction -- drop lowest-value messages until we hit the token target
+                    const compactResult = compactHistory(
                         this.history,
                         50, // Target 50% usage after compaction
                         contextStats.modelLimit,
                         contextStats.systemPromptTokens,
                         contextStats.memoryTokens
                     );
+                    this.history = compactResult.kept;
+                    let autoDropped = compactResult.dropped;
 
                     // Guarantee at least 40% of messages are removed -- same floor as compactContext().
                     // Without this, compactHistory may return 0 removals when context is dense
@@ -5608,8 +5820,11 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // the model to produce blank/empty responses on the very next turn.
                     const minAutoRemove = Math.max(Math.floor(oldMessageCount * 0.4), 4);
                     if (oldMessageCount - this.history.length < minAutoRemove && oldMessageCount > minAutoRemove) {
-                        this.history = historyBeforeCompact.slice(minAutoRemove);
-                        logInfo(`[context] Auto-compact minRemove floor applied: forced ${minAutoRemove} drops (compactHistory returned ${oldMessageCount - (historyBeforeCompact.length - minAutoRemove)} removals)`);
+                        const extra = minAutoRemove - (oldMessageCount - this.history.length);
+                        const moved = this.history.slice(0, extra);
+                        this.history = this.history.slice(extra);
+                        autoDropped = [...moved, ...autoDropped];
+                        logInfo(`[context] Auto-compact minRemove floor applied: forced ${minAutoRemove} drops`);
                     }
 
                     // Calculate removed count AFTER compaction
@@ -5635,8 +5850,8 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // survive even silent auto-compaction. Use the same LLM-based structured
                     // extraction as manual compact -- run async so it doesn't block this turn.
                     if (this.memory && messagesRemoved > 0) {
-                        // compactHistory keeps the NEWEST messages, so dropped = OLDEST messages from pre-compact history
-                        const droppedForSave = historyBeforeCompact.slice(0, messagesRemoved);
+                        // compactHistory returns the exact dropped messages
+                        const droppedForSave = autoDropped;
                         const droppedText = droppedForSave
                             .filter(m => m.role === 'user' || m.role === 'assistant')
                             .map(m => `${m.role}: ${m.content.slice(0, 500)}`)
@@ -5864,7 +6079,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             }
             // Use role:'user' not 'system' — some models (qwen3.8) reject system messages
             // that appear anywhere other than position 0.
-            const ctxBudgetMsg: OllamaMessage = { role: 'user', content: `[SYSTEM: ${ctxBudgetNote}]` };
+            // Item 2.4: append a tool-choice bias note when context is tight
+            const toolBiasNote = buildToolBiasNote(remainingPct);
+            const ctxBudgetMsg: OllamaMessage = { role: 'user', content: `[SYSTEM: ${ctxBudgetNote}${toolBiasNote}]` };
 
             // Route to fast model when the previous turn was purely reads and no edits yet
             const effectiveModel = (prevTurnWasReadOnly && this._editsThisRun === 0)
@@ -5990,11 +6207,31 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     _numPredictOverride = -1;
                     logInfo(`[agent] Proactively uncapping num_predict (-1): thinking model read ${_lastReadToolResultSize} chars, write turn likely`);
                 }
+                // 2.6: pre-execute read-only tool blocks as they complete mid-stream.
+                this._preExecBuf = '';
+                const onToken = (token: string) => {
+                    const t = streamFilter(token);
+                    if (t) { post({ type: 'token', text: t }); }
+                    // Accumulate raw tokens (pre-filter) to detect completed <tool> blocks.
+                    this._preExecBuf += token;
+                    const closeIdx = this._preExecBuf.lastIndexOf('</tool>');
+                    if (closeIdx !== -1) {
+                        const openIdx = this._preExecBuf.lastIndexOf('<tool>', closeIdx);
+                        if (openIdx !== -1) {
+                            const block = this._preExecBuf.slice(openIdx, closeIdx + 7);
+                            this._preExecBuf = this._preExecBuf.slice(0, openIdx);
+                            void this._preExecToolBlock(block);
+                        }
+                    }
+                    // Keep buffer bounded -- drop content before the last <tool> open tag.
+                    const lastOpen = this._preExecBuf.lastIndexOf('<tool>');
+                    if (lastOpen > 0) { this._preExecBuf = this._preExecBuf.slice(lastOpen); }
+                };
                 result = await streamChatRequest(
                     effectiveModel,
                     [{ role: 'system', content: systemContent }, ...this.history, ...(memoryNudgeMsg ? [memoryNudgeMsg] : []), ...(projectNudgeMsg ? [projectNudgeMsg] : []), ctxBudgetMsg],
                     tools,
-                    (token) => { const t = streamFilter(token); if (t) { post({ type: 'token', text: t }); } },
+                    onToken,
                     this.stopRef,
                     _numPredictOverride !== undefined ? { numPredict: _numPredictOverride } : undefined
                 );
@@ -8168,7 +8405,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             'run_command_destructive'
                         );
                         if (!confirmed) {
-                            const blockedMsg = `[BLOCKED] The destructive command was not approved by the user. Do not retry this command. If the task requires deleting files, explain what would be deleted and ask the user to confirm before proceeding.`;
+                            const blockedMsg = `[BLOCKED: destructive-guard] The destructive command was not approved by the user. Do not retry this command. If the task requires deleting files, explain what would be deleted and ask the user to confirm before proceeding.`;
                             if (isTextMode) {
                                 this.history.push({ role: 'user', content: `Tool ${name} returned:\n${blockedMsg}` });
                             } else {
@@ -10040,6 +10277,23 @@ If the code looks correct, respond with exactly: OK`;
 
     // â"€â"€ Tool executor â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
+    /** 2.6: Pre-execute a completed read-only <tool> block mid-stream and cache its result. */
+    private async _preExecToolBlock(block: string): Promise<void> {
+        try {
+            const m = block.match(/<tool>\s*(\{[\s\S]*?\})\s*<\/tool>/);
+            if (!m) { return; }
+            const parsed = JSON.parse(m[1]);
+            const name: string = parsed.name ?? '';
+            if (!this._PREEXEC_ALLOWLIST.has(name)) { return; }
+            const args = (parsed.arguments ?? parsed) as Record<string, unknown>;
+            const key = `${name}::${JSON.stringify(args)}`;
+            if (this._preExecCache.has(key)) { return; }
+            logInfo(`[2.6] Pre-executing read-only tool mid-stream: ${name}`);
+            const result = await this.executeTool(name, args, `preexec_${name}`);
+            this._preExecCache.set(key, result);
+        } catch { /* malformed block -- ignore, main loop will parse it */ }
+    }
+
     private async executeTool(
         name: string,
         args: Record<string, unknown>,
@@ -10047,6 +10301,17 @@ If the code looks correct, respond with exactly: OK`;
     ): Promise<string> {
         const root = this.workspaceRoot;
         if (!root) { return 'No workspace folder is open.'; }
+
+        // 2.6: reuse a result pre-executed mid-stream (read-only tools only).
+        {
+            const key = `${name}::${JSON.stringify(args)}`;
+            const cached = this._preExecCache.get(key);
+            if (cached !== undefined) {
+                this._preExecCache.delete(key);
+                logInfo(`[2.6] Reusing pre-executed result for ${name}`);
+                return cached;
+            }
+        }
 
         // Sanitize path arg: qwen3 sometimes emits "path": "\"README.md\"" so after
         // JSON.parse the string value still contains literal backslash-quote pairs or
@@ -10071,6 +10336,22 @@ If the code looks correct, respond with exactly: OK`;
             const parsed = parseMCPToolName(name);
             if (!parsed) {
                 throw new Error(`Invalid MCP tool name format: ${name}`);
+            }
+            // First-time confirmation gate (item 1.7): MCP tools are
+            // user-configured but auto-exposed, so confirm the first time
+            // any given MCP tool is invoked in a session.
+            const mcpKey = `${parsed.server}.${parsed.tool}`;
+            if (!this._mcpConfirmedTools.has(mcpKey)) {
+                const choice = await this.askUser(
+                    `Allow MCP tool "${mcpKey}" to run this session?`,
+                    ['Allow for this session', 'Deny'],
+                    false
+                );
+                if (choice !== 'Allow for this session') {
+                    logInfo(`[agent] MCP tool ${mcpKey} denied by user`);
+                    return `[TOOL DENIED] MCP tool "${mcpKey}" was not approved by the user. Do not retry it this session.`;
+                }
+                this._mcpConfirmedTools.add(mcpKey);
             }
             logInfo(`[agent] Executing MCP tool: ${parsed.server}.${parsed.tool}`);
             return await callMCPTool(parsed.server, parsed.tool, args);
@@ -10189,7 +10470,7 @@ If the code looks correct, respond with exactly: OK`;
                     if (!acceptedOvr) { return 'Edit cancelled by user.'; }
                     fs.mkdirSync(path.dirname(full), { recursive: true });
                     fs.writeFileSync(full, newString, 'utf8');
-                    this._lastFileOp = { path: rel, originalContent: originalForOverwrite, action: 'edited' };
+                    this._recordFileOp({ path: rel, originalContent: originalForOverwrite, action: 'edited' });
                     this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                     this.postFn({ type: 'fileChanged', path: rel, action: 'edited' });
                     if (!this._filesChangedThisRun.includes(rel)) { this._filesChangedThisRun.push(rel); }
@@ -10293,7 +10574,7 @@ If the code looks correct, respond with exactly: OK`;
                                     }
                                     if (!accepted2) { return 'Edit cancelled by user.'; }
                                     fs.writeFileSync(full, newContent2, 'utf8');
-                                    this._lastFileOp = { path: rel, originalContent: original, action: 'edited' };
+                                    this._recordFileOp({ path: rel, originalContent: original, action: 'edited' });
                                     this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                                     this.postFn({ type: 'fileChanged', path: rel, action: 'edited' });
                                     if (!this._filesChangedThisRun.includes(rel)) { this._filesChangedThisRun.push(rel); }
@@ -10334,7 +10615,7 @@ If the code looks correct, respond with exactly: OK`;
                                 if (!isAutoApproved3) { this.diffViewManager.closeDiffPreview(); }
                                 if (!accepted3) { return 'Edit cancelled by user.'; }
                                 fs.writeFileSync(full, newContent3, 'utf8');
-                                this._lastFileOp = { path: rel, originalContent: original, action: 'edited' };
+                                this._recordFileOp({ path: rel, originalContent: original, action: 'edited' });
                                 this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                                 this.postFn({ type: 'fileChanged', path: rel, action: 'edited' });
                                 if (!this._filesChangedThisRun.includes(rel)) { this._filesChangedThisRun.push(rel); }
@@ -10468,7 +10749,7 @@ If the code looks correct, respond with exactly: OK`;
                     }
                 }
 
-                this._lastFileOp = { path: rel, originalContent: original, action: 'edited' };
+                this._recordFileOp({ path: rel, originalContent: original, action: 'edited' });
                 this._readOnlyTurnsSinceLastEdit = 0;
                 this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                 // Track new_string and old_string for revert-spiral detection
@@ -10876,7 +11157,7 @@ If the code looks correct, respond with exactly: OK`;
                     }
                     fs.mkdirSync(path.dirname(full), { recursive: true });
                     fs.writeFileSync(full, content, 'utf8');
-                    this._lastFileOp = { path: rel, originalContent, action: 'edited' };
+                    this._recordFileOp({ path: rel, originalContent, action: 'edited' });
                     this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                     this.postFn({ type: 'fileChanged', path: rel, action: 'edited' });
                     if (!this._filesChangedThisRun.includes(rel)) { this._filesChangedThisRun.push(rel); }
@@ -11115,7 +11396,7 @@ if errors:
                 if (!accepted3) { return 'Edit cancelled by user.'; }
 
                 fs.writeFileSync(full2, newFile, 'utf8');
-                this._lastFileOp = { path: rel2, originalContent: original2, action: 'edited' };
+                this._recordFileOp({ path: rel2, originalContent: original2, action: 'edited' });
                 this.postFn({ type: 'fileChanged', path: rel2, action: 'edited' });
                 if (!this._filesChangedThisRun.includes(rel2)) { this._filesChangedThisRun.push(rel2); }
                 const editResult3 = action === 'insert'
@@ -11449,38 +11730,9 @@ if errors:
             case 'read_file': {
                 const rfPathRaw = String(args.path ?? '');
                 if (!rfPathRaw) { return '[read_file] path is required'; }
-                let rfPath: string;
-                try {
-                    rfPath = this.safePath(this.workspaceRoot, rfPathRaw);
-                } catch {
-                    // Path is outside the workspace — resolve it absolutely and check if it is an
-                    // OS-protected location (hard block) or a regular external file (ask user).
-                    const rfAbsolute = path.resolve(this.workspaceRoot, rfPathRaw);
-                    if (Agent.isOsProtectedPath(rfAbsolute)) {
-                        return `[read_file] Access denied: "${rfPathRaw}" is in an OS-protected directory and cannot be read.`;
-                    }
-                    // Check user-configured allowlist (ollamaForge.allowedExternalReadPaths)
-                    const allowedExternalPaths = vscode.workspace.getConfiguration('ollamaForge')
-                        .get<string[]>('allowedExternalReadPaths', ['~/.ssh/config']);
-                    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-                    const isAllowed = allowedExternalPaths.some(allowed => {
-                        const expanded = allowed.startsWith('~') ? path.join(homeDir, allowed.slice(1)) : allowed;
-                        return path.resolve(expanded).toLowerCase() === rfAbsolute.toLowerCase();
-                    });
-                    // SSH paths and remote URIs are not local paths — skip the prompt.
-                    const isRemote = /^[a-z][a-z0-9+\-.]*:\/\//i.test(rfPathRaw);
-                    if (!isRemote && !isAllowed) {
-                        const approved = await this.requestConfirmation(
-                            'read_outside_workspace',
-                            `Read file outside workspace: \`${rfAbsolute}\`\n\nThis file is not inside the workspace root. Allow?`,
-                            'read_file_outside'
-                        );
-                        if (!approved) {
-                            return `[read_file] Access denied: user did not allow reading "${rfPathRaw}" (outside workspace).`;
-                        }
-                    }
-                    rfPath = rfAbsolute;
-                }
+                const rfResolved = await this.resolvePathWithPolicy(rfPathRaw, 'read_file');
+                if ('blocked' in rfResolved) { return rfResolved.blocked; }
+                const rfPath: string = rfResolved.path;
                 logInfo(`[read_file] workspaceRoot=${this.workspaceRoot} | raw=${rfPathRaw} | resolved=${rfPath}`);
                 try {
                     const rfStat = fs.statSync(rfPath);
@@ -11515,11 +11767,15 @@ if errors:
                         const graphExtract = this._codeGraph!.getRelevantSymbolsForFile(rfPath, this._currentTaskMessage, 800);
                         if (graphExtract) {
                             logInfo(`[read_file] Graph extraction used for large file: ${rfRel} (${rfLines.length} lines)`);
-                            return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total — graph-extracted relevant symbols shown below; use offset/limit for raw lines)\n\n${graphExtract}`;
+                            const geRedacted = redactSecrets(graphExtract);
+                            if (geRedacted.count > 0) logInfo(`[read_file] Redacted ${geRedacted.count} secret(s) from graph extraction`);
+                            return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total — graph-extracted relevant symbols shown below; use offset/limit for raw lines)\n\n${geRedacted.text}`;
                         }
                     }
 
-                    return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total):\n${rfNumbered}${rfTrunc}${rfPartialNote}`;
+                    const rfRedacted = redactSecrets(rfNumbered);
+                    if (rfRedacted.count > 0) logInfo(`[read_file] Redacted ${rfRedacted.count} secret(s) from output`);
+                    return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total):\n${rfRedacted.text}${rfTrunc}${rfPartialNote}`;
                 } catch (e) {
                     return `[read_file] Error: ${e instanceof Error ? e.message : String(e)}`;
                 }
@@ -11643,7 +11899,10 @@ if errors:
                     }
                 } catch { /* prefetch is best-effort */ }
 
-                return `[CWD: ${this.workspaceRoot}]\n${results.join('\n')}${sfTrunc}${prefetch}`;
+                const sfCombined = results.join('\n') + sfTrunc + prefetch;
+                const sfRedacted = redactSecrets(sfCombined);
+                if (sfRedacted.count > 0) logInfo(`[search_files] Redacted ${sfRedacted.count} secret(s) from output`);
+                return `[CWD: ${this.workspaceRoot}]\n${sfRedacted.text}`;
             }
 
             // â"€â"€ find_files (native, no shell) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -12199,7 +12458,9 @@ if errors:
 
                 // Inject CWD so the model stays oriented (pattern from nanoclaude)
                 const shellCwdNote = root ? `\n[CWD: ${root.replace(/\\/g, '/')}]` : '';
-                return shellResult + shellCwdNote;
+                const srRedacted = redactSecrets(shellResult);
+                if (srRedacted.count > 0) logInfo(`[shell_read] Redacted ${srRedacted.count} secret(s) from output`);
+                return srRedacted.text + shellCwdNote;
             }
 
             // â"€â"€ run_command â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -12924,7 +13185,7 @@ if errors:
                 // Wave 1 security (1.3): hard-block saving credentials to memory.
                 if (containsSecret(content)) {
                     logInfo(`[memory] BLOCKED secret in memory_tier_write (tier ${tier})`);
-                    this._guardEvents.push({ type: 'command-policy', reason: 'secret-in-memory' });
+                    this._guardEvents.push({ type: 'secret-detection', reason: 'secret-in-memory' });
                     return `BLOCKED: content appears to contain a credential (API key, token, password, or private key). Memory must never store secrets. Remove the secret value and save only the non-sensitive fact (e.g. "AWS key present in .env" instead of the key itself).`;
                 }
 
@@ -13748,6 +14009,150 @@ ${sampleHtml}
                 } catch { /* non-fatal if VS Code API unavailable */ }
 
                 return `System map written to .ollamaforge/system-map.md (${smvSubgraph.nodes.length} nodes, ${smvSubgraph.edges.length} edges). Open Markdown Preview (Ctrl+Shift+V) to see the diagram.`;
+            }
+
+            case 'propose_edit': {
+                const rel = String(args.path ?? '').trim();
+                const oldString = String(args.old_string ?? '');
+                const newString = String(args.new_string ?? '');
+                if (!rel) { throw new Error('propose_edit: path is required'); }
+                const full = this.safePath(root, rel);
+                const current = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : '';
+                if (oldString && !current.includes(oldString)) {
+                    throw new Error(`propose_edit: old_string not found in "${rel}". Read the file first and use the exact current text.`);
+                }
+                const id = ++this._stagedEditSeq;
+                this._stagedEdits.push({ id, path: rel, oldString, newString, destructive: args.destructive === true });
+                // Show a diff preview so the user can review the hunk immediately.
+                try { await this.diffViewManager.showDiffPreview(full, current, current.replace(oldString, newString)); } catch { /* preview is best-effort */ }
+                return `Staged edit #${id} for "${rel}" (${newString.split('\n').length} lines → ${oldString ? 'replace' : 'insert'}${args.destructive === true ? ', DESTRUCTIVE' : ''}). Not written yet. Apply with apply_staged_edits mode="select" edit_ids=[${id}], or discard it.`;
+            }
+
+            case 'apply_staged_edits': {
+                const mode = String(args.mode ?? 'all');
+                const ids = Array.isArray(args.edit_ids) ? args.edit_ids.map(Number) : [];
+                if (this._stagedEdits.length === 0) { return 'No staged edits to apply. Use propose_edit first.'; }
+                if (mode === 'discard') {
+                    if (ids.length === 0) { throw new Error('apply_staged_edits mode=discard requires edit_ids'); }
+                    const before = this._stagedEdits.length;
+                    this._stagedEdits = this._stagedEdits.filter(e => !ids.includes(e.id));
+                    return `Discarded ${before - this._stagedEdits.length} staged edit(s). ${this._stagedEdits.length} remain.`;
+                }
+                const toApply = mode === 'select'
+                    ? this._stagedEdits.filter(e => ids.includes(e.id))
+                    : this._stagedEdits;
+                if (mode === 'select' && toApply.length === 0) { return `None of edit_ids [${ids.join(', ')}] are staged. Staged: ${this._stagedEdits.map(e => e.id).join(', ')}.`; }
+                const results: string[] = [];
+                const appliedIds: number[] = [];
+                for (const e of toApply) {
+                    const full = this.safePath(root, e.path);
+                    let content = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : '';
+                    if (e.oldString && !content.includes(e.oldString)) {
+                        results.push(`#${e.id} ${e.path}: SKIPPED (old_string no longer matches — file changed since staging)`);
+                        continue;
+                    }
+                    const original = content;
+                    content = e.oldString ? content.replace(e.oldString, e.newString) : e.newString + content;
+                    fs.mkdirSync(path.dirname(full), { recursive: true });
+                    fs.writeFileSync(full, content, 'utf8');
+                    this._recordFileOp({ path: e.path, originalContent: original, action: 'edited' });
+                    this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
+                    this.postFn({ type: 'fileChanged', path: e.path, action: 'edited' });
+                    if (!this._filesChangedThisRun.includes(e.path)) { this._filesChangedThisRun.push(e.path); }
+                    appliedIds.push(e.id);
+                    results.push(`#${e.id} ${e.path}: APPLIED`);
+                }
+                this._stagedEdits = this._stagedEdits.filter(e => !appliedIds.includes(e.id));
+                return `Applied ${appliedIds.length}/${toApply.length} staged edit(s).\n${results.join('\n')}${this._stagedEdits.length ? `\nStill staged: ${this._stagedEdits.map(e => `#${e.id} ${e.path}`).join(', ')}` : ''}`;
+            }
+
+            case 'rollback_last_refactor': {
+                if (this._fileOpStack.length === 0) { return 'Nothing to roll back — no file operations recorded this session.'; }
+                const count = Math.max(1, Math.min(Number(args.count ?? 1), this._fileOpStack.length));
+                const ops = this._fileOpStack.slice(-count).reverse();
+                const results: string[] = [];
+                for (const op of ops) {
+                    let full: string;
+                    try { full = this.safePath(this.workspaceRoot, op.path); } catch { continue; }
+                    try {
+                        if (op.action === 'created') { if (fs.existsSync(full)) { fs.unlinkSync(full); } results.push(`${op.path}: removed (was created)`); }
+                        else if (op.action === 'deleted' && op.originalContent !== null) { fs.mkdirSync(path.dirname(full), { recursive: true }); fs.writeFileSync(full, op.originalContent, 'utf8'); results.push(`${op.path}: restored (was deleted)`); }
+                        else if (op.originalContent !== null) { fs.writeFileSync(full, op.originalContent, 'utf8'); results.push(`${op.path}: reverted`); }
+                        else { results.push(`${op.path}: skipped (no prior content captured)`); }
+                    } catch (err) { results.push(`${op.path}: FAILED (${toErrorMessage(err)})`); }
+                }
+                this._fileOpStack.splice(this._fileOpStack.length - count);
+                this._lastFileOp = this._fileOpStack[this._fileOpStack.length - 1] ?? null;
+                return `Rolled back ${count} file operation(s):\n${results.join('\n')}`;
+            }
+
+            case 'task_plan': {
+                const taskId = String(args.task_id ?? '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 64);
+                if (!taskId) { throw new Error('task_id is required'); }
+                const action = String(args.action ?? 'status');
+                const taskDir = path.join(root, '.ollamaforge', 'tasks', taskId);
+                if (!fs.existsSync(taskDir)) { fs.mkdirSync(taskDir, { recursive: true }); }
+                const planPath = path.join(taskDir, 'plan.json');
+
+                interface PlanStep { text: string; status: 'pending' | 'done' | 'skipped' | 'blocked'; note?: string; }
+                interface PlanLedger { task_id: string; created: string; updated: string; steps: PlanStep[]; }
+
+                const now = new Date().toISOString();
+                let ledger: PlanLedger;
+                if (fs.existsSync(planPath)) {
+                    try { ledger = JSON.parse(fs.readFileSync(planPath, 'utf8')); }
+                    catch { ledger = { task_id: taskId, created: now, updated: now, steps: [] }; }
+                } else {
+                    ledger = { task_id: taskId, created: now, updated: now, steps: [] };
+                }
+
+                if (action === 'create') {
+                    const steps = Array.isArray(args.steps) ? args.steps.map(s => String(s).slice(0, 300)) : [];
+                    if (steps.length === 0) { throw new Error('action=create requires a non-empty "steps" array'); }
+                    ledger.steps = steps.map(text => ({ text, status: 'pending' as const }));
+                    ledger.updated = now;
+                    fs.writeFileSync(planPath, JSON.stringify(ledger, null, 2), 'utf8');
+                    return `Plan created for "${taskId}" with ${steps.length} steps:\n${ledger.steps.map((s, i) => `  ${i + 1}. [ ] ${s.text}`).join('\n')}\n\nAdvance with task_plan action="advance" after each step.`;
+                }
+
+                if (ledger.steps.length === 0) {
+                    return `No plan exists for "${taskId}" yet. Call task_plan with action="create" and a "steps" array first.`;
+                }
+
+                const nextIdx = ledger.steps.findIndex(s => s.status === 'pending');
+                if (nextIdx === -1) {
+                    const allDone = ledger.steps.every(s => s.status === 'done');
+                    return allDone
+                        ? `Plan "${taskId}" is fully complete — all ${ledger.steps.length} steps done. Call task_log status="done" to close it out.`
+                        : `Plan "${taskId}" has no pending steps (some skipped/blocked). Current state:\n${ledger.steps.map((s, i) => `  ${i + 1}. [${s.status}] ${s.text}${s.note ? ` — ${s.note}` : ''}`).join('\n')}`;
+                }
+
+                if (action === 'advance' || action === 'skip' || action === 'block') {
+                    const newStatus: PlanStep['status'] = action === 'advance' ? 'done' : action === 'skip' ? 'skipped' : 'blocked';
+                    const note = args.note ? String(args.note).slice(0, 200) : undefined;
+                    ledger.steps[nextIdx].status = newStatus;
+                    if (note) { ledger.steps[nextIdx].note = note; }
+                    ledger.updated = now;
+                    fs.writeFileSync(planPath, JSON.stringify(ledger, null, 2), 'utf8');
+                    const done = ledger.steps.filter(s => s.status === 'done').length;
+                    const remaining = ledger.steps.filter(s => s.status === 'pending').length;
+                    const nextStep = ledger.steps[nextIdx + 1];
+                    return `Step ${nextIdx + 1}/${ledger.steps.length} marked ${newStatus}: "${ledger.steps[nextIdx].text}"\nProgress: ${done} done, ${remaining} pending.\n${nextStep ? `Next: ${nextStep.text}` : 'No steps remaining.'}`;
+                }
+
+                // action === 'status' (default)
+                return `Plan "${taskId}" — ${ledger.steps.filter(s => s.status === 'done').length}/${ledger.steps.length} done:\n${ledger.steps.map((s, i) => `  ${i + 1}. [${s.status}] ${s.text}${s.note ? ` — ${s.note}` : ''}`).join('\n')}`;
+            }
+
+            case 'ask_user': {
+                const question = String(args.question ?? '').trim();
+                if (!question) { throw new Error('question is required'); }
+                const rawOpts = Array.isArray(args.options) ? args.options : [];
+                const options = rawOpts.map(o => String(o).trim()).filter(Boolean).slice(0, 6);
+                if (options.length < 2) { throw new Error('ask_user requires at least 2 options'); }
+                const allowFreeText = Boolean(args.allowFreeText);
+                const choice = await this.askUser(question, options, allowFreeText);
+                return `User answered: ${choice}`;
             }
 
             case 'task_log': {
@@ -15261,6 +15666,42 @@ ${sampleHtml}
             '/windows/winsxs/', '/windows/servicing/',
         ];
         return BLOCKED.some(b => norm.startsWith(b) || norm === b.slice(0, -1));
+    }
+
+    /** Resolve a raw path against the workspace with the full outside-workspace policy:
+     *  OS-protected hard block → user allowlist (allowedExternalReadPaths) → confirmation prompt.
+     *  Returns { path } on success, or { blocked } with a user-facing message. Shared by
+     *  read_file (and any future tool that accepts an absolute/external path) so the
+     *  policy lives in exactly one place. */
+    private async resolvePathWithPolicy(rawPath: string, toolName: string): Promise<{ path: string } | { blocked: string }> {
+        try {
+            return { path: this.safePath(this.workspaceRoot, rawPath) };
+        } catch {
+            const absolute = path.resolve(this.workspaceRoot, rawPath);
+            if (Agent.isOsProtectedPath(absolute)) {
+                return { blocked: `[${toolName}] Access denied: "${rawPath}" is in an OS-protected directory and cannot be read.` };
+            }
+            const allowedExternalPaths = vscode.workspace.getConfiguration('ollamaForge')
+                .get<string[]>('allowedExternalReadPaths', ['~/.ssh/config']);
+            const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+            const isAllowed = allowedExternalPaths.some(allowed => {
+                const expanded = allowed.startsWith('~') ? path.join(homeDir, allowed.slice(1)) : allowed;
+                return path.resolve(expanded).toLowerCase() === absolute.toLowerCase();
+            });
+            // SSH paths and remote URIs are not local paths — skip the prompt.
+            const isRemote = /^[a-z][a-z0-9+\-.]*:\/\//i.test(rawPath);
+            if (!isRemote && !isAllowed) {
+                const approved = await this.requestConfirmation(
+                    'read_outside_workspace',
+                    `Read file outside workspace: \`${absolute}\`\n\nThis file is not inside the workspace root. Allow?`,
+                    'read_file_outside'
+                );
+                if (!approved) {
+                    return { blocked: `[${toolName}] Access denied: user did not allow reading "${rawPath}" (outside workspace).` };
+                }
+            }
+            return { path: absolute };
+        }
     }
 
     private safePath(root: string, rel: string): string {

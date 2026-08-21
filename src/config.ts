@@ -130,6 +130,7 @@ export function getConfig(): OllamaConfig {
         contextFileAutoUpdateDays: c.get<number> ('contextFile.autoUpdateDays',     7),
         keepAlive:                 c.get<string> ('keepAlive',                      '10m'),
         reasoningEffort:           c.get<string> ('reasoningEffort',                 ''),
+        commandPolicy:             c.get('commandPolicy') ?? undefined,
     };
 }
 

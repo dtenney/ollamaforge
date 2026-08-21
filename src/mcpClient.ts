@@ -19,13 +19,31 @@ export interface MCPServer {
 const activeServers = new Map<string, MCPServer>();
 
 /**
+ * Default-deny blocklist for MCP tools (item 1.7). MCP servers are
+ * user-configured but we never want a tool that can execute arbitrary
+ * shell commands to be auto-exposed without explicit opt-in. Any tool
+ * whose name matches one of these patterns is hidden from the agent
+ * unless the server's `allowedTools` list explicitly names it.
+ */
+const MCP_DENY_PATTERNS: RegExp[] = [
+    /(^|[_-])(run|exec|execute|shell|bash|sh|cmd|powershell|terminal|process|spawn|system|eval|evaljs)([_-]|$)/i,
+    /(^|[_-])(write|create|delete|remove|rm|unlink|move|rename|copy|cp|mv|mkdir|touch|truncate|append|patch|apply)([_-]|$)/i,
+    /(^|[_-])(install|uninstall|npm|pip|apt|brew|cargo|gem|yarn|pnpm)([_-]|$)/i,
+];
+
+function isMCPToolDenied(toolName: string): boolean {
+    return MCP_DENY_PATTERNS.some(re => re.test(toolName));
+}
+
+/**
  * Start an MCP server and connect to it
  */
 export async function startMCPServer(
     name: string,
     command: string,
     args: string[],
-    env: Record<string, string> = {}
+    env: Record<string, string> = {},
+    allowedTools?: string[]
 ): Promise<MCPServer> {
     try {
         logInfo(`Starting MCP server: ${name} (${command} ${args.join(' ')})`);
@@ -48,13 +66,29 @@ export async function startMCPServer(
 
         // List available tools
         const toolsResult = await client.listTools();
-        const tools = toolsResult.tools.map((tool: any) => ({
+        const allTools = toolsResult.tools.map((tool: any) => ({
             name: tool.name,
             description: tool.description || '',
             inputSchema: tool.inputSchema || {},
         }));
 
-        logInfo(`MCP server ${name} has ${tools.length} tools: ${tools.map(t => t.name).join(', ')}`);
+        // Apply allowlist + default-deny (item 1.7).
+        // Allowlist filters which tools are visible; deny-patterns always apply
+        // independently — an explicitly allowed tool can still be blocked by a
+        // deny pattern (deny-patterns take precedence).
+        const tools = allTools.filter(t => {
+            if (isMCPToolDenied(t.name)) {
+                logInfo(`[mcp] ${name}: tool "${t.name}" matches default-deny pattern -- hidden`);
+                return false;
+            }
+            if (allowedTools && !allowedTools.includes(t.name)) {
+                logInfo(`[mcp] ${name}: tool "${t.name}" not in allowedTools -- hidden`);
+                return false;
+            }
+            return true;
+        });
+
+        logInfo(`MCP server ${name} has ${tools.length}/${allTools.length} tools exposed: ${tools.map(t => t.name).join(', ')}`);
 
         const server: MCPServer = { name, client, transport, tools };
         activeServers.set(name, server);

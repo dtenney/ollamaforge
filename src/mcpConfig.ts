@@ -8,6 +8,12 @@ export interface MCPServerConfig {
     command: string;
     args: string[];
     env?: Record<string, string>;
+    /**
+     * Optional per-server tool allowlist (item 1.7). When present, ONLY these
+     * tool names are exposed to the agent. When absent, all server tools are
+     * exposed (minus the default-deny blocklist in mcpClient.ts).
+     */
+    allowedTools?: string[];
 }
 
 /**

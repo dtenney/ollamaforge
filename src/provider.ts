@@ -116,6 +116,7 @@ type WebviewMsg =
     | { command: 'undoLastTool' }
     | { command: 'confirmResponse'; id: string; accepted: boolean }
     | { command: 'confirmResponseAll'; id: string; toolName: string }
+    | { command: 'resolveChoice'; choice: string }
     | { command: 'applyCodeBlock'; code: string; lang: string }
     | { command: 'webviewError'; text: string }
     | { command: 'openTab' }
@@ -1590,6 +1591,13 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                 case 'applyCodeBlock': {
                     const applyMsg = raw as { command: 'applyCodeBlock'; code: string; lang: string };
                     await this.applyCodeBlock(applyMsg.code, applyMsg.lang);
+                    break;
+                }
+
+                // ── ask_user choice response from webview (item 3.7) ─────────
+                case 'resolveChoice': {
+                    const rcMsg = raw as unknown as { command: 'resolveChoice'; choice: string };
+                    this._agent?.resolveChoice(rcMsg.choice);
                     break;
                 }
 
