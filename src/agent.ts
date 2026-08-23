@@ -1390,6 +1390,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Prefer current files over dated backups.** When you see both a plain config file (e.g. '.env', 'config.yaml') and dated backup variants (e.g. 'env_20240205', 'config.yaml.bak', 'settings_old'), always read the plain/undated file first -- it is the live config. Only read dated backups when explicitly asked or when the current file does not exist.
 **Act on every tool result.** If a result contradicts your plan, update the plan. Ignoring a tool result is a failure.
 **Exit 0 is not correctness.** After running a command, read its output once to confirm it worked. If you already confirmed it worked, move on — do NOT re-check the same output again.
+**Never invent explanations for tool failures.** If a tool call fails, is blocked, or returns an error, report the ACTUAL error text verbatim. Do NOT fabricate reasons (e.g. "firewall", "injection detected", "rate limit", "policy violation") that are not present in the error output. If the error is unclear, say "The tool returned: <exact text>" and ask the user for guidance. Inventing a plausible-sounding cause is a critical failure — it misleads the user and hides the real problem.
 **Done means verified — once.** Written → syntax-checked → executed → output confirmed. One verification pass is enough. Do not run the same verification check more than once.
 **Before declaring done: check the tracking document.** If the user has a tracking document (any file ending in .md, .txt, or .todo that contains a checklist of tasks — e.g. "progress.md", "tasks.md", "TODO.md", "PLAN.md", or a file mentioned by name in the conversation), read it with read_file BEFORE saying the task is complete. Count unchecked items (lines starting with \`- [ ]\` or \`[ ]\` or numbered items without a ✓). If any items remain unchecked, continue working — do NOT declare done.
 
@@ -1543,7 +1544,8 @@ Read the [PRE-LOADED CONTEXT] and check internally (do NOT narrate the checks):
 ## Rules
 - PREFER edit_file_at_line over edit_file -- it is more reliable
 - Do NOT call shell_read -- the file content is already provided
-- Never use placeholder logic like \`pass\` or \`# TODO\` -- implement the actual logic based on the patterns in the file`;
+- Never use placeholder logic like \`pass\` or \`# TODO\` -- implement the actual logic based on the patterns in the file
+- If a tool call fails or is blocked, report the ACTUAL error text verbatim. Do NOT invent explanations (e.g. "firewall", "injection detected", "rate limit") that are not in the error output`;
 }
 
 // â"€â"€ Text-mode tool calling (fallback for models without native tool support) â"€â"€
