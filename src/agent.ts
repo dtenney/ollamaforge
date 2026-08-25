@@ -9003,13 +9003,59 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             'edit_file': '"path", "old_string", "new_string"',
                             'edit_file_at_line': '"path", "start_line", "end_line", "new_content"',
                             'run_command': '"command" (the shell command to execute, e.g. "python3 script.py")',
-                            'shell_read': '"command" (the shell command to read output from, e.g. "cat file.py")',
+                            'shell_read': '"command" (the shell command to read output from, e.g. "git status" or "find . -name \'*.py\'")',
+                            'read_file': '"path" (the file path to read, e.g. "app/main.py" or "requirements.txt")',
+                            'write_file': '"path" (destination file path) and "content" (the full file content to write)',
                         };
                         const argList = toolHints[name] ?? 'all required arguments';
-                        const missingHint = `[SYSTEM: Your "${name}" tool call was missing the "${missingArg}" argument and did not execute. You must include ${argList}. Retry NOW with a complete, non-empty tool call.]`;
-                        this.history[this.history.length - 1] = isTextMode
-                            ? { role: 'user', content: missingHint }
-                            : { role: 'tool', content: missingHint };
+
+                        // Path auto-recovery for read_file: when the model omits the path argument,
+                        // scan its narration text for a file path it mentioned (e.g. "Let me read X")
+                        // and auto-supply the missing path so the tool succeeds without a retry loop.
+                        let autoRecoveredPath = '';
+                        if (name === 'read_file' && missingArg === 'path') {
+                            const lastEntry = this.history[this.history.length - 1];
+                            const narration = typeof lastEntry?.content === 'string' ? lastEntry.content : '';
+                            // Scan narration for file paths: quoted paths, backtick paths, or bare relative paths
+                            const pathPat = /(?:`([^`]+\.[a-z]{1,6})`|["']([^"'\n]+\.[a-z]{1,6})["']|(?:read|open|check|inspect|look at|examine)\s+([A-Za-z][\w./\\-]+\.[a-z]{1,6}))/gi;
+                            let pm: RegExpExecArray | null;
+                            while ((pm = pathPat.exec(narration)) !== null) {
+                                const candidate = (pm[1] ?? pm[2] ?? pm[3] ?? '').trim().replace(/^\/+/, '');
+                                if (candidate && !candidate.includes(' ') && candidate.includes('.')) {
+                                    const abs = path.isAbsolute(candidate) ? candidate : path.join(this.workspaceRoot, candidate);
+                                    if (fs.existsSync(abs)) {
+                                        autoRecoveredPath = candidate;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (autoRecoveredPath) {
+                            // Auto-execute read_file with the recovered path instead of looping
+                            logWarn(`[agent] Missing-path on "read_file" -- auto-recovering with "${autoRecoveredPath}"`);
+                            try {
+                                const recoveredResult = await this.executeTool('read_file', { path: autoRecoveredPath }, `${toolId}_recovered`);
+                                toolResult = recoveredResult;
+                                // Replace the failed error result with the recovered file content
+                                const recoveredMsg = `[Auto-recovered read_file for "${autoRecoveredPath}"]\n${recoveredResult}`;
+                                this.history[this.history.length - 1] = isTextMode
+                                    ? { role: 'user', content: `Tool read_file returned:\n${recoveredMsg}` }
+                                    : { role: 'tool', content: recoveredMsg };
+                                post({ type: 'toolResult', id: toolId, name: 'read_file', success: true, preview: `(auto-recovered: ${autoRecoveredPath})` });
+                                this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1);
+                            } catch {
+                                const missingHint = `[SYSTEM: Your "read_file" tool call was missing the "path" argument. Include "path" with the file path to read. Example: <tool>{"name":"read_file","arguments":{"path":"${autoRecoveredPath}"}}</tool>]`;
+                                this.history[this.history.length - 1] = isTextMode
+                                    ? { role: 'user', content: missingHint }
+                                    : { role: 'tool', content: missingHint };
+                            }
+                        } else {
+                            const missingHint = `[SYSTEM: Your "${name}" tool call was missing the "${missingArg}" argument and did not execute. You must include ${argList}. Retry NOW with a complete, non-empty tool call. Example: <tool>{"name":"${name}","arguments":{"${missingArg}":"<value>"}}</tool>]`;
+                            this.history[this.history.length - 1] = isTextMode
+                                ? { role: 'user', content: missingHint }
+                                : { role: 'tool', content: missingHint };
+                        }
                         logWarn(`[agent] Missing-arg on "${name}" (${missingArg}) -- consecutiveFailures rolled back, hint injected`);
                     }
 
