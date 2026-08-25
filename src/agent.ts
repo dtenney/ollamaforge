@@ -1493,13 +1493,10 @@ export const TOOL_CONTEXT_COST: Record<string, ToolContextCost> = {
  * Returns '' when context is comfortable (>=30% remaining).
  */
 export function buildToolBiasNote(remainingPct: number): string {
-    if (remainingPct >= 30) return '';
+    if (remainingPct >= 15) return '';
     const cheap = ['search_files', 'find_files', 'graph_query', 'get_diagnostics'];
     const expensive = ['read_file', 'shell_read', 'run_command', 'web_fetch'];
-    if (remainingPct < 15) {
-        return ` [TOOL CHOICE: context is ${remainingPct < 7 ? 'CRITICAL' : 'LOW'}. Prefer cheap targeted tools (${cheap.join(', ')}) over expensive whole-file reads (${expensive.join(', ')}). Use read_file with offset+limit for specific lines, never whole files. Avoid re-reading files already in context.]`;
-    }
-    return ` [TOOL CHOICE: context is TIGHT. Prefer search_files / graph_query / find_files over read_file for locating code. When reading, use offset+limit for the specific region, not the whole file.]`;
+    return ` [TOOL CHOICE: context is ${remainingPct < 7 ? 'CRITICAL' : 'LOW'}. Prefer cheap targeted tools (${cheap.join(', ')}) over expensive whole-file reads (${expensive.join(', ')}). Use read_file with offset+limit for specific lines, never whole files. Avoid re-reading files already in context.]`;
 }
 
 /**
@@ -6074,7 +6071,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             } else if (remainingPct < 15) {
                 ctxBudgetNote = `[CONTEXT LOW: ${Math.round(remainingPct)}% remaining (~${Math.round(remainingTokens / 1000)}k tokens). If writing code, output ONE function or section at a time. After each chunk, stop and ask the user to confirm before continuing. Do not attempt to write an entire file in one response.]`;
             } else if (remainingPct < 30) {
-                ctxBudgetNote = `[CONTEXT TIGHT: ${Math.round(remainingPct)}% remaining (~${Math.round(remainingTokens / 1000)}k tokens). Keep responses concise. If a coding task requires writing >100 lines, split it into named sections and complete one per turn. If you have discovered important facts (IPs, file paths, decisions), save them with memory_write now before context is compacted.]`;
+                ctxBudgetNote = `[Context: ${Math.round(contextStats.usagePercentage)}% used, ~${Math.round(remainingTokens / 1000)}k tokens remaining. Continue the task normally — use search_files or offset+limit reads when possible to keep tool results small.]`;
             } else if (contextStats.usagePercentage >= 50) {
                 ctxBudgetNote = `[Context: ${Math.round(contextStats.usagePercentage)}% used, ~${Math.round(remainingTokens / 1000)}k tokens remaining.]`;
             } else {
@@ -12295,8 +12292,12 @@ if errors:
                     if (!isSshShellRead) {
                         // Extract the first absolute path argument from common read commands
                         // (cat, head, tail, grep, less, wc, diff, stat, file).
-                        const absPathMatch = cmd.match(/(?:^|\s)["']?(\/[^\s"'|;&>]+|[A-Za-z]:\\[^\s"'|;&>]+)["']?/);
-                        if (absPathMatch) {
+                        // Exclude paths that are glob patterns (contain *) or follow a flag (-opt)
+                        // to avoid false positives from find/grep flag arguments like -not -path '*/build/*'.
+                        const absPathMatch = cmd.match(/(?:^|\s)["']?(\/[^\s"'|;&>*]+|[A-Za-z]:\\[^\s"'|;&>*]+)["']?/);
+                        // Reject if the matched path is a flag value (preceded by a dash-option in the command)
+                        const isFlagValue = absPathMatch ? /-\w+\s+["']?$/.test(cmd.slice(0, absPathMatch.index ?? 0)) : false;
+                        if (absPathMatch && !isFlagValue) {
                             const candidatePath = absPathMatch[1].replace(/\\/g, '/');
                             const candidateNorm = candidatePath.toLowerCase();
                             const rootNorm = (process.platform === 'win32'

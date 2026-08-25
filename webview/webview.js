@@ -1507,7 +1507,10 @@ function friendlyErrorMsg(raw) {
         return '🔌 Ollama isn\'t running. Start it with: <code class="inline">ollama serve</code>';
     if (/timed out/i.test(raw))
         return '⏱ Request timed out. The model may still be loading — try again in a moment.';
-    if (/model.*not found/i.test(raw))
+    // Match Ollama's real 404 body: `model '<name>' not found`. The old
+    // /model.*not found/i was greedy and fired on ANY error that merely contained
+    // both words far apart, producing a misleading "Model not found" message.
+    if (/model\s+'[^']*'\s+not found/i.test(raw))
         return '📦 Model not found. Install it with: <code class="inline">ollama pull &lt;model-name&gt;</code>';
     if (/context length|too long/i.test(raw))
         return '📏 Message exceeds the model\'s context window. Try compacting the conversation or starting a new chat.';
