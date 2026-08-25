@@ -7172,6 +7172,11 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     const hasFencedToolCall = /```[\s\S]*?\b(edit_file|edit_file_at_line|shell_read|run_command|write_file|find_files|search_files)\b[\s\S]*?```/.test(resp);
                     // Model is asking the user to provide files it can read itself
                     const isDeflecting = /please provide|provide the (contents|file|code|text)|share the (contents|file|code)|paste the|send me the|provide me with/i.test(resp);
+                    // In trust/yolo mode: detect permission-seeking questions the model should just act on instead.
+                    // e.g. "Want me to take the Section 13 cleanup next?" or "Should I proceed with X?"
+                    const isPermissionSeeking = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
+                        && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|ok(ay)? (if|to)|shall we|should we|can i go ahead|want me to (go ahead|proceed|continue|start|tackle|take|handle|do|fix|clean|remove|delete|add|update|check|review|move|push|run))\b/i.test(resp)
+                        && /\?/.test(resp.slice(-120)); // must end with a question
                     // Model is giving the user instructions instead of executing them
                     const isGivingInstructions = !isDeflecting && (
                         /\b(you (should|can|could|need to|must)|you('ll| will) (need|want|have) to)\b.{0,120}\b(run|execute|call|use|add|create|install|edit|update|write|configure)\b/i.test(resp)
@@ -7206,17 +7211,19 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         ? '[SYSTEM: You wrote a tool call inside a code block (```). That does NOT execute the tool. Output a raw <tool>{"name":"...","arguments":{...}}</tool> XML block — no backticks, no fences. Output ONLY the <tool> block now.]'
                         : isDeflecting
                         ? `[SYSTEM: You asked the user to provide file contents, but you have tools to read files yourself. Call shell_read or read_file. Do NOT ask the user.${toolCallHint}]`
+                        : isPermissionSeeking
+                        ? `[SYSTEM: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission — just do it. The user already approved this. Call the next tool immediately.${toolCallHint}]`
                         : isGivingInstructions
                         ? `[SYSTEM: You gave the user instructions instead of executing them. You are an autonomous agent — call the tool yourself RIGHT NOW.${toolCallHint}]`
                         : (this._isSmallModel && this._editContextInjected)
                         ? '[SYSTEM: The file content is in [PRE-LOADED CONTEXT] above. Call edit_file_at_line NOW with the line numbers shown. Output ONLY the <tool> block.]'
                         : `[SYSTEM: You did not call any tool and the task is not done. Call the next tool NOW.${toolCallHint}${escalatedHint}]`;
 
-                    const reason = hasFencedToolCall ? 'fenced' : isDeflecting ? 'deflecting' : isGivingInstructions ? 'giving-instructions' : 'no-tool';
+                    const reason = hasFencedToolCall ? 'fenced' : isDeflecting ? 'deflecting' : isPermissionSeeking ? 'permission-seeking' : isGivingInstructions ? 'giving-instructions' : 'no-tool';
                     logInfo(`[agent] No-tool nudge (reason=${reason}, turn=${turn}, retry=${this.autoRetryCount})`);
 
                     // Decide whether to remove the visible response or keep it.
-                    // Planning narration, deflection, giving-instructions, and fenced tool calls
+                    // Planning narration, deflection, permission-seeking, giving-instructions, and fenced tool calls
                     // should be removed — they are mid-task artifacts, not useful to the user.
                     // Substantial text responses (>80 chars, no planning markers) that look like
                     // real answers should stay visible — the user saw something useful, and hiding it
@@ -7225,6 +7232,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         && !isPlanningNarration
                         && !hasFencedToolCall
                         && !isDeflecting
+                        && !isPermissionSeeking
                         && !isGivingInstructions
                         && !isPlanningLoop;
                     if (looksLikeRealAnswer) {
