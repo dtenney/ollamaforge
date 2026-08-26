@@ -5070,8 +5070,8 @@ ${_nextIdx !== -1 ? `NEXT STEP: ${_ledger.steps[_nextIdx].text}. Work on it now,
         // When the user describes work spanning multiple phases, streams, or sessions
         // (weeks/months of effort, multiple tracks), auto-create PROJECT.md to anchor
         // the agent's awareness across compactions and sessions.
-        // Only fires on the first user turn and only if no PROJECT.md exists yet.
-        const _isProjectLevelTask = !isConfirmation && !this._activeProjectFile && this.userTurnCount <= 2 && (
+        // Fires on any user turn (phased plans often emerge mid-conversation) and only if no PROJECT.md exists yet.
+        const _isProjectLevelTask = !isConfirmation && !this._activeProjectFile && (
             /\b(phase[s]?|stream[s]?|milestone[s]?|sprint[s]?|initiative|roadmap|multi[- ]?phase|multi[- ]?stream|long[- ]?term|over\s+the\s+(next|coming)\s+(week|month|quarter))\b/i.test(userMessage)
             || /\b(track\s+\d|track\s+(a|b|one|two)|parallel\s+(work|effort|stream)|two\s+tracks|three\s+tracks)\b/i.test(userMessage)
             || /\b(project\s+(plan|tracker|tracking)|keep\s+track\s+of|tracking\s+doc|tracking\s+document)\b/i.test(userMessage)
@@ -6155,7 +6155,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // Check for inline repetition only in the tail -- avoids false-positives on
                     // tool-result data echoed near the start of the response.
                     const tail = _spiralBuf.slice(-600);
-                    if (/(.{15,60})\1{4,}/.test(tail)) { _spiralAborted = true; return true; }
+                    if (/(.{15,60})\1{5,}/.test(tail)) { _spiralAborted = true; return true; }
                     // Check for line repetition: same line 5+ times in recent output (raised from 4
                     // to reduce false-positives on SSH/log/JSON output with naturally repeated structure).
                     const recentLines = _spiralBuf.slice(-1200).split('\n').map(l => l.trim()).filter(l => l.length > 15);
@@ -6325,6 +6325,11 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             // â"€â"€ Mid-stream spiral abort recovery â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             // If streamFilter aborted the stream early due to detected repetition spiral,
             // reset stopRef and inject a circuit-breaker nudge, then retry the turn.
+            // Reset consecutive abort counter when a turn completes cleanly (no spiral abort this turn).
+            if (!_midStreamSpiralAborted && this._consecutiveAborts > 0) {
+                logInfo(`[agent] Clean turn -- resetting consecutive abort counter (was ${this._consecutiveAborts})`);
+                this._consecutiveAborts = 0;
+            }
             if (_midStreamSpiralAborted && this.autoRetryCount < this.effectiveMaxRetries) {
                 _midStreamSpiralAborted = false;
                 this.stopRef.stop = false;
@@ -12887,7 +12892,11 @@ if errors:
                 // or configure services on the local machine. These should only run on the target host.
                 {
                     const isShellScriptRun = /\b(?:bash|sh|source)\s+.*\.sh\b/i.test(cmd) || /^\.\/\S+\.sh\b/i.test(cmd.trim());
-                    if (isShellScriptRun) {
+                    // Remote execution (ssh/scp) is the INTENDED path for install scripts --
+                    // the guard only protects the LOCAL machine. If the command runs the
+                    // script over ssh/scp, skip the local-deploy block.
+                    const isRemoteExec = /\b(?:ssh|scp|sftp)\s+/.test(cmd);
+                    if (isShellScriptRun && !isRemoteExec) {
                         const scriptPathM = cmd.match(/(?:bash|sh|source)\s+([^\s;|&]+\.sh)/i) || cmd.match(/^(\.\S+\.sh)\b/i);
                         const scriptPathG = scriptPathM ? scriptPathM[1] : '';
                         let scriptSrcDeploy = '';
