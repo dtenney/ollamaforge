@@ -14841,8 +14841,11 @@ ${sampleHtml}
                 finish(-1);
             });
 
-            // SSH commands get a longer timeout -- remote scripts over large directories can be slow
-            const timeoutMs = isSshCmdR ? 120_000 : 30_000;
+            // SSH commands get a longer timeout -- remote scripts over large directories can be slow.
+            // Sleep commands need enough time to actually sleep (agent uses them to wait for background jobs).
+            const hasSleepR = /\bsleep\s+(\d+)/.exec(cmdR);
+            const sleepSecsR = hasSleepR ? parseInt(hasSleepR[1], 10) : 0;
+            const timeoutMs = isSshCmdR ? 120_000 : sleepSecsR > 0 ? Math.max(60_000, (sleepSecsR + 10) * 1000) : 30_000;
             const timer = setTimeout(() => {
                 if (!finished) {
                     child.kill();
