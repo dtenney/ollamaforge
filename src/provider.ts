@@ -300,6 +300,10 @@ interface TabState {
     pendingMessage?: { text: string; model: string; raw: MsgSendMessage };
     /** Promise for an in-progress pre-continuation compact — drain waits for it. */
     pendingCompact?: Promise<void>;
+    /** In-progress assistant text buffer (not yet saved to session.messages).
+     *  Set while the agent is streaming; cleared on streamEnd. Used to
+     *  reattach the live bubble when the user switches back to this tab. */
+    liveBuffer?: string;
 }
 
 // ── Provider ──────────────────────────────────────────────────────────────────
@@ -909,7 +913,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             // Strip thinking sentinels and thinking content from session buffer
                             if (tok === '\x01THINK_START\x01') { inThinking = true; }
                             else if (tok === '\x01THINK_END\x01') { inThinking = false; }
-                            else if (!inThinking) { assistantBuf += tok; }
+                            else if (!inThinking) { assistantBuf += tok; runTab.liveBuffer = assistantBuf; }
                         } else if (pm.type === 'commandStart' && pm.id && pm.cmd) {
                             _activeCmds.set(pm.id, { cmd: pm.cmd, outputBuf: '' });
                         } else if (pm.type === 'commandChunk' && pm.id) {
@@ -957,6 +961,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 }
                             }
                             assistantBuf = '';
+                            runTab.liveBuffer = '';
                             inThinking = false;
                             // Sync agent history and task state mid-run so a crash/force-close
                             // doesn't lose the turns already completed in this run.
@@ -1378,6 +1383,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         pinnedMsgIds: incoming.session.pinnedMsgIds || [],
                         draft: incoming.draft,
                         agentRunning: incoming.running,
+                        liveBuffer: incoming.liveBuffer || '',
                     });
                     post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
                     // Restore context usage bar for the incoming tab

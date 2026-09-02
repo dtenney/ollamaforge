@@ -542,6 +542,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Run a stack health check as part of the nightly dream cycle. Issues are surfaced in the dream cycle notification."
+        },
+        "ollamaForge.registryCheck": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Probe PyPI/npm to confirm new install package names exist (requires network, off by default)."
         }
       }
     }

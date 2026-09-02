@@ -382,9 +382,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                                 const stat = fs.statSync(full);
                                 if (stat.mtimeMs < cutoffMs) { continue; }
                                 const content = fs.readFileSync(full, 'utf8');
-                                // Only flag TODO/FIXME when in a comment context, not inside string literals.
-                                // Match lines where the marker is preceded by //, #, or /* (optionally with whitespace).
-                                const matches = (content.match(/(?:\/\/|#|\/\*)[^\n]*\b(TODO|FIXME|HACK|XXX)\b.*$/gm) || []).slice(0, 3);
+                                // Only flag TODO/FIXME at the START of a comment (after leading whitespace),
+                                // not mid-line — this avoids false positives from string literals/prompt
+                                // templates that contain "# TODO" or "// TODO" text.
+                                const matches = (content.match(/^\s*(?:\/\/|#|\/\*)[ \t]*(?:\[[^\]]*\][ \t]*)?\b(TODO|FIXME|HACK|XXX)\b.*$/gm) || []).slice(0, 3);
                                 if (matches.length > 0) {
                                     findings.push(`${path.relative(idleRoot, full)}: ${matches.join(', ').slice(0, 120)}`);
                                 }

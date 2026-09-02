@@ -71,6 +71,8 @@ export interface OllamaConfig {
     reasoningEffort: string;
     /** Command policy engine (Wave 1 security). deny/confirm/allow patterns + egress allowlist. */
     commandPolicy?: import('./commandPolicy').CommandPolicyConfig;
+    /** When true, probe PyPI/npm to confirm new install package names exist (network, off by default). */
+    registryCheck: boolean;
 }
 
 // ── Model routing helpers ─────────────────────────────────────────────────────
@@ -131,6 +133,7 @@ export function getConfig(): OllamaConfig {
         keepAlive:                 c.get<string> ('keepAlive',                      '10m'),
         reasoningEffort:           c.get<string> ('reasoningEffort',                 ''),
         commandPolicy:             c.get('commandPolicy') ?? undefined,
+        registryCheck:             c.get<boolean>('registryCheck', false),
     };
 }
 
