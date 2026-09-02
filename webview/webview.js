@@ -255,17 +255,20 @@ function populateModels(models, connected, configuredModel) {
         sendBtn.disabled = true;
         return;
     }
-    models.forEach((name, i) => {
+    models.forEach((name) => {
         const o = document.createElement('option');
         o.value = name;
         o.textContent = name;
-        if (i === 0) { o.selected = true; }
         modelSelect.appendChild(o);
     });
-    
-    // Apply default model from settings if available
+
+    // Resolve the model to select: settings model first, then active preset,
+    // then the first available model. Never silently default to models[0]
+    // when the user has configured a different model — that caused the wrong
+    // variant (e.g. qwen3.8:27b-128k) to be used instead of the configured one.
+    let resolved = '';
     if (defaultModel && models.includes(defaultModel)) {
-        modelSelect.value = defaultModel;
+        resolved = defaultModel;
         // If settings model doesn't match the active preset, switch to custom
         if (currentPreset && MODEL_PRESETS[currentPreset] && MODEL_PRESETS[currentPreset].model !== defaultModel) {
             currentPreset = '';
@@ -275,9 +278,14 @@ function populateModels(models, connected, configuredModel) {
         // Only apply preset when settings didn't specify a different model
         const config = MODEL_PRESETS[currentPreset];
         if (models.includes(config.model)) {
-            modelSelect.value = config.model;
+            resolved = config.model;
         }
     }
+    if (!resolved) {
+        resolved = models[0];
+        console.warn(`[ollamaforge] Configured model "${defaultModel}" not found on server — falling back to "${resolved}". Available: ${models.join(', ')}`);
+    }
+    modelSelect.value = resolved;
     
     setStatus('connected', `${models.length} model${models.length > 1 ? 's' : ''} available`);
     sendBtn.disabled = false;
@@ -1234,6 +1242,33 @@ function showResumeBanner(summary) {
     }
 }
 
+/**
+ * Detect common hallucination patterns in the agent's final text.
+ * Returns an array of matched phrases, or an empty array if none found.
+ * Only flags a phrase if it appears in the agent's visible text
+ * (not in tool output, which is stripped before this runs).
+ */
+function checkHallucinationPatterns(text) {
+    const patterns = [
+        /\bfirewall\b/i,
+        /\bblocked by\b/i,
+        /\bpolicy violation\b/i,
+        /\brate[- ]limit(?:ed)?\b/i,
+        /\bpermission denied by (?:the )?(?:server|admin|system)\b/i,
+        /\bnetwork (?:is )?(?:unavailable|unreachable|down)\b/i,
+        /\bDNS (?:resolution )?fail(?:ed|ure)\b/i,
+        /\btimeout due to\b/i,
+        /\bconnection (?:was )?refused by\b/i,
+        /\bauthentication (?:was )?denied by\b/i,
+    ];
+    const matches = [];
+    for (const re of patterns) {
+        const m = text.match(re);
+        if (m) { matches.push(m[0]); }
+    }
+    return matches;
+}
+
 function finalizeMessage() {
     if (!currentMsgEl) { return; }
 
@@ -1317,6 +1352,20 @@ function finalizeMessage() {
     // Render full markdown
     const content = currentMsgEl.querySelector('.msg-content');
     if (content) { content.innerHTML = renderMarkdown(cleanRaw); }
+
+    // Hallucination-pattern detector: flag common invented-cause phrases
+    const hwMatches = checkHallucinationPatterns(cleanRaw);
+    if (hwMatches.length > 0 && content) {
+        const warn = document.createElement('div');
+        warn.className = 'hallucination-warning';
+        warn.title = 'These phrases are common hallucination patterns. Verify against the actual tool output before relying on them.';
+        const label = document.createElement('span');
+        label.className = 'hw-label';
+        label.textContent = '⚠ Unverified claim: ';
+        warn.appendChild(label);
+        warn.appendChild(document.createTextNode(hwMatches.join(', ') + ' — check the tool output for exact wording.'));
+        content.appendChild(warn);
+    }
 
     // Add retry + feedback buttons to completed assistant messages
     const header = currentMsgEl.querySelector('.msg-header');
@@ -2052,7 +2101,7 @@ function addCommandBlock(id, cmd) {
             const preview = div.querySelector('.cmd-preview');
             if (preview) { preview.style.display = isHidden ? 'none' : ''; }
         };
-        header.addEventListener('click', () => div._toggleOutput && div._toggleOutput());
+        header.onclick = () => div._toggleOutput && div._toggleOutput();
     }
     scrollBottom();
 }
@@ -2148,8 +2197,8 @@ function finalizeCommandBlock(id, exitCode) {
                 }
             }
 
-            // Update block._toggleOutput in-place — the click listener in addCommandBlock
-            // already delegates to this property, so no new addEventListener needed.
+            // Update block._toggleOutput in-place AND replace the header's onclick
+            // so the arrow is guaranteed to work regardless of prior listener state.
             block._toggleOutput = () => {
                 const hidden = output.style.display === 'none';
                 output.style.display = hidden ? 'block' : 'none';
@@ -2157,6 +2206,9 @@ function finalizeCommandBlock(id, exitCode) {
                 block.dataset.userCollapsed = hidden ? '' : '1';
                 if (preview) { preview.style.display = hidden ? 'none' : ''; }
             };
+            // Use onclick (IDL property) to replace any prior listener — safe because
+            // it overwrites the existing handler rather than stacking a second one.
+            header.onclick = block._toggleOutput;
             // Also wire preview click directly (it's not covered by the header delegate).
             if (preview) { preview.addEventListener('click', block._toggleOutput); }
         } // end if (hasOutput && output)
@@ -3489,6 +3541,17 @@ window.addEventListener('message', (event) => {
 
         case 'sessionLoaded':
             renderStoredSession(msg.session, msg.messages, msg.pinnedMsgIds);
+            // Always land at the bottom of the conversation when a tab is (re)loaded.
+            // userScrolledUp/streaming state is stale from the previous tab, so force it.
+            // Defer to rAF so the browser has finished layout before we read scrollHeight.
+            userScrolledUp = false;
+            scrollBtn.classList.remove('visible');
+            // Scroll directly (bypasses scrollBottom gating) — once after layout
+            // (rAF) and again after late messages (trustLevelRestored, tabList) settle.
+            requestAnimationFrame(() => {
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+                setTimeout(() => { messagesEl.scrollTop = messagesEl.scrollHeight; }, 150);
+            });
             if (msg.resumeSummary) { showResumeBanner(msg.resumeSummary); }
             // Restore the draft the user had typed in this tab before switching away
             if (msg.draft !== undefined) {
@@ -3502,6 +3565,20 @@ window.addEventListener('message', (event) => {
                 setStreaming(false); // show stop btn but don't animate send btn (we're not streaming right now)
                 // Show a subtle status line so user knows agent is between turns (not stuck)
                 setStatus('running', 'Agent working in background…');
+                // Reattach the in-progress assistant bubble so the user sees the
+                // live output that was suppressed while this tab was in the background.
+                // Subsequent 'token' events append to currentRaw and re-render.
+                if (msg.liveBuffer && msg.liveBuffer.trim()) {
+                    startAssistantMessage();
+                    currentRaw = msg.liveBuffer;
+                    const content = currentMsgEl?.querySelector('.msg-content');
+                    if (content) {
+                        let display = stripToolBlocksClient(msg.liveBuffer);
+                        display = display.replace(/\btool>\s*/gi, '').replace(/<\/tool(?:_call)?>/gi, '').replace(/<\/?(?:parameter|function)>/gi, '');
+                        content.innerHTML = renderMarkdown(display);
+                    }
+                    scrollBottom();
+                }
             }
             break;
 

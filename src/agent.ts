@@ -26,6 +26,7 @@ import type { ActiveTaskState } from './chatStorage';
 import { CodeGraph, loadRouterMd, generateRouterMd, isRouterMdStale } from './codeGraph';
 import { evaluateCommand, checkEgress, CommandPolicyConfig } from './commandPolicy';
 import { redactSecrets, containsSecret } from './secretRedaction';
+import { validatePythonImports, formatImportWarning, validateDoctests, formatDoctestWarning, probeRegistry, formatRegistryWarning, RegistryProbeResult } from './importResolver';
 
 // â"€â"€ Shell environment detection â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
@@ -1391,6 +1392,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Act on every tool result.** If a result contradicts your plan, update the plan. Ignoring a tool result is a failure.
 **Exit 0 is not correctness.** After running a command, read its output once to confirm it worked. If you already confirmed it worked, move on — do NOT re-check the same output again.
 **Never invent explanations for tool failures.** If a tool call fails, is blocked, or returns an error, report the ACTUAL error text verbatim. Do NOT fabricate reasons (e.g. "firewall", "injection detected", "rate limit", "policy violation") that are not present in the error output. If the error is unclear, say "The tool returned: <exact text>" and ask the user for guidance. Inventing a plausible-sounding cause is a critical failure — it misleads the user and hides the real problem.
+**Never fabricate environmental blockers.** Do NOT claim that a network, firewall, SSH, VPN, hardware, GPU, connectivity, or permission issue is preventing you from acting unless you actually ran a tool and that tool returned an error confirming it. If you cannot reach a host, try the tool first (run_command / shell_read with ssh/ping/curl). If the tool succeeds, proceed. If it fails, quote the exact error. You are NEVER allowed to declare "I can't reach X because of a firewall/network issue" without a failed tool call proving it.
 **Done means verified — once.** Written → syntax-checked → executed → output confirmed. One verification pass is enough. Do not run the same verification check more than once.
 **Before declaring done: check the tracking document.** If the user has a tracking document (any file ending in .md, .txt, or .todo that contains a checklist of tasks — e.g. "progress.md", "tasks.md", "TODO.md", "PLAN.md", or a file mentioned by name in the conversation), read it with read_file BEFORE saying the task is complete. Count unchecked items (lines starting with \`- [ ]\` or \`[ ]\` or numbered items without a ✓). If any items remain unchecked, continue working — do NOT declare done.
 
@@ -3312,6 +3314,19 @@ export class Agent {
     retryLast(): string | undefined {
         const last = this.lastUserMessage;
         if (!last) { return undefined; }
+
+        // Capture the last assistant response before stripping it, so we can detect
+        // fabricated blockers and inject a correction nudge on retry.
+        let lastAssistantContent = '';
+        for (let i = this.history.length - 1; i >= 0; i--) {
+            if (this.history[i].role === 'assistant') {
+                lastAssistantContent = typeof this.history[i].content === 'string'
+                    ? (this.history[i].content as string)
+                    : '';
+                break;
+            }
+        }
+
         // Pop back to (but not including) the last user message
         while (this.history.length && this.history[this.history.length - 1].role !== 'user') {
             this.history.pop();
@@ -3319,6 +3334,21 @@ export class Agent {
         if (this.history.length && this.history[this.history.length - 1].role === 'user') {
             this.history.pop();
         }
+
+        // If the previous response fabricated an environmental blocker (firewall, network, SSH, etc.)
+        // without any actual tool error, inject a correction nudge so the model doesn't repeat it.
+        const hadFabricatedBlocker = lastAssistantContent
+            && /\b(firewall|network (issue|block|restrict|problem)|can'?t reach|cannot reach|unable to (connect|reach|access)|connection (refused|blocked|timed out)|no route to host|ssh.*block|blocked by|not accessible|unreachable|vpn required|permission denied)\b/i.test(lastAssistantContent)
+            && !/the tool returned|error:|exit (code|status) [1-9]|timed out after|failed with/i.test(lastAssistantContent);
+
+        if (hadFabricatedBlocker) {
+            logWarn(`[agent] retryLast: previous response contained fabricated blocker — injecting correction nudge`);
+            this.history.push({
+                role: 'user',
+                content: `[SYSTEM: Your previous response claimed a connectivity/firewall/network blocker but you did NOT run any tool to verify it. That claim was fabricated. On this retry you MUST actually run the tool (run_command or shell_read with ssh/ping/curl) to test connectivity. Do NOT repeat the blocker claim. Call the tool now.]`,
+            });
+        }
+
         return last;
     }
 
@@ -7177,6 +7207,10 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     const hasFencedToolCall = /```[\s\S]*?\b(edit_file|edit_file_at_line|shell_read|run_command|write_file|find_files|search_files)\b[\s\S]*?```/.test(resp);
                     // Model is asking the user to provide files it can read itself
                     const isDeflecting = /please provide|provide the (contents|file|code|text)|share the (contents|file|code)|paste the|send me the|provide me with/i.test(resp);
+                    // Model is fabricating an environmental blocker (firewall, network, SSH, etc.) without running a tool to verify it.
+                    // Pattern: claims inability due to environmental reason AND no tool was called this turn.
+                    const isFabricatingBlocker = /\b(firewall|network (issue|block|restrict|problem)|can'?t reach|cannot reach|unable to (connect|reach|access)|connection (refused|blocked|timed out)|no route to host|ssh.*block|blocked by|not accessible|unreachable|vpn required|permission denied)\b/i.test(resp)
+                        && !/the tool returned|error:|exit (code|status) [1-9]|timed out after|failed with/i.test(resp); // no actual tool error in response
                     // In trust/yolo mode: detect permission-seeking questions the model should just act on instead.
                     // e.g. "Want me to take the Section 13 cleanup next?" or "Should I proceed with X?"
                     const isPermissionSeeking = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
@@ -7214,6 +7248,8 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         : '';
                     const nudgeContent = hasFencedToolCall
                         ? '[SYSTEM: You wrote a tool call inside a code block (```). That does NOT execute the tool. Output a raw <tool>{"name":"...","arguments":{...}}</tool> XML block — no backticks, no fences. Output ONLY the <tool> block now.]'
+                        : isFabricatingBlocker
+                        ? `[SYSTEM: CRITICAL — You claimed a network/firewall/connectivity blocker WITHOUT running a tool to verify it. That claim is fabricated. You MUST run the actual tool (run_command / shell_read with ssh, ping, or curl) RIGHT NOW to check connectivity. Do NOT claim a blocker you have not actually observed from a tool result. Call the tool now.${toolCallHint}]`
                         : isDeflecting
                         ? `[SYSTEM: You asked the user to provide file contents, but you have tools to read files yourself. Call shell_read or read_file. Do NOT ask the user.${toolCallHint}]`
                         : isPermissionSeeking
@@ -7224,7 +7260,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         ? '[SYSTEM: The file content is in [PRE-LOADED CONTEXT] above. Call edit_file_at_line NOW with the line numbers shown. Output ONLY the <tool> block.]'
                         : `[SYSTEM: You did not call any tool and the task is not done. Call the next tool NOW.${toolCallHint}${escalatedHint}]`;
 
-                    const reason = hasFencedToolCall ? 'fenced' : isDeflecting ? 'deflecting' : isPermissionSeeking ? 'permission-seeking' : isGivingInstructions ? 'giving-instructions' : 'no-tool';
+                    const reason = hasFencedToolCall ? 'fenced' : isFabricatingBlocker ? 'fabricating-blocker' : isDeflecting ? 'deflecting' : isPermissionSeeking ? 'permission-seeking' : isGivingInstructions ? 'giving-instructions' : 'no-tool';
                     logInfo(`[agent] No-tool nudge (reason=${reason}, turn=${turn}, retry=${this.autoRetryCount})`);
 
                     // Decide whether to remove the visible response or keep it.
@@ -7666,12 +7702,12 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         }
                         batchToolsSucceeded++;
                         this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
-                        this.history.push({ role: 'tool', content: `[TOOL RESULT: ${pc.name}]\n${toolResult}` });
+                        this.history.push({ role: 'tool', content: `[TOOL RESULT: ${pc.name}]\n${toolResult}\n\n[SELF-CHECK] Before stating a cause for any failure or unexpected result above, quote the EXACT error text from this output. If the output does not literally contain a word like "firewall", "blocked", "policy", or "rate limit", do NOT claim that cause. Report only what the output actually says.` });
                         post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: true, preview: toolResult.slice(0, 200) });
                     } else {
                         const errMsg = toErrorMessage(s.reason);
                         this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
-                        this.history.push({ role: 'tool', content: `[TOOL ERROR: ${pc.name}]\n${errMsg}` });
+                        this.history.push({ role: 'tool', content: `[TOOL ERROR: ${pc.name}]\n${errMsg}\n\n[SELF-CHECK] The error text above is the ONLY source of truth for what went wrong. Quote it exactly when explaining the failure. Do NOT add causes (firewall, policy, rate limit, etc.) that are not literally present in the text.` });
                         post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: errMsg.slice(0, 200) });
                     }
                 }
@@ -11357,6 +11393,44 @@ if errors:
                             }
                         } catch { /* ignore AST check errors -- py_compile will catch syntax issues */ }
 
+                        // Import hallucination check (hedgemony-inspired three-valued resolver)
+                        try {
+                            const env3 = detectShellEnvironment();
+                            const pyCmd3 = env3.pythonCmd || 'python3';
+                            const importReport = validatePythonImports(content, pyCmd3);
+                            if (importReport.hasMissing) {
+                                if (doBackup && originalContent) {
+                                    fs.writeFileSync(full, originalContent, 'utf8');
+                                }
+                                let warning = formatImportWarning(importReport, rel);
+                                // Rec #4: opt-in registry probe for PACKAGE-class misses
+                                if (getConfig().registryCheck) {
+                                    const pkgs = importReport.missing.filter(m => m.classification === 'PACKAGE').map(m => m.module);
+                                    if (pkgs.length > 0) {
+                                        const results = await Promise.all(pkgs.map(p => probeRegistry(p, 'pypi')));
+                                        const missing = results.filter(r => r.exists === false);
+                                        if (missing.length > 0) {
+                                            warning += '\n\n' + formatRegistryWarning(results, rel);
+                                        }
+                                    }
+                                }
+                                return warning;
+                            }
+                        } catch { /* non-fatal -- import check is best-effort */ }
+
+                        // Doctest contract check (hedgemony Rec #2)
+                        try {
+                            const env4 = detectShellEnvironment();
+                            const pyCmd4 = env4.pythonCmd || 'python3';
+                            const doctestReport = validateDoctests(content, pyCmd4);
+                            if (doctestReport.hasFailures) {
+                                if (doBackup && originalContent) {
+                                    fs.writeFileSync(full, originalContent, 'utf8');
+                                }
+                                return formatDoctestWarning(doctestReport, rel);
+                            }
+                        } catch { /* non-fatal -- doctest check is best-effort */ }
+
                         this._lastWrittenFilePath = rel;
                         this._writtenPathsThisSession.add(rel.replace(/\\/g, '/'));
                         this._editFileHardBlocked.delete(rel.replace(/\\/g, '/')); // Lift edit block -- write_file succeeded
@@ -14399,6 +14473,28 @@ ${sampleHtml}
     // shell. This lets us spawn ssh/scp/sftp directly on Windows, bypassing
     // cmd.exe which doesn't understand single quotes and mangles forward slashes.
 
+    /**
+     * Bounded sandbox (hedgemony-inspired): wrap a bash command with ulimit
+     * caps so a runaway agent command cannot exhaust CPU or memory.
+     *   - CPU: 300s (5 min) -- covers npm install, large builds
+     *   - Virtual memory: 2GB -- covers Node/Python workloads
+     *   - File size: 500MB -- prevents accidental 10GB file writes
+     * Skipped for commands that legitimately need more (docker, kubectl,
+     * large data pipelines) and for non-bash spawn paths (python -c, ssh).
+     */
+    private static applySandbox(cmd: string): string {
+        const skipPatterns = [
+            /\b(docker|kubectl|helm|terraform|ansible)\b/,
+            /\b(pip3?\s+install|npm\s+(install|ci)|apt(-get)?\s+install)\b/,
+            /\b(ssh|scp|sftp)\b/,
+            /\b(git\s+(clone|fetch|pull))\b/,
+        ];
+        if (skipPatterns.some(re => re.test(cmd))) {
+            return cmd;
+        }
+        return `ulimit -t 300; ulimit -v 2097152; ulimit -f 512000; ${cmd}`;
+    }
+
     private static parseSshArgs(raw: string): string[] {
         // Tokenize a shell command string respecting single and double quotes,
         // without invoking a shell. Whitespace outside quotes splits tokens;
@@ -14491,7 +14587,7 @@ ${sampleHtml}
                 : true;
             const child = winBashPath
                 // Git Bash available: route everything through bash (handles ssh/scp/sftp/unix cmds)
-                ? spawn(winBashPath, ['-c', safeCmd], { cwd, env: bashEnv, windowsHide: true })
+                ? spawn(winBashPath, ['-c', Agent.applySandbox(safeCmd)], { cwd, env: bashEnv, windowsHide: true })
                 : pyMatch
                     ? spawn(pyMatch[1], ['-c', pyMatch[2]], { cwd, env: { ...process.env } })
                     : (isSshCmd && !isSshChained)
@@ -14707,7 +14803,7 @@ ${sampleHtml}
             let child;
             if (winBashPathR) {
                 // Git Bash available: route everything (including ssh/scp/sftp) through bash
-                child = spawn(winBashPathR, ['-c', cmdR], { cwd, env: bashEnvR, windowsHide: true });
+                child = spawn(winBashPathR, ['-c', Agent.applySandbox(cmdR)], { cwd, env: bashEnvR, windowsHide: true });
             } else if (pyMatchR) {
                 child = spawn(pyMatchR[1], ['-c', pyMatchR[2]], { cwd, env: { ...process.env } });
             } else if (isSshCmdR && !isSshChainedR) {
