@@ -10844,6 +10844,32 @@ If the code looks correct, respond with exactly: OK`;
                     }
                 }
 
+                // Import hallucination check (hedgemony-inspired three-valued resolver)
+                if (rel.endsWith('.py')) {
+                    try {
+                        const envEdit = detectShellEnvironment();
+                        const pyCmdEdit = envEdit.pythonCmd || 'python3';
+                        const importReport = validatePythonImports(newContent, pyCmdEdit);
+                        if (importReport.hasMissing) {
+                            if (original !== undefined) {
+                                fs.writeFileSync(full, original, 'utf8');
+                            }
+                            let warning = formatImportWarning(importReport, rel);
+                            if (getConfig().registryCheck) {
+                                const pkgs = importReport.missing.filter(m => m.classification === 'PACKAGE').map(m => m.module);
+                                if (pkgs.length > 0) {
+                                    const results = await Promise.all(pkgs.map(p => probeRegistry(p, 'pypi')));
+                                    const missing = results.filter(r => r.exists === false);
+                                    if (missing.length > 0) {
+                                        warning += '\n\n' + formatRegistryWarning(results, rel);
+                                    }
+                                }
+                            }
+                            return warning;
+                        }
+                    } catch { /* non-fatal -- import check is best-effort */ }
+                }
+
                 this._recordFileOp({ path: rel, originalContent: original, action: 'edited' });
                 this._readOnlyTurnsSinceLastEdit = 0;
                 this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';

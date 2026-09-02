@@ -106,6 +106,30 @@ describe('importResolver (hedgemony recommendations)', () => {
             assert.strictEqual(report.hasMissing, false);
         });
 
+        it('skips imports inside try/except ImportError blocks', () => {
+            const src = [
+                'import os',
+                'try:',
+                '    import torch',
+                'except ImportError:',
+                '    torch = None',
+                '',
+            ].join('\n');
+            const report = validatePythonImports(src, PY);
+            // os should be checked (top-level)
+            assert.ok(report.results.some(r => r.module === 'os'));
+            // torch should NOT be in results (inside try/except)
+            assert.ok(!report.results.some(r => r.module === 'torch'),
+                'torch inside try/except ImportError should be skipped');
+        });
+
+        it('still catches a fabricated top-level import', () => {
+            const src = 'import os\nimport totally_fake_pkg_xyz\n';
+            const report = validatePythonImports(src, PY);
+            assert.strictEqual(report.hasMissing, true);
+            assert.ok(report.missing.some(m => m.module === 'totally_fake_pkg_xyz'));
+        });
+
         it('resolves to UNKNOWN (null) when the interpreter is unavailable', () => {
             // A bogus interpreter forces the subprocess-failure path:
             // every module must be null, never reported as missing.

@@ -117,30 +117,44 @@ export function validatePythonImports(
     pyCmd: string = 'python3',
     timeoutMs: number = 5000
 ): ImportValidationReport {
-    const modules = extractImportModules(source);
-
-    if (modules.length === 0) {
-        return { results: [], missing: [], unknown: [], hasMissing: false };
-    }
-
-    // Build a Python script that checks each module via importlib.util.find_spec
-    // and prints a JSON array of [module, status] pairs.
+    // Build a Python script that:
+    //   1. Parses the source with AST to extract top-level imports
+    //      (skipping imports inside try/except ImportError blocks)
+    //   2. Checks each module via importlib.util.find_spec
+    //   3. Prints a JSON array of [module, status] pairs
     // status: 1 = found, 0 = not found, -1 = unknown (find_spec returned None)
-    const moduleList = JSON.stringify(modules);
+    const sourceJson = JSON.stringify(source);
     const pyScript = `
-import importlib.util, json, sys
-modules = ${moduleList}
+import ast, importlib.util, json, sys
+
+src = ${sourceJson}
+tree = ast.parse(src)
+
+# Collect only top-level imports (direct children of the module).
+# Imports inside try/except, functions, if-blocks, etc. are NOT direct
+# children of the tree, so they are naturally excluded. This means
+# optional-dependency patterns like:
+#   try:
+#       import torch
+#   except ImportError:
+#       torch = None
+# are correctly skipped.
+modules = set()
+for node in tree.body:
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            modules.add(alias.name)
+    elif isinstance(node, ast.ImportFrom):
+        if node.level == 0 and node.module:
+            modules.add(node.module)
+
 results = []
-for mod in modules:
+for mod in sorted(modules):
     try:
         spec = importlib.util.find_spec(mod)
         if spec is not None:
             results.append([mod, 1])
         else:
-            # find_spec returns None (not an exception) for a missing TOP-LEVEL
-            # package — that is a confirmed hallucination. For a SUBMODULE
-            # (a.b.c) a None spec is ambiguous (parent may be a namespace
-            # package), so it stays unknown.
             if '.' in mod:
                 results.append([mod, -1])
             else:
@@ -162,9 +176,10 @@ print(json.dumps(results))
         parsed = JSON.parse(stdout.trim());
     } catch (err: unknown) {
         // Subprocess failed (timeout, python not found, syntax error, etc.)
-        // All modules are UNKNOWN — never reported as a pass.
+        // Fall back to regex extraction for the unknown list.
+        const fallbackModules = extractImportModules(source);
         logWarn(`[importResolver] subprocess failed: ${err instanceof Error ? err.message : String(err)}`);
-        const allUnknown: ImportCheckResult[] = modules.map(mod => ({
+        const allUnknown: ImportCheckResult[] = fallbackModules.map(mod => ({
             module: mod,
             status: null,
             classification: 'UNKNOWN',
