@@ -1395,6 +1395,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Never fabricate environmental blockers.** Do NOT claim that a network, firewall, SSH, VPN, hardware, GPU, connectivity, or permission issue is preventing you from acting unless you actually ran a tool and that tool returned an error confirming it. If you cannot reach a host, try the tool first (run_command / shell_read with ssh/ping/curl). If the tool succeeds, proceed. If it fails, quote the exact error. You are NEVER allowed to declare "I can't reach X because of a firewall/network issue" without a failed tool call proving it.
 **Done means verified — once.** Written → syntax-checked → executed → output confirmed. One verification pass is enough. Do not run the same verification check more than once.
 **Before declaring done: check the tracking document.** If the user has a tracking document (any file ending in .md, .txt, or .todo that contains a checklist of tasks — e.g. "progress.md", "tasks.md", "TODO.md", "PLAN.md", or a file mentioned by name in the conversation), read it with read_file BEFORE saying the task is complete. Count unchecked items (lines starting with \`- [ ]\` or \`[ ]\` or numbered items without a ✓). If any items remain unchecked, continue working — do NOT declare done.
+**Create a tracking plan file for any effort with more than four steps.** Before you start, estimate how many distinct steps the task requires (read/search/edit/verify cycles each count). If the estimate is MORE THAN FOUR, create a tracking plan file FIRST — a markdown file at \`plans/<short-slug>.md\` (use write_file) with a \`- [ ]\` checkbox per step, plus a "Next action:" line. Then work through it: tick each step \`- [x]\` with edit_file as you finish it, and update the "Next action:" line. This file is your external memory — smaller models and context compaction will lose track of what is done without it, and claiming "done" while steps remain unchecked is a failure. Do NOT declare the effort complete until every checkbox is \`- [x]\` (or each remaining one is explicitly listed with a reason it is deferred). For 4 or fewer steps, a plan file is optional.
 
 ## Staying on track
 **Confirmed plan = authorization for all steps.** When the user says yes/go ahead/proceed, execute the entire sequence without pausing to ask "want me to continue-- or "should I do X next-- at each step. Only pause for a genuine blocker: unexpected error, irreversible action not in the plan, or a value only the user can provide.
@@ -3073,6 +3074,8 @@ export class Agent {
     private _lastPlanStepOutput: string = '';
     /** Absolute path of the active task plan file (plans/<name>.md), or null if none */
     private _activePlanFile: string | null = null;
+    /** True once the plan-file completion guard has fired this run — prevents a nudge spiral */
+    private _planStopGuardFiredThisRun: boolean = false;
     /** Absolute path of the active PROJECT.md (project-level tracker), or null if none */
     private _activeProjectFile: string | null = null;
     /** Turn number when the project context was last injected — throttles re-injection */
@@ -4034,6 +4037,7 @@ export class Agent {
         this._focusedGrepInjectedThisTurn = false; // Reset focused-grep dedup flag
         this._trackingDocCheckedThisRun = false;   // Reset tracking-doc check so it can fire once per user message
         this._projectStopGuardFiredThisRun = false; // Reset project stop guard so it can fire once per user message
+        this._planStopGuardFiredThisRun = false;    // Reset plan-file completion guard so it can fire once per user message
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._editContextInjected = false;     // Reset read-then-act flag
@@ -7048,6 +7052,27 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             post({ type: 'removeLastAssistant' });
                             continue;
                         }
+                    }
+                }
+
+                // ── Plan file: completion guard ──────────────────────────────────────
+                // The agent created its own plan file (plans/<slug>.md) for this task.
+                // If it declares completion while that plan still has unchecked steps,
+                // block the stop — a model that wrote a checklist must not claim "done"
+                // with items still open. Only fires once per run to prevent a nudge spiral.
+                if (isLegitimateStop && (hasCompletionLanguage || hasConfirmationLanguage)
+                    && !isUserDismissal && this._activePlanFile && !this._planStopGuardFiredThisRun) {
+                    const planOpen = this.countTrackingDocOpenItems(this._activePlanFile);
+                    if (planOpen) {
+                        this._planStopGuardFiredThisRun = true;
+                        const relPlan = path.relative(this.workspaceRoot, this._activePlanFile).replace(/\\/g, '/');
+                        logInfo(`[plan] DONE GATE: completion declared but plan file "${relPlan}" has ${planOpen.length} unchecked step(s) — blocking stop`);
+                        const planLines = planOpen.slice(0, 15).map(i => `  - [ ] ${i}`).join('\n');
+                        const planMore = planOpen.length > 15 ? `\n  …and ${planOpen.length - 15} more` : '';
+                        this.history.pop();
+                        this.history.push({ role: 'user', content: `[system: DONE GATE — you declared completion, but your own plan file "${relPlan}" still has ${planOpen.length} unchecked step(s). You may NOT stop yet. Either (a) continue working on the remaining steps, or (b) if they are out of scope for this request, explicitly list each one and state why it is being deferred. Remaining steps:\n${planLines}${planMore}]` });
+                        post({ type: 'removeLastAssistant' });
+                        continue;
                     }
                 }
 
@@ -11282,6 +11307,16 @@ If the code looks correct, respond with exactly: OK`;
                     this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
                     this.postFn({ type: 'fileChanged', path: rel, action: 'edited' });
                     if (!this._filesChangedThisRun.includes(rel)) { this._filesChangedThisRun.push(rel); }
+
+                    // If the agent created a tracking plan file under plans/, adopt it as the
+                    // active plan so the plan-file completion guard can enforce "no done with
+                    // unchecked steps" even when the model wrote it via write_file (not the
+                    // internal writePlanFile path).
+                    const _planRel = rel.replace(/\\/g, '/');
+                    if (_planRel.startsWith('plans/') && _planRel.endsWith('.md')) {
+                        this._activePlanFile = full;
+                        logInfo(`[plan] Agent created tracking plan file: ${rel}`);
+                    }
 
                     // Auto-scan document files for hallucination artifacts (corrupted characters
                     // introduced when the model constructs long strings inside its thinking block).
