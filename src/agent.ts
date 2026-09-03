@@ -3034,6 +3034,9 @@ export class Agent {
     private _toolCallsThisRun: ToolCallRecord[] = [];
     /** Counts consecutive auto-continue runs where no write_file/edit_file was called. Reset when a file is written. */
     private _consecutiveNoWriteRuns: number = 0;
+    /** Counts consecutive runs where context compaction fired before any edits (turn <= 1, editsThisRun == 0).
+     *  Two such consecutive runs means the session overhead alone exhausts the context budget — an unrecoverable loop. */
+    private _earlyCompactionStalls: number = 0;
     /** Tier 0 stale-entry IDs that have already triggered a correction this run -- prevents infinite correction loops */
     private _correctedStaleIds: Set<string> | null = null;
     /** Accumulates every guardrail event that fired during the current run -- reset at run start */
@@ -5762,6 +5765,27 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         logInfo(`[context] Heuristic said ${contextStats.usagePercentage.toFixed(1)}% but accurate count is ${accurateStats.usagePercentage.toFixed(1)}% -- skipping auto-compact`);
                     } else {
                     logWarn(`[context] Auto-compacting at ${accurateStats.usagePercentage.toFixed(1)}% (accurate)`);
+
+                    // === EARLY-COMPACTION STALL DETECTION ===
+                    // If compaction fires before any real work (turn 0-1, zero edits), the session
+                    // overhead alone fills the context window. Two consecutive such runs means we are
+                    // in an unrecoverable "read plan → exhaust context → compact → repeat" loop.
+                    if (turn <= 1 && this._editsThisRun === 0) {
+                        this._earlyCompactionStalls++;
+                        logWarn(`[context] Early-compaction stall #${this._earlyCompactionStalls} (turn=${turn}, edits=0)`);
+                        if (this._earlyCompactionStalls >= 2) {
+                            logWarn(`[context] Early-compaction stall limit reached — stopping to break loop`);
+                            post({ type: 'streamEnd' });
+                            post({
+                                type: 'error',
+                                text: `[warn] The context window fills up before any work can be done (stall #${this._earlyCompactionStalls}). ` +
+                                    `This usually means the system prompt + memory + task description alone exceeds the model's context budget. ` +
+                                    `Try: switching to a model with a larger context window, clearing session memory, or breaking the task into a smaller first step.`
+                            });
+                            this._runOutcome = 'error';
+                            return;
+                        }
+                    }
 
                     // === SYNCHRONOUS WORK-IN-PROGRESS SNAPSHOT ===
                     // Build this BEFORE compactHistory drops messages so we still have full history.
@@ -10162,6 +10186,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             );
             if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
+                this._earlyCompactionStalls = 0; // real progress breaks the stall streak
             } else {
                 this._consecutiveNoWriteRuns++;
             }
