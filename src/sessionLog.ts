@@ -43,6 +43,18 @@ export interface SessionLogEntry {
     durationMs: number;
     /** How the run ended. */
     outcome: 'done' | 'error' | 'stopped';
+    /**
+     * If reasoning traces are logged, this flag distinguishes a provider
+     * *summary* of thinking (e.g. Anthropic) from the *real* chain-of-thought
+     * (e.g. vLLM / Ollama). Without it, analysis silently compares a summary
+     * against a full transcript.
+     *
+     * Source: GVS5H (slee-persis/GVS5H) — `reasoning_is_summary` field in
+     * their per-call transcript records.
+     */
+    reasoningIsSummary?: boolean;
+    /** Raw reasoning / thinking text, if the provider returned one. */
+    reasoning?: string;
 }
 
 // ── Writers ───────────────────────────────────────────────────────────────────
