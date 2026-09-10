@@ -693,6 +693,35 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
     {
         type: 'function',
         function: {
+            name: 'deep_research',
+            description: 'Execute a structured deep research pipeline: fan-out web searches with multiple query angles → fetch top sources → extract key claims → cross-reference for corroboration/contradictions → produce a cited synthesis report. Use this INSTEAD of multiple individual web_search + web_fetch calls when the user asks to "research", "investigate", "find out about", or needs a thorough multi-source answer. Returns a formatted markdown report with inline citations and contradiction flags. Requires SearXNG to be configured.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    question:   { type: 'string', description: 'The research question to investigate. Be specific — e.g. "How does KV cache offloading work in vLLM?" not "vLLM"' },
+                    maxSources: { type: 'number', description: 'Maximum number of source pages to fetch (default 5, max 10).' },
+                },
+                required: ['question'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'use_skill',
+            description: 'Activate a named skill from the workspace skill library (.ollamaforge/skills/). When active, the agent injects the skill\'s prompt, restricts available tools to the skill\'s allowlist, and optionally switches to the skill\'s model. Pass skill name to activate, or empty string to deactivate. Use when the user asks to "use the X skill" or "switch to X mode".',
+            parameters: {
+                type: 'object',
+                properties: {
+                    skill: { type: 'string', description: 'Name of the skill to activate (e.g. "code-review"). Pass empty string to deactivate the current skill.' },
+                },
+                required: ['skill'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'generate_image',
             description: 'Generate an image from a text prompt using ComfyUI (SDXL). Returns the local file path of the saved PNG. Use this to create diagrams, illustrations, mockups, or visuals for reports. Requires ollamaForge.comfyui.url to be configured.',
             parameters: {
@@ -1341,7 +1370,8 @@ Every script must print a structured summary as its last line: {"processed": N, 
     const searchCfg = getSearchConfig();
     const comfyCfg = getComfyUIConfig();
     const webSearchLine = searchCfg.url
-        ? `  web_search         -- search the web via SearXNG (${searchCfg.url}); use for examples, docs, libraries\n  web_fetch          -- fetch and read a web page by URL`
+        ? `  web_search         -- search the web via SearXNG (${searchCfg.url}); use for examples, docs, libraries\n  web_fetch          -- fetch and read a web page by URL
+  deep_research    -- structured multi-source research with citations (use instead of multiple web_search+web_fetch)`
         : '';
     const generateImageLine = comfyCfg.url
         ? `  generate_image     -- generate an image via ComfyUI (${comfyCfg.url}); use for diagrams, mockups, report visuals`
@@ -1487,6 +1517,7 @@ export const TOOL_CONTEXT_COST: Record<string, ToolContextCost> = {
     shell_read: 'high',
     run_command: 'high',
     web_fetch: 'high',
+    deep_research: 'high',
     web_search: 'medium',
     gather_context: 'high',
 };
@@ -2939,6 +2970,7 @@ export class Agent {
 
     private diffViewManager: DiffViewManager;
     private refactorManager: MultiFileRefactoringManager;
+    private activeSkill: import('./skillLibrary').SkillManifest | undefined;
     /** Last file operation for undo support */
     private _lastFileOp: { path: string; originalContent: string | null; action: string } | null = null;
     /** Undo stack (item 3.5): recent file ops, oldest→newest, for multi-file rollback. */
@@ -5144,6 +5176,39 @@ This task spans multiple phases or streams. A PROJECT.md skeleton has been creat
             } catch { /* non-fatal */ }
         }
 
+        // Inject active skill prompt into system content
+        if (this.activeSkill) {
+            baseSystemContent += `
+
+## ACTIVE SKILL: ${this.activeSkill.name}
+${this.activeSkill.prompt}`;
+            logInfo(`[agent] Skill prompt injected: ${this.activeSkill.name}`);
+        }
+
+        // Trigger hints: nudge the agent toward skills whose triggers match the current query
+        try {
+            const { loadSkills, matchesSkillTriggers, formatTriggerHint } = await import('./skillLibrary');
+            const wsRoot = this.workspaceRoot ?? process.cwd();
+            const allSkills = loadSkills(wsRoot);
+            const hints: string[] = [];
+            for (const skill of allSkills.values()) {
+                if (skill === this.activeSkill) { continue; } // already active
+                const triggers = skill.triggers ?? (skill.trigger ? [skill.trigger] : []);
+                if (triggers.length === 0) { continue; }       // no triggers = no hint
+                if (matchesSkillTriggers(skill, userMessage)) {
+                    hints.push(`- **${skill.name}** — ${skill.description}${formatTriggerHint(skill)}`);
+                }
+            }
+            if (hints.length > 0) {
+                baseSystemContent += `
+
+## AVAILABLE SKILLS (match current query)
+The following skills are available and their triggers match your current request. Consider calling \`use_skill\` with the skill name to activate one:
+${hints.join('\n')}`;
+                logInfo(`[agent] Skill trigger hints: ${hints.length} skill(s) matched`);
+            }
+        } catch { /* non-fatal */ }
+
         // Inject periodic memory nudge as a separate system message (not mutating user message)
         let memoryNudgeMsg: OllamaMessage | null = null;
         if (cfg.autoSaveMemory) {
@@ -5321,21 +5386,19 @@ This task spans multiple phases or streams. A PROJECT.md skeleton has been creat
                 }
             }
 
-            // ── Fan-out: codeIndex semantic hits (fills the gap between graph + memory) ──
-            // codeGraph covers structural symbols; memory covers past facts. codeIndex adds
-            // semantic file-level relevance from Qdrant — the store not otherwise queried here.
-            if (this.codeIndex?.isReady) {
-                try {
-                    const ciHits = await this.codeIndex.findRelevantFiles(userMessage, 4);
-                    if (ciHits.length > 0) {
-                        const ciLines = ciHits.map(h =>
-                            `- **${h.relPath}** (${Math.round(h.score * 100)}%): ${h.summary}`
-                        );
-                        graphContext += `## Semantically Relevant Files\n${ciLines.join('\n')}\n\n`;
-                        logInfo(`[fanout] codeIndex injected: ${ciHits.length} files`);
-                    }
-                } catch (e) { logWarn('[fanout] codeIndex query failed: ' + String(e)); }
-            }
+            // ── Fan-out: codeIndex semantic hits + memory search (unified via contextFanout) ──
+            // codeGraph covers structural symbols (handled above with ROUTER.md, cross-ref, drift).
+            // contextFanout.findRelevant() handles codeIndex (Qdrant semantic) + tiered memory
+            // in parallel with token budgets and dedup. Passing codeGraph=null avoids duplicating
+            // the scope context already injected above.
+            try {
+                const { findRelevant } = await import('./contextFanout');
+                const fanout = await findRelevant(userMessage, null, this.codeIndex, this.memory);
+                if (fanout.text) {
+                    graphContext += fanout.text + '\n\n';
+                    logInfo(`[fanout] Unified context injected: ~${fanout.tokenEstimate} tokens (index=${fanout.sources.index}, memory=${fanout.sources.memory})`);
+                }
+            } catch (e) { logWarn('[fanout] Unified context query failed: ' + String(e)); }
 
             // ── Adaptive context allocation: pre-load graph-scored symbol bodies ──────
             // When the code graph has indexed this workspace, query top-scored nodes and
@@ -6119,7 +6182,12 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             const tools = isTextMode ? []
                 : (this._isSmallModel && this._editContextInjected)
                     ? SMALL_MODEL_TOOL_DEFINITIONS
-                    : [...TOOL_DEFINITIONS, ...mcpTools];
+                    : this.activeSkill && this.activeSkill.tools.length > 0
+                        ? [...TOOL_DEFINITIONS, ...mcpTools].filter((t: any) => {
+                            const name = t.function?.name ?? t.name;
+                            return this.activeSkill!.tools.includes(name);
+                        })
+                        : [...TOOL_DEFINITIONS, ...mcpTools];
             
             if (mcpTools.length > 0) {
                 logInfo(`[agent] Using ${TOOL_DEFINITIONS.length} built-in + ${mcpTools.length} MCP tools`);
@@ -7349,6 +7417,25 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         logInfo(`[agent] No-tool nudge suppressed — hit retry cap (${this.autoRetryCount}/${this.effectiveMaxRetries}), accepting response`);
                         break;
                     }
+
+                    // Dead-end repetition guard: if the model is producing the same substantial
+                    // text response as its previous turn (no tools, same content), it's stuck in
+                    // a "I already told you" replay loop. Accept the response and break rather than
+                    // nudging again — nudging only makes it repeat the same answer more times.
+                    const prevAssistant = [...this.history].reverse().find((h, i) => i > 0 && h.role === 'assistant');
+                    const prevText = typeof prevAssistant?.content === 'string' ? prevAssistant.content.trim() : '';
+                    const curText = resp.trim();
+                    if (prevText.length > 100 && curText.length > 100) {
+                        // Similarity: compare first 200 chars (enough to detect same-answer replay)
+                        const prevHead = prevText.slice(0, 200).toLowerCase();
+                        const curHead = curText.slice(0, 200).toLowerCase();
+                        const overlap = prevHead.split(' ').filter(w => w.length > 4 && curHead.includes(w)).length;
+                        const similarity = overlap / Math.max(1, prevHead.split(' ').filter(w => w.length > 4).length);
+                        if (similarity > 0.7) {
+                            logWarn(`[agent] Dead-end repetition detected (similarity=${similarity.toFixed(2)}) — accepting response and breaking`);
+                            break;
+                        }
+                    }
                     this.autoRetryCount++;
                     this._readOnlyTurnsSinceLastEdit++;
                     const toolCallHint = isTextMode ? ' Output only a <tool> block, nothing else.' : ' Call the tool now.';
@@ -8221,14 +8308,18 @@ Do NOT use ssh + sed -i. Edit the file locally and scp it up.]`;
                             break;
                         }
 
-                        // Hard block: any python3 -c or heredoc over ssh.
-                        // Multi-line: guaranteed to fail on BusyBox/ash (quoting mangled by shell).
-                        // Single-line: also fails on Windows -- Git Bash mangles quote nesting before
-                        //   ssh sees it, causing syntax errors. Always use write_file + scp + ssh instead.
-                        const SSH_HARD_BLOCK_RE = /\bssh\b.*(?:python3\s+-c\s+["']|<<\s*['"]?EOF)/s;
+                        // Hard block: heredoc over ssh (guaranteed to fail) or python3 -c where the
+                        // outer ssh argument uses the SAME quote type as the -c script body
+                        // (Git Bash on Windows mangles nested same-type quotes before ssh sees them).
+                        // ssh host "... python3 -c 'script'" is fine — mixed outer/inner quotes survive.
+                        const sshHeredoc = /\bssh\b.*<<\s*['"]?EOF/s.test(cmd);
+                        const sshPy3SameQuote =
+                            /\bssh\b\s+\S+\s+python3\s+-c\s+'/.test(cmd) ||          // bare: ssh host python3 -c 'script'
+                            /\bssh\b[^"]*"[^"]*python3\s+-c\s+"/.test(cmd);           // double-in-double: ssh "... python3 -c "
+                        const SSH_HARD_BLOCK_RE = sshHeredoc || sshPy3SameQuote;
                         // Soft nudge: awk or find -printf inline (may work on real Linux, but fragile)
                         const SSH_SOFT_NUDGE_RE = /\bssh\b.*(?:find\s+[^|]*-printf\s+|awk\s+["'])/s;
-                        if (SSH_HARD_BLOCK_RE.test(cmd)) {
+                        if (SSH_HARD_BLOCK_RE) {
                             this._sshInlineGuardFired = true;
                             logWarn('[agent] SSH inline python3 -c / heredoc blocked -- redirecting to write_file + scp + ssh');
                             const hint = `[SYSTEM: That ssh command uses python3 -c or a heredoc. This always fails on Windows (Git Bash mangles quote nesting before ssh sees it) and on BusyBox/ash targets. Do not retry inline python over ssh.
@@ -13819,6 +13910,39 @@ if errors:
             }
 
             // â"€â"€ generate_image â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+            case 'deep_research': {
+                const { deepResearch } = await import('./deepResearch');
+                const question = String(args.question ?? '').trim();
+                if (!question) { throw new Error('question is required'); }
+                const maxSources = Math.min(Math.max(1, Number(args.maxSources ?? 5)), 10);
+                const report = await deepResearch(question, { maxSources });
+                return report;
+            }
+
+            case 'use_skill': {
+                const { loadSkills, getSkillToolAllowlist, getSkillModelOverride } = await import('./skillLibrary');
+                const skillName = String(args.skill ?? '').trim();
+                const wsRoot = this.workspaceRoot ?? process.cwd();
+                const skills = loadSkills(wsRoot);
+
+                if (!skillName) {
+                    this.activeSkill = undefined;
+                    return '(skill deactivated — all tools available again)';
+                }
+
+                const skill = skills.get(skillName);
+                if (!skill) {
+                    const available = Array.from(skills.keys()).join(', ') || '(none)';
+                    return `(skill "${skillName}" not found. Available skills: ${available})`;
+                }
+
+                this.activeSkill = skill;
+                const allowlist = getSkillToolAllowlist(skill);
+                const modelOverride = getSkillModelOverride(skill);
+                logInfo(`[use_skill] Activated: ${skill.name} | tools: ${allowlist ? allowlist.join(',') : 'all'} | model: ${modelOverride ?? 'default'}`);
+                return `(skill "${skill.name}" activated. Prompt injected, tools: ${allowlist ? allowlist.join(', ') : 'all'}, model: ${modelOverride ?? 'default'})`;
+            }
+
             case 'generate_image': {
                 const comfyCfg = getComfyUIConfig();
                 if (!comfyCfg.url) {
