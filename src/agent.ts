@@ -6661,7 +6661,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             logWarn(`[agent] Hard-stopping native recovery loop after ${this._nativeRecoverySuppressCount} suppressions`);
                             post({ type: 'streamEnd' });
                             post({ type: 'removeLastAssistant' });
-                            post({ type: 'error', text: `⚠️ Agent stuck: \`${toolName}\` called with same/empty args ${recentRepeatCount}+ times and cannot self-correct. Try: "Use find_files to list files, then read_file with the exact filename."` });
+                            post({ type: 'error', text: `⚠️ Agent stuck: \`${toolName}\` called with same/empty args ${recentRepeatCount}+ times and cannot self-correct. Try: "Use find_files to list files in the workspace, then read the file you need."` });
                             loopExhausted = false;
                             break;
                         }
@@ -6677,9 +6677,13 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                                 .map(e => `"${e.name}"`)
                                 .join(', ');
                         } catch { /* ignore */ }
+                        const exampleFile = fileList ? fileList.split(',')[0].trim().replace(/^"|"$/g, '') : 'FILENAME';
+                        const exampleArgs = toolName2 === 'shell_read'
+                            ? `{"command":"cat ${exampleFile}"}`
+                            : `{"path":"${exampleFile}"}`;
                         const fileHint = fileList
-                            ? `The workspace contains: ${fileList}. Output ONLY a <tool> block like: <tool>{"name":"${toolName2}","arguments":{"path":"Wiz Email.txt"}}</tool>`
-                            : `Output ONLY a <tool> block: <tool>{"name":"${toolName2}","arguments":{"path":"FILENAME"}}</tool>`;
+                            ? `The workspace contains: ${fileList}. Output ONLY a <tool> block like: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`
+                            : `Output ONLY a <tool> block: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`;
                         this.history.pop();
                         this.history.push({ role: 'user', content: `[SYSTEM: You called ${toolName2} with no path. ${fileHint}]` });
                         post({ type: 'removeLastAssistant' });
