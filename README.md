@@ -17,6 +17,7 @@ A 100% local AI coding agent for VS Code powered by Ollama. No telemetry, no int
 - **Dream agent** — nightly self-improvement cycle using session feedback
 - **MCP support** — connect external tool servers via Model Context Protocol
 - **Multi-workspace** — independent agent sessions per workspace folder
+- **Deep research** — fan-out web search, page fetch, claim extraction, and cited synthesis in one tool call
 - **Skills system** — reusable agent scripts in `.ollamaforge/skills/`
 - **Trust levels** — Normal (confirm tools), Trust (auto-approve edits), YOLO (fully autonomous)
 - **Code review** — review uncommitted changes or any commit via the command palette

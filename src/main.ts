@@ -3,6 +3,7 @@ import { OllamaAgentProvider, runDiagnostics } from './provider';
 import { fetchModels, streamChatRequest, keepAliveModel } from './ollamaClient';
 import { getConfig } from './config';
 import { channel, logInfo, logWarn, logError, toErrorMessage, initFileLogger, exportLog } from './logger';
+import { initTranscriptLogger } from './transcriptLogger';
 import { startMCPServer, stopAllMCPServers } from './mcpClient';
 import { loadMCPConfig, createExampleMCPConfig } from './mcpConfig';
 import { TieredMemoryManager } from './memoryCore';
@@ -230,7 +231,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // so it never blocks activation.
     let codeIndexer: CodeIndexer | null = null;
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (workspaceRoot) { initFileLogger(workspaceRoot); }
+    if (workspaceRoot) { initFileLogger(workspaceRoot); initTranscriptLogger(workspaceRoot); }
     logInfo(`[code-index] Setup: memory.enabled=${memoryConfig.enabled}, workspaceRoot=${workspaceRoot ?? '(none)'}`);
 
     // ── Ensure .ollamaforge/ is gitignored in every workspace folder ──────────

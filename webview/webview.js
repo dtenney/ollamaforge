@@ -739,6 +739,17 @@ function startAssistantMessage() {
 function appendToken(token) {
     if (!currentMsgEl) { return; }
 
+    // Handle thinking headline sentinel — arrives after THINK_END with the summary text
+    if (token.includes('\x01THINK_HEADLINE\x01')) {
+        const idx = token.indexOf('\x01THINK_HEADLINE\x01');
+        const headline = token.slice(idx + '\x01THINK_HEADLINE\x01'.length).trim();
+        const details = currentMsgEl?.querySelector('.thinking-block');
+        if (details && headline) {
+            const summary = details.querySelector('summary');
+            if (summary) { summary.textContent = '💭 ' + headline; }
+        }
+        return;
+    }
     // Handle thinking sentinels — sentinels may arrive concatenated with content,
     // so split on them rather than using strict equality.
     if (token.includes('\x01THINK_START\x01') || token.includes('\x01THINK_END\x01')) {

@@ -63,6 +63,10 @@ export interface OllamaConfig {
     modelRoutingEnabled: boolean;
     /** Model to use for the dream cycle. Empty = use main model. */
     dreamModel: string;
+    /** Model to use for deep research synthesis. Empty = use main model. */
+    researchModel: string;
+    /** Model to use for thinking summary headlines. Empty = use fastModel, then main model. */
+    summaryModel: string;
     /** Days before AGENTS.md is considered stale and auto-refresh is triggered on workspace open. 0 = disabled. */
     contextFileAutoUpdateDays: number;
     /** How long Ollama keeps the model loaded in GPU memory between requests (e.g. "10m", "1h", "0" to unload immediately). */
@@ -129,6 +133,8 @@ export function getConfig(): OllamaConfig {
         criticModel:               c.get<string> ('routing.criticModel',            ''),
         modelRoutingEnabled:       c.get<boolean>('routing.enabled',                false),
         dreamModel:                c.get<string> ('dreamModel',                     ''),
+        researchModel:             c.get<string> ('researchModel',                  ''),
+        summaryModel:              c.get<string> ('summaryModel',                 ''),
         contextFileAutoUpdateDays: c.get<number> ('contextFile.autoUpdateDays',     7),
         keepAlive:                 c.get<string> ('keepAlive',                      '10m'),
         reasoningEffort:           c.get<string> ('reasoningEffort',                 ''),

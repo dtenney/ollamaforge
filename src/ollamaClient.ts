@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { getConfig, parseBaseUrl } from './config';
 import { logInfo, logWarn, logError, toErrorMessage } from './logger';
+import { logTranscript } from './transcriptLogger';
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -107,6 +108,47 @@ export class ToolsNotSupportedError extends Error {
     constructor(model: string) {
         super(`Model "${model}" does not support native tool calling. Switched to text-mode.`);
         this.name = 'ToolsNotSupportedError';
+    }
+}
+
+
+/** Generate a one-line summary headline for a thinking block using a fast model. */
+async function generateThinkingHeadline(thinking: string): Promise<string | null> {
+    try {
+        const cfg = getConfig();
+        const model = cfg.summaryModel || cfg.fastModel || cfg.model;
+        const prompt = `Summarize the following AI thinking/reasoning block in ONE short headline (max 8 words). No preamble, no quotes, just the headline.\n\n${thinking.slice(0, 2000)}`;
+        const body = JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: prompt }],
+            stream: false,
+            options: { temperature: 0.3, num_predict: 30 },
+        });
+        const { hostname, port, isHttps } = getEndpoint();
+        return new Promise((resolve) => {
+            const req = (isHttps ? https : http).request(
+                { hostname, port, path: '/api/chat', method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+                  timeout: 8000 },
+                (res) => {
+                    let buf = '';
+                    res.on('data', (c: Buffer) => (buf += c.toString()));
+                    res.on('end', () => {
+                        try {
+                            const parsed = JSON.parse(buf);
+                            const text = (parsed.message?.content || '').trim().replace(/^["']|["']$/g, '');
+                            resolve(text || null);
+                        } catch { resolve(null); }
+                    });
+                }
+            );
+            req.on('timeout', () => { req.destroy(); resolve(null); });
+            req.on('error', () => resolve(null));
+            req.write(body);
+            req.end();
+        });
+    } catch {
+        return null;
     }
 }
 
@@ -550,11 +592,28 @@ export function streamChatRequest(
                                 if (fullThinking) { logInfo(`[think] ${fullThinking.length} thinking chars`); }
                                 if (avgLogprob !== null) { logInfo(`[logprobs] avg=${avgLogprob.toFixed(3)} over ${logprobCount} tokens`); }
                                 logInfo(`Stream done — ${fullContent.length} chars, ${toolCalls.length} tool calls`);
+                                // Raw per-call transcript (JSONL) — the un-summarized debugging record.
+                                logTranscript({
+                                    ts: new Date().toISOString(),
+                                    endpoint: '/api/chat',
+                                    model,
+                                    messages_in: messages.length,
+                                    thinking: fullThinking || undefined,
+                                    content: fullContent || undefined,
+                                    tool_calls: toolCalls.length ? toolCalls : undefined,
+                                    avg_logprob: avgLogprob,
+                                });
                                 // If the model produced thinking but no visible content and no tool calls,
                                 // it got stuck in the thinking block and stopped. Return empty content —
                                 // agent.ts will detect this and extract the question from result.thinking
                                 // after the stream resolves, with correct streamStart/streamEnd framing.
                                 const effectiveContent = fullContent;
+                                // Generate thinking headline before resolving
+                                if (fullThinking && fullThinking.length > 200) {
+                                    generateThinkingHeadline(fullThinking).then((headline) => {
+                                        if (headline) { onToken('\x01THINK_HEADLINE\x01' + headline); }
+                                    }).catch(() => {});
+                                }
                                 resolve({ content: effectiveContent, toolCalls, avgLogprob, thinking: fullThinking });
                             }
                         } catch { /* skip malformed line */ }

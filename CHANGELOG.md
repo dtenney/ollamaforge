@@ -4,6 +4,11 @@ All notable changes to Ollama Forge are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Deep Research Mode** — `src/deepResearch.ts` orchestrates fan-out web search, page fetch, claim extraction, cross-referencing, and cited synthesis. Exposed as the `deepResearch` agent tool. New `researchModel` config field lets you route research to a dedicated model.
+- **Thinking Summary Headline** — after a thinking block completes, a fast model generates a one-line headline rendered as a collapsible header above the thinking block in the chat UI. New `summaryModel` config field (defaults to `fastModel`).
+- **Skill Library** — `src/skillLibrary.ts` loads, validates, and resolves skill manifests from `.ollamaforge/skills/*.json`. Each skill bundles a prompt fragment, a tool allowlist, and an optional model override. The agent's new `use_skill` tool activates/deactivates skills at runtime; active skills restrict the available tool set and inject their prompt into the system message. Example skill: `code-review`.
+
 ---
 
 ## [1.0.3] — 2026-08-08

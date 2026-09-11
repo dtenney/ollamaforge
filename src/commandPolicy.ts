@@ -47,7 +47,9 @@ const BUILTIN_DENY: RegExp[] = [
     /\bRemove-Item\s+.*-Recurse\s+.*\/(home|Users)\b/i, // Remove-Item -Recurse /home
     /\bdrop\s+(database|table)\b/i,                     // SQL drop
     /\btruncate\s+table\b/i,                            // SQL truncate
-    /\bshutdown\b|\breboot\b|\binit\s+0\b/,             // system power
+    /(?:^|[;&|{(]\s*)(?:sudo\s+)?(?:shutdown|halt|poweroff)\b/,          // system power commands
+    /(?:^|[;&|{(]\s*)(?:sudo\s+)?reboot(?!\s*\d|\s*now\b)(?=\s*$|\s*[;&|])/,  // reboot as standalone command, not "last reboot" arg
+    /\binit\s+0\b/,                                     // init 0
 ];
 
 /** Built-in confirm list — always active. */
