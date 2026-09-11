@@ -14925,6 +14925,7 @@ ${sampleHtml}
             /\b(pip3?\s+install|npm\s+(install|ci)|apt(-get)?\s+install)\b/,
             /\b(ssh|scp|sftp)\b/,
             /\bgit\b/,  // all git commands — ulimit -v fails on Git Bash (Windows) for any git op
+            /\baws\b/,  // AWS CLI on Windows: ulimit breaks the Python-wrapper launcher
         ];
         if (skipPatterns.some(re => re.test(cmd))) {
             return cmd;
@@ -14996,6 +14997,14 @@ ${sampleHtml}
             let safeCmd = cmd;
             if (!isSshCmd && !pyMatch) {
                 safeCmd = cmd.replace(/[\r\n]+/g, ' ').trim();
+            }
+
+            // On Windows + Git Bash, rewrite bare `aws` → `aws.cmd` so bash invokes the
+            // Windows CMD wrapper instead of the extensionless Python launcher script.
+            // Without this, bash tries to exec the Python file directly and MSYS mangles
+            // the path: C:\Python314\Scripts\aws becomes c:\\c\\Python314\\Scripts\\aws.
+            if (winBashPath && process.platform === 'win32') {
+                safeCmd = safeCmd.replace(/(?<![.\w])aws(?=\s|$)/g, 'aws.cmd');
             }
 
             // For SSH commands routed through bash, inject non-interactive options into the
@@ -15216,6 +15225,11 @@ ${sampleHtml}
             let cmdR = cmd;
             if (!isSshCmdR && !pyMatchR) {
                 cmdR = cmd.replace(/[\r\n]+/g, ' ').trim();
+            }
+
+            // On Windows + Git Bash, rewrite bare `aws` → `aws.cmd` (same fix as runCommandStreaming).
+            if (winBashPathR && process.platform === 'win32') {
+                cmdR = cmdR.replace(/(?<![.\w])aws(?=\s|$)/g, 'aws.cmd');
             }
 
             // For SSH commands routed through bash, inject non-interactive options into the command string.
