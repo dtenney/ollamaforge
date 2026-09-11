@@ -7355,7 +7355,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // actual file content so it has what it needs and has no reason to re-read.
                 const readSpiralThresholdEarly =
                     this._taskPhase === 'acting'    ? 3 :
-                    this._taskPhase === 'verifying' ? 5 : 6; // research: was 10, lowered — 6 reads without writing is enough
+                    this._taskPhase === 'verifying' ? 4 : 6; // research: was 10→6; verifying: was 5→4
                 if (this._readOnlyTurnsSinceLastEdit >= readSpiralThresholdEarly
                     && this.autoRetryCount < this.effectiveMaxRetries
                     && !isLegitimateStop) {
@@ -7363,7 +7363,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     logInfo(`[agent] Read saturation: ${this._readOnlyTurnsSinceLastEdit} read-only turns (phase=${this._taskPhase}, edits=${this._editsThisRun})`);
                     this.history.pop();
                     let fileInject = '';
-                    if ((this._taskPhase === 'acting' || this._taskPhase === 'verifying') && this._lastReadFilePath) {
+                    if (this._taskPhase === 'acting' && this._lastReadFilePath) {
                         try {
                             const absPath = path.isAbsolute(this._lastReadFilePath)
                                 ? this._lastReadFilePath
@@ -7377,8 +7377,10 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             fileInject = `\n\nCURRENT FILE CONTENT (${rel}, ${lines.length} lines):\n${numbered}${truncNote}\n\nCall write_file with path="${rel}" to apply your changes. Do NOT call read_file again.`;
                         } catch { /* ignore */ }
                     }
-                    const readNudge = (this._taskPhase === 'acting' || this._taskPhase === 'verifying')
+                    const readNudge = this._taskPhase === 'acting'
                         ? `[SYSTEM: You have read ${this._readOnlyTurnsSinceLastEdit} times without making changes. The file content is below — use write_file or edit_file NOW. Do NOT read again.]${fileInject}`
+                        : this._taskPhase === 'verifying'
+                        ? `[SYSTEM: You have verified ${this._readOnlyTurnsSinceLastEdit} times without finding anything to fix. Verification is DONE. Write your summary to the user now and STOP. Do NOT read any more files.]`
                         : `[SYSTEM: You have read ${this._readOnlyTurnsSinceLastEdit} files without acting. You have enough context. Call write_file, edit_file, or run_command — or write your final answer. Do NOT read more files.]`;
                     this.history.push({ role: 'user', content: readNudge });
                     post({ type: 'removeLastAssistant' });
