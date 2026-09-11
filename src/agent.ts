@@ -11897,8 +11897,19 @@ if errors:
             case 'gather_context': {
                 // Accept either `files` (array of paths -> auto-wrap as `cat`) or `commands` (shell commands).
                 // Models naturally pass file paths; converting them here avoids requiring shell-command syntax.
-                const rawFiles = args.files;
-                const rawCmds = args.commands;
+                // Some models (text-mode) pass files/commands as a JSON string instead of a parsed array -- coerce.
+                const coerceToArray = (v: unknown): unknown[] | null => {
+                    if (Array.isArray(v)) return v;
+                    if (typeof v === 'string') {
+                        const s = v.trim();
+                        if (s.startsWith('[')) {
+                            try { const p = JSON.parse(s); if (Array.isArray(p)) return p; } catch { /* fall through */ }
+                        }
+                    }
+                    return null;
+                };
+                const rawFiles = coerceToArray(args.files) ?? args.files;
+                const rawCmds = coerceToArray(args.commands) ?? args.commands;
                 if ((!Array.isArray(rawFiles) || rawFiles.length === 0) && (!Array.isArray(rawCmds) || rawCmds.length === 0)) {
                     throw new Error('gather_context: provide either "files" (array of file paths) or "commands" (array of shell commands).');
                 }
