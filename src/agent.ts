@@ -2957,6 +2957,11 @@ export class Agent {
     /** Track auto-learned correction rule IDs so we don't re-learn the same rule twice per session */
     private _autoLearnedRuleIds = new Set<string>();
     private _readOnlyTurnsSinceLastEdit = 0; // tracks consecutive read-only turns without an edit
+    /** Counts "gather then announce" cycles: model made read-only tools then emitted a no-tool planning
+     *  response. Resets when a write/edit happens. Hard-stop nudge fires after 3 consecutive cycles. */
+    private _gatherStallCycles = 0;
+    /** Tracks whether the last batch of tool calls contained any reads (used for gather-stall detection) */
+    private _lastBatchWasReadOnly = false;
     /** Staged-edit queue (item 3.3 diff-first): edits proposed but not yet written to disk. */
     private _stagedEdits: Array<{ id: number; path: string; oldString: string; newString: string; destructive: boolean }> = [];
     private _stagedEditSeq = 0;
@@ -4088,6 +4093,8 @@ export class Agent {
         this._editContextInjected = false;     // Reset read-then-act flag
         this._editsThisRun = 0;                // Reset per-turn edit counter (session total in _totalEditsThisSession)
         this._readOnlyTurnsSinceLastEdit = 0;  // Reset read-only turn counter -- fresh budget each user message
+        this._gatherStallCycles = 0;           // Reset gather-stall cycle counter
+        this._lastBatchWasReadOnly = false;    // Reset read-only batch flag
         this._responseFingerprints = [];       // Reset loop-detection fingerprints each user message
         // NOTE: do NOT seed _totalEditsThisSession from history on session restore.
         // Doing so caused isVerificationSweep to fire after the first edit in a new message,
@@ -7348,7 +7355,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // actual file content so it has what it needs and has no reason to re-read.
                 const readSpiralThresholdEarly =
                     this._taskPhase === 'acting'    ? 3 :
-                    this._taskPhase === 'verifying' ? 5 : 10;
+                    this._taskPhase === 'verifying' ? 5 : 6; // research: was 10, lowered — 6 reads without writing is enough
                 if (this._readOnlyTurnsSinceLastEdit >= readSpiralThresholdEarly
                     && this.autoRetryCount < this.effectiveMaxRetries
                     && !isLegitimateStop) {
@@ -7429,6 +7436,30 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     if (this.autoRetryCount >= this.effectiveMaxRetries && !endsWithPlanningStatement) {
                         logInfo(`[agent] No-tool nudge suppressed — hit retry cap (${this.autoRetryCount}/${this.effectiveMaxRetries}), accepting response`);
                         break;
+                    }
+
+                    // Gather-stall guard: model read files last turn, then emitted a planning response
+                    // ("I have the full picture, writing now") without a write. This pattern loops:
+                    // read → announce → read → announce → ... Reset by autoRetryCount=0 each tool call.
+                    // Detect by: _lastBatchWasReadOnly=true (last turn was reads) + current turn no tool.
+                    if (this._lastBatchWasReadOnly) {
+                        this._gatherStallCycles++;
+                        this._lastBatchWasReadOnly = false; // consumed — reset until next read batch
+                        if (this._gatherStallCycles >= 3) {
+                            logWarn(`[agent] Gather-stall loop detected (${this._gatherStallCycles} cycles) — forcing write nudge`);
+                            this._gatherStallCycles = 0;
+                            this.autoRetryCount++;
+                            this.history.pop();
+                            const writeTarget = this._toolCallsThisRun.find(tc => tc.name === 'write_file')?.path
+                                ?? this._toolCallsThisRun.find(tc => tc.name === 'edit_file')?.path
+                                ?? '';
+                            const writeNudge = writeTarget
+                                ? `[SYSTEM: WRITE NOW. You have read files ${this._readOnlyTurnsSinceLastEdit} times and announced "I have the full picture" ${this._gatherStallCycles + 3} times without writing. You already have all the context you need. Call write_file with path="${writeTarget}" immediately — no more reading, no more announcing.]`
+                                : `[SYSTEM: WRITE NOW. You have read files ${this._readOnlyTurnsSinceLastEdit} times and announced "I have the full picture" multiple times without writing. Stop reading. Call write_file immediately with the full content. No more reading, no more announcing.]`;
+                            this.history.push({ role: 'user', content: writeNudge });
+                            post({ type: 'removeLastAssistant' });
+                            continue;
+                        }
                     }
 
                     // Dead-end repetition guard: if the model is producing the same substantial
@@ -10284,12 +10315,15 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 const hadEditTool = toolCalls.some(tc => ['edit_file', 'edit_file_at_line', 'run_command', 'write_file'].includes(tc.function?.name ?? ''));
                 if (hadEditTool) {
                     this._readOnlyTurnsSinceLastEdit = 0;
+                    this._gatherStallCycles = 0;     // Write happened — gather-stall loop is over
+                    this._lastBatchWasReadOnly = false;
                     // Phase transitions: any edit/write moves us to 'acting'.
                     // This includes re-entering 'acting' from 'verifying' -- the agent
                     // may iterate: act -> verify -> act -> verify multiple times.
                     if (this._taskPhase !== 'acting') { this._taskPhase = 'acting'; }
                 } else {
                     this._readOnlyTurnsSinceLastEdit++;
+                    this._lastBatchWasReadOnly = true;  // This batch was reads-only; flag for gather-stall detection
                     // Reading after edits = verification, not a research loop.
                     // Do not transition back from 'verifying' to 'research'.
                     if (this._taskPhase === 'acting') { this._taskPhase = 'verifying'; }
