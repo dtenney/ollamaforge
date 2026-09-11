@@ -2082,6 +2082,7 @@ function addCommandBlock(id, cmd) {
             `<span class="cmd-icon">⚡</span>` +
             `<span class="cmd-type">${escHtml(label)}</span>` +
             `<span class="cmd-label">${escHtml(cmdDisplay)}</span>` +
+            `<span class="cmd-toggle" style="margin-left:auto;font-size:0.75em;opacity:0.4;flex-shrink:0;display:none">▶</span>` +
             `<div class="dots"><span></span><span></span><span></span></div>` +
         `</div>` +
         `<div class="cmd-output" style="display:none"></div>`;
@@ -2166,17 +2167,28 @@ function finalizeCommandBlock(id, exitCode) {
         // Remove the streaming dots now that the command has finished.
         // (already removed above, but guard in case querySelector missed it)
 
+        // Get the arrow element added by addCommandBlock (always present now).
+        // Badge and lineHint are inserted BEFORE the arrow so layout is:
+        //   icon | type | label [flex-grow] | badge | lineHint | ▶
+        const existingArrow = header.querySelector('.cmd-toggle');
+
         const badge = document.createElement('span');
         badge.className = 'cmd-exit';
         badge.textContent = ok ? `✓ exit 0` : `✗ exit ${exitCode}`;
         badge.style.color = ok ? '#4ec94e' : '#f44747';
-        header.appendChild(badge);
+        if (existingArrow) { header.insertBefore(badge, existingArrow); }
+        else { header.appendChild(badge); }
 
         if (hasOutput && output) {
             const lines = output.textContent.split('\n').filter(l => l.trim()).length;
 
-            const toggleArrow = document.createElement('span');
-            toggleArrow.className = 'cmd-toggle';
+            // Reuse the arrow span that was injected in addCommandBlock's innerHTML.
+            let toggleArrow = existingArrow;
+            if (!toggleArrow) {
+                toggleArrow = document.createElement('span');
+                toggleArrow.className = 'cmd-toggle';
+                header.appendChild(toggleArrow);
+            }
             toggleArrow.style.cssText = 'margin-left:auto;font-size:0.75em;opacity:0.6;flex-shrink:0';
 
             const lineHint = document.createElement('span');
@@ -2184,8 +2196,8 @@ function finalizeCommandBlock(id, exitCode) {
             lineHint.textContent = `${lines} line${lines !== 1 ? 's' : ''}`;
             lineHint.style.opacity = '0.4';
 
-            header.appendChild(toggleArrow);
-            header.appendChild(lineHint);
+            // Insert lineHint before arrow so arrow stays last.
+            header.insertBefore(lineHint, toggleArrow);
             header.style.cursor = 'pointer';
 
             // On success: collapse output. On failure: leave expanded. Respect manual toggle.
@@ -2222,6 +2234,10 @@ function finalizeCommandBlock(id, exitCode) {
             header.onclick = block._toggleOutput;
             // Also wire preview click directly (it's not covered by the header delegate).
             if (preview) { preview.addEventListener('click', block._toggleOutput); }
+        } else {
+            // No output — hide the toggle arrow (nothing to expand) and remove pointer cursor.
+            if (existingArrow) { existingArrow.style.display = 'none'; }
+            if (header) { header.style.cursor = 'default'; }
         } // end if (hasOutput && output)
     } // end if (header)
 
