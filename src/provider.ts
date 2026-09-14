@@ -19,6 +19,7 @@ import { DiffViewManager } from './diffView';
 import { MultiWorkspaceManager } from './multiWorkspace';
 import { runDreamCycle } from './dreamAgent';
 import { isValidWebviewMsg } from './webviewMsgGuard';
+import { isOutdatedAgentModel, OutdatedModelWarningTracker } from './modelRecommendations';
 
 /** Strip <tool>{...}</tool> blocks using brace-counting for nested JSON.
  *  Also strips <function_calls>/<invoke> Claude-format blocks and bare stray tags. */
@@ -108,6 +109,7 @@ type WebviewMsg =
     | { command: 'updatePins'; pins: string[] }
     | { command: 'updatePinnedFiles'; files: string[] }
     | { command: 'openSettings' }
+    | { command: 'mcpStatus' }
     | { command: 'openFile'; path: string }
     | { command: 'reviewProject' }
     | { command: 'compactContext' }
@@ -318,6 +320,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
     private _workspaceChanging: boolean = false;
     /** Shared DiffViewManager for applyCodeBlock (reused, not created per call) */
     private _diffViewManager: DiffViewManager = new DiffViewManager();
+    /** Outdated-model warning tracker — warns once per conversation per model. */
+    private _outdatedTracker: OutdatedModelWarningTracker = new OutdatedModelWarningTracker();
 
     // ── Tab management ────────────────────────────────────────────────────────
     private _tabs: Map<string, TabState> = new Map();
@@ -1054,6 +1058,19 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         pausedAt:       new Date().toISOString(),
                     };
                     this.storage.upsert(runTab.session);
+
+                    // ── Outdated model warning (once per conversation per model) ──
+                    if (isOutdatedAgentModel(model)) {
+                        const history = runTab.agent.conversationHistory
+                            .map(m => `${m.role}:${m.content.slice(0, 200)}`);
+                        const hasAssistant = runTab.agent.conversationHistory.some(m => m.role === 'assistant');
+                        const req = this._outdatedTracker.beginRequest(history, hasAssistant);
+                        if (!this._outdatedTracker.hasShown(req, model)) {
+                            this._outdatedTracker.markShown(req, model);
+                            post({ type: 'info', text: `⚠ "${model}" is an older model family. Consider a newer model (e.g. gemma4, qwen3, llama3.3) for better agentic coding performance.` });
+                        }
+                    }
+
                     try {
                         await runTab.agent.run(fullMessageWithPins, model, trackedPost);
                         // Sync agent history and task state into session after run completes.
@@ -1460,6 +1477,12 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     const pinMsg = raw as { command: 'updatePins'; pins: string[] };
                     this.currentSession.pinnedMsgIds = pinMsg.pins;
                     this.persistSession();
+                    break;
+                }
+
+                // ── MCP status ───────────────────────────────────────────
+                case 'mcpStatus': {
+                    vscode.commands.executeCommand('ollamaForge.mcpStatus');
                     break;
                 }
 

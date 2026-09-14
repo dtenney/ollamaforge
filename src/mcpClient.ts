@@ -178,6 +178,65 @@ export function parseMCPToolName(name: string): { server: string; tool: string }
 }
 
 /**
+ * Status snapshot of a single MCP server
+ */
+export interface MCPServerStatus {
+    name: string;
+    connected: boolean;
+    toolCount: number;
+    tools: string[];
+    error?: string;
+}
+
+/**
+ * Get status of all MCP servers (connected or attempted)
+ */
+export function getMCPStatus(): MCPServerStatus[] {
+    const statuses: MCPServerStatus[] = [];
+    for (const [name, server] of activeServers.entries()) {
+        statuses.push({
+            name,
+            connected: true,
+            toolCount: server.tools.length,
+            tools: server.tools.map(t => t.name),
+        });
+    }
+    return statuses;
+}
+
+/**
+ * Restart a single MCP server by name
+ */
+export async function restartMCPServer(
+    name: string,
+    command: string,
+    args: string[],
+    env: Record<string, string> = {},
+    allowedTools?: string[]
+): Promise<MCPServer> {
+    // Stop existing
+    const existing = activeServers.get(name);
+    if (existing) {
+        try { await existing.client.close(); } catch { /* ignore */ }
+        activeServers.delete(name);
+    }
+    // Start fresh
+    return startMCPServer(name, command, args, env, allowedTools);
+}
+
+/**
+ * Stop a single MCP server by name
+ */
+export async function stopMCPServer(name: string): Promise<void> {
+    const server = activeServers.get(name);
+    if (server) {
+        try { await server.client.close(); } catch { /* ignore */ }
+        activeServers.delete(name);
+        logInfo(`Stopped MCP server: ${name}`);
+    }
+}
+
+/**
  * Stop all MCP servers
  */
 export async function stopAllMCPServers(): Promise<void> {

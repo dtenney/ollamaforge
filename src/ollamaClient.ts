@@ -3,6 +3,7 @@ import * as https from 'https';
 import { getConfig, parseBaseUrl } from './config';
 import { logInfo, logWarn, logError, toErrorMessage } from './logger';
 import { logTranscript } from './transcriptLogger';
+import { machineContextLength, isMachineContextTooSmall, formatContextLength, minimumMachineContextLength } from './contextLength';
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -109,6 +110,57 @@ export class ToolsNotSupportedError extends Error {
         super(`Model "${model}" does not support native tool calling. Switched to text-mode.`);
         this.name = 'ToolsNotSupportedError';
     }
+}
+
+/**
+ * Structured error for Ollama API failures (ported from ollama-vscode extension).
+ * Carries HTTP status, endpoint, and the server's error detail so callers
+ * can branch on specific failure modes (auth, context-length, model-not-found).
+ */
+export class OllamaAPIError extends Error {
+    readonly status: number;
+    readonly endpoint: string;
+    readonly responseError?: string;
+    readonly signinURL?: string;
+
+    constructor(message: string, status: number, endpoint: string, responseError?: string, signinURL?: string) {
+        super(message);
+        this.name = 'OllamaAPIError';
+        this.status = status;
+        this.endpoint = endpoint;
+        this.responseError = responseError;
+        this.signinURL = signinURL;
+    }
+}
+
+/**
+ * Thrown when the Ollama stream ends without a recognized completion marker.
+ * Some backends (especially non-Ollama proxies) close the stream after
+ * `done_reason` without a final `done: true` chunk, leaving the caller
+ * unable to distinguish "model finished" from "stream dropped".
+ */
+export class MissingStreamCompletionError extends Error {
+    constructor(model: string, contentLength: number) {
+        super(`Stream for model "${model}" ended without a completion marker (${contentLength} chars received). The response may be truncated.`);
+        this.name = 'MissingStreamCompletionError';
+    }
+}
+
+/** Check if an error is a context-length / context-window overflow. */
+export function isContextLengthError(err: unknown): boolean {
+    if (!(err instanceof Error)) { return false; }
+    const msg = err.message.toLowerCase();
+    return msg.includes('context length') || msg.includes('context_length')
+        || msg.includes('maximum context') || msg.includes('exceeds the context')
+        || msg.includes('too many tokens') || msg.includes('context window');
+}
+
+/** Extract the numeric context limit from an error message, if present. */
+export function extractContextLimit(err: unknown): number | undefined {
+    if (!(err instanceof Error)) { return undefined; }
+    const m = err.message.match(/(\d{3,6})\s*(?:tokens?|chars?|characters?)/i);
+    if (m) { return parseInt(m[1], 10); }
+    return undefined;
 }
 
 
@@ -244,7 +296,24 @@ export function streamChatRequest(
                         if (res.statusCode === 400 && e.toLowerCase().includes('does not support tools')) {
                             reject(new ToolsNotSupportedError(model));
                         } else {
-                            reject(new Error(`HTTP ${res.statusCode}: ${e}`));
+                            // Parse structured error body (ported from ollama-vscode)
+                            let responseError: string | undefined;
+                            let signinURL: string | undefined;
+                            try {
+                                const parsed = JSON.parse(e) as { error?: string; signin_url?: string };
+                                if (typeof parsed === 'object' && parsed !== null) {
+                                    responseError = parsed.error;
+                                    signinURL = parsed.signin_url;
+                                }
+                            } catch { /* not JSON */ }
+                            const detail = responseError ?? e;
+                            reject(new OllamaAPIError(
+                                `Ollama /api/chat failed with HTTP ${res.statusCode}${detail ? `: ${detail}` : ''}`,
+                                res.statusCode!,
+                                '/api/chat',
+                                responseError,
+                                signinURL
+                            ));
                         }
                     });
                     return;
@@ -623,9 +692,16 @@ export function streamChatRequest(
                 res.on('end', () => {
                     if (!resolved) {
                         resolved = true;
+                        // Stream ended without a `done: true` marker — some backends
+                        // (non-Ollama proxies, older Ollama versions) close the stream
+                        // after `done_reason` without a final completion chunk.
+                        // Log a warning so the user knows the response may be truncated.
+                        logInfo(`[stream] WARNING: stream ended without completion marker — ${fullContent.length} chars received, ${toolCalls.length} tool calls. Response may be truncated.`);
                         const avgLogprob = logprobCount > 0 ? logprobSum / logprobCount : null;
                         resolve({ content: fullContent, toolCalls, avgLogprob, thinking: fullThinking });
                     }
+                    // Best-effort: check if the model's allocated context is too small
+                    checkContextLength(model);
                 });
                 res.on('error', reject);
             }
@@ -642,6 +718,36 @@ export function streamChatRequest(
         req.write(body);
         req.end();
     });
+}
+
+/**
+ * Best-effort context-length check: query `/api/ps` for the model's allocated
+ * context_length and warn if it's below the 64K minimum.
+ * Non-fatal — if Ollama is unreachable or the model isn't loaded yet, we skip.
+ */
+async function checkContextLength(model: string): Promise<void> {
+    try {
+        const config = getConfig();
+        const { protocol, hostname, port } = parseBaseUrl(config.baseUrl);
+        const req = (protocol === 'https' ? https : http).request({
+            hostname, port, path: '/api/ps', method: 'GET', timeout: 3000,
+        }, (res) => {
+            let data = '';
+            res.on('data', (c: string) => { data += c; });
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data) as { models?: unknown[] };
+                    const ctxLen = machineContextLength(parsed.models ?? [], model);
+                    if (ctxLen !== undefined && isMachineContextTooSmall(ctxLen)) {
+                        logWarn(`[context] WARNING: model "${model}" has only ${formatContextLength(ctxLen)} context allocated (minimum ${formatContextLength(minimumMachineContextLength)}). Long conversations may be truncated. Increase OLLAMA_CONTEXT_LENGTH or use a smaller model.`);
+                    }
+                } catch { /* non-JSON response — skip */ }
+            });
+        });
+        req.on('error', () => { /* Ollama unreachable — skip check */ });
+        req.on('timeout', () => { req.destroy(); });
+        req.end();
+    } catch { /* best-effort — never throw */ }
 }
 
 // ── FIM (Fill-in-the-Middle) via /api/generate ───────────────────────────────

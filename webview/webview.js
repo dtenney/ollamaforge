@@ -1576,6 +1576,8 @@ function friendlyErrorMsg(raw) {
         return '📏 Message exceeds the model\'s context window. Try compacting the conversation or starting a new chat.';
     if (/does not support tools/i.test(raw))
         return '⚙️ This model doesn\'t support native tool calling — text-mode will be used automatically.';
+    // Don't prepend ⚠ if the message already starts with an emoji or ⚠ (avoids "⚠ ⚠️ ...")
+    if (/^[\u26A0\u{1F300}-\u{1FFFF}\u{2600}-\u{27BF}]/u.test(raw)) return escHtml(raw);
     return `⚠ ${escHtml(raw)}`;
 }
 
@@ -2590,6 +2592,14 @@ if (compactBtnFooter) {
         vscode.postMessage({ command: 'compactContext' });
         compactBtnFooter.textContent = 'Compacting…';
         compactBtnFooter.disabled = true;
+    });
+}
+
+// ── MCP button ────────────────────────────────────────────────────────────────
+const mcpBtn = /** @type {HTMLButtonElement} */ (document.getElementById('mcp-btn'));
+if (mcpBtn) {
+    mcpBtn.addEventListener('click', () => {
+        vscode.postMessage({ command: 'mcpStatus' });
     });
 }
 

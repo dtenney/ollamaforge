@@ -77,6 +77,14 @@ export interface OllamaConfig {
     commandPolicy?: import('./commandPolicy').CommandPolicyConfig;
     /** When true, probe PyPI/npm to confirm new install package names exist (network, off by default). */
     registryCheck: boolean;
+    /** When true, sample K responses before executing mutating tools and gate on R_sc consensus. */
+    consistencyGateEnabled: boolean;
+    /** Number of samples for the consistency gate (default 3). */
+    consistencyGateSamples: number;
+    /** R_sc threshold below which the response passes (default 0.35). */
+    consistencyGatePass: number;
+    /** R_sc threshold above which the response is blocked (default 0.70). */
+    consistencyGateBlock: number;
 }
 
 // ── Model routing helpers ─────────────────────────────────────────────────────
@@ -140,6 +148,11 @@ export function getConfig(): OllamaConfig {
         reasoningEffort:           c.get<string> ('reasoningEffort',                 ''),
         commandPolicy:             c.get('commandPolicy') ?? undefined,
         registryCheck:             c.get<boolean>('registryCheck', false),
+        // Consistency gate (R_sc)
+        consistencyGateEnabled:    c.get<boolean>('consistencyGate.enabled', false),
+        consistencyGateSamples:    c.get<number> ('consistencyGate.samples', 3),
+        consistencyGatePass:       c.get<number> ('consistencyGate.passThreshold', 0.35),
+        consistencyGateBlock:      c.get<number> ('consistencyGate.blockThreshold', 0.70),
     };
 }
 

@@ -67,6 +67,7 @@ graph TD
         MULTIREF["multiFileRefactor.ts"]
         CMDPOL["commandPolicy.ts"]
         SECRETS["secretRedaction.ts"]
+        CODEREV["codeReview.ts"]
     end
 
     subgraph "UI Providers"
@@ -86,6 +87,7 @@ graph TD
         CONFIG["config.ts"]
         LOGGER["logger.ts"]
         WEBGUARD["webviewMsgGuard.ts"]
+        TRANSCRIPT["transcriptLogger.ts"]
     end
 
     %% Entry wiring
@@ -154,6 +156,8 @@ graph TD
     MAIN --> MDINGEST
     MAIN --> MCP
     MAIN --> MCPCFG
+    MAIN --> CODEREV
+    MAIN --> TRANSCRIPT
 
     %% Memory internals
     MEMCORE --> EMB
@@ -272,6 +276,7 @@ npm run bundle:prod
 | `multiFileRefactor.ts` | Multi-file refactoring plan execution |
 | `commandPolicy.ts` | Shell command safety evaluation, egress checks |
 | `secretRedaction.ts` | Secret detection and redaction in tool output |
+| `codeReview.ts` | Code review request builder (git diff → review prompt) |
 
 ### UI Providers
 | File | Role |
@@ -293,6 +298,7 @@ npm run bundle:prod
 | `config.ts` | Settings schema, model presets, `getConfig()` |
 | `logger.ts` | File + output channel logging |
 | `webviewMsgGuard.ts` | Webview message validation |
+| `transcriptLogger.ts` | Per-call raw transcript logging (model I/O to disk) |
 
 ## Key Systems
 

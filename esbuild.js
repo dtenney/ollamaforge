@@ -13,6 +13,13 @@ const NATIVE_EXTERNALS = [
     'better-sqlite3',
 ];
 
+// Transitive runtime dependencies of the native modules. These are NOT esbuild
+// externals (their parent is already external), but they must be copied into
+// dist/node_modules so the extension host can resolve them at runtime.
+const NATIVE_TRANSITIVE_DEPS = [
+    'node-gyp-build',
+];
+
 esbuild.build({
     entryPoints: ['src/main.ts'],
     bundle: true,
@@ -32,7 +39,7 @@ esbuild.build({
     const distNodeModules = path.join(__dirname, 'dist', 'node_modules');
     fs.mkdirSync(distNodeModules, { recursive: true });
 
-    for (const mod of NATIVE_EXTERNALS) {
+    for (const mod of [...NATIVE_EXTERNALS, ...NATIVE_TRANSITIVE_DEPS]) {
         const src = path.join(__dirname, 'node_modules', mod);
         const dst = path.join(distNodeModules, mod);
         if (!fs.existsSync(src)) continue;

@@ -4,7 +4,7 @@ import { fetchModels, streamChatRequest, keepAliveModel } from './ollamaClient';
 import { getConfig } from './config';
 import { channel, logInfo, logWarn, logError, toErrorMessage, initFileLogger, exportLog } from './logger';
 import { initTranscriptLogger } from './transcriptLogger';
-import { startMCPServer, stopAllMCPServers } from './mcpClient';
+import { startMCPServer, stopAllMCPServers, getMCPStatus, restartMCPServer, stopMCPServer } from './mcpClient';
 import { loadMCPConfig, createExampleMCPConfig } from './mcpConfig';
 import { TieredMemoryManager } from './memoryCore';
 import { getMemoryConfig } from './memoryConfig';
@@ -608,6 +608,78 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     context.subscriptions.push(
         vscode.commands.registerCommand('ollamaForge.createMCPConfig', () => createExampleMCPConfig())
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('ollamaForge.mcpStatus', async () => {
+            const statuses = getMCPStatus();
+            const configs = loadMCPConfig();
+            const lines: string[] = [];
+            lines.push('═══ MCP Server Status ═══');
+            lines.push('');
+            if (statuses.length === 0) {
+                lines.push('No MCP servers are currently connected.');
+                lines.push('');
+                lines.push(`Configured servers: ${configs.length}`);
+                if (configs.length > 0) {
+                    lines.push('They may have failed to start. Check the Ollama Forge log for errors.');
+                } else {
+                    lines.push('Run "Ollama: Create MCP Config File" to set up servers.');
+                }
+            } else {
+                for (const s of statuses) {
+                    const icon = s.connected ? '●' : '○';
+                    lines.push(`${icon} ${s.name} — ${s.toolCount} tool(s)`);
+                    if (s.tools.length > 0) {
+                        lines.push(`   Tools: ${s.tools.join(', ')}`);
+                    }
+                    if (s.error) {
+                        lines.push(`   Error: ${s.error}`);
+                    }
+                }
+                // Check for configured but not connected
+                const connectedNames = new Set(statuses.map(s => s.name));
+                const missing = configs.filter(c => !connectedNames.has(c.name));
+                if (missing.length > 0) {
+                    lines.push('');
+                    lines.push(`Not connected: ${missing.map(c => c.name).join(', ')}`);
+                }
+            }
+            lines.push('');
+            lines.push('Commands:');
+            lines.push('  • Ollama: Restart MCP Servers — stop all and restart from config');
+            lines.push('  • Ollama: Stop MCP Servers — disconnect all');
+            lines.push('  • Ollama: Create MCP Config File — open/edit .ollamaforge/mcp.json');
+
+            const output = lines.join('\n');
+            channel.appendLine('');
+            channel.appendLine(output);
+            channel.show(true);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('ollamaForge.mcpRestart', async () => {
+            const configs = loadMCPConfig();
+            if (configs.length === 0) {
+                vscode.window.showWarningMessage('No MCP servers configured. Run "Ollama: Create MCP Config File" first.');
+                return;
+            }
+            await stopAllMCPServers();
+            const results = await Promise.allSettled(
+                configs.map(cfg => startMCPServer(cfg.name, cfg.command, cfg.args, cfg.env || {}, cfg.allowedTools))
+            );
+            const ok = results.filter(r => r.status === 'fulfilled').length;
+            const failed = results.filter(r => r.status === 'rejected').length;
+            vscode.window.showInformationMessage(`MCP servers restarted: ${ok} connected, ${failed} failed`);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('ollamaForge.mcpStop', async () => {
+            await stopAllMCPServers();
+            vscode.window.showInformationMessage('All MCP servers stopped.');
+        })
     );
 
     context.subscriptions.push(

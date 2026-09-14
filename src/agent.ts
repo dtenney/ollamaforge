@@ -27,6 +27,8 @@ import { CodeGraph, loadRouterMd, generateRouterMd, isRouterMdStale } from './co
 import { evaluateCommand, checkEgress, CommandPolicyConfig } from './commandPolicy';
 import { redactSecrets, containsSecret } from './secretRedaction';
 import { validatePythonImports, formatImportWarning, validateDoctests, formatDoctestWarning, probeRegistry, formatRegistryWarning, RegistryProbeResult } from './importResolver';
+import { classifyIntent, IntentResult } from './core/promptIntentClassifier';
+import { evaluateGate } from './core/consistencyGate';
 
 // â"€â"€ Shell environment detection â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
@@ -2944,14 +2946,35 @@ export class Agent {
     /** Interval (in user turns) between memory nudge injections */
     private readonly MEMORY_NUDGE_INTERVAL = 3;
 
-    /** Track auto-retries for permission-asking / plan-dumping to prevent infinite loops */
+    /**
+     * Retry / circuit-breaker state — two counters with distinct roles:
+     *
+     * autoRetryCount  — TOTAL retry budget consumed this run, across ALL causes
+     *                  (network drops, timeouts, spiral aborts, self-stops,
+     *                  stalls, planning narration). Decides "should I keep
+     *                  retrying or accept the response?" Capped by
+     *                  effectiveMaxRetries (6 / 9 / 12 by trust level).
+     *                  Decays −1 on each successful tool call; resets to 0 on
+     *                  any tool invocation, legitimate stop, or new user msg.
+     *
+     * _consecutiveAborts — CONSECUTIVE bail-out streak (spiral + self-stop only).
+     *                  Decides "should I hard-stop to protect Ollama?" Capped
+     *                  by MAX_CONSECUTIVE_ABORTS (3). Resets on any clean turn
+     *                  or real tool call. Stalls and network errors do NOT
+     *                  increment this — only true model bail-outs do.
+     *
+     * The two are incremented together in the self-stop and spiral paths, but
+     * autoRetryCount is also incremented by network/timeout/stall paths. So
+     * autoRetryCount can be high while _consecutiveAborts is low (many
+     * transient retries, few bail-outs) — which is correct: the hard-stop
+     * should only fire on repeated bail-outs, not on network hiccups.
+     */
     private autoRetryCount = 0;
-    private readonly MAX_AUTO_RETRIES = 6;   // was 12 -- lower to reduce Ollama stress on abort loops
+    private readonly MAX_AUTO_RETRIES = 6;   // default (non-trust) retry budget
     /** Effective retry limit -- YOLO gets more budget since it runs autonomously longer */
     private get effectiveMaxRetries(): number {
-        return this.trustLevel === 'yolo' ? 12 : this.trustLevel === 'trust' ? 9 : 6;
+        return this.trustLevel === 'yolo' ? 12 : this.trustLevel === 'trust' ? 9 : this.MAX_AUTO_RETRIES;
     }
-    /** Count consecutive pre-draft / spiral aborts -- hard-stop after 3 to protect Ollama */
     private _consecutiveAborts = 0;
     private readonly MAX_CONSECUTIVE_ABORTS = 3;
     /** Track auto-learned correction rule IDs so we don't re-learn the same rule twice per session */
@@ -5043,6 +5066,16 @@ export class Agent {
                 ? buildSmallModelSystemPrompt(this.workspaceRoot)
                 : await buildSystemPromptAsync(cfg.autoSaveMemory, this.workspaceRoot));
 
+        // ── Intent-based context strategy ─────────────────────────────────────
+        const intentResult: IntentResult = classifyIntent(userMessage);
+        if (intentResult.intent !== 'general') {
+            logInfo(`[intent] ${intentResult.intent} (confidence=${intentResult.confidence}) — prioritize: ${intentResult.contextPriorities.join(', ')} | skip: ${intentResult.contextSkips.join(', ') || 'none'}`);
+            baseSystemContent += `\n\n## CONTEXT STRATEGY (intent: ${intentResult.intent})
+Prioritize these context sources: ${intentResult.contextPriorities.join(', ')}.
+Skip or de-prioritize: ${intentResult.contextSkips.join(', ') || 'none'}.
+Adapt your tool calls accordingly — e.g. if git_diff is skipped, do not call shell_read for git log/diff unless the user explicitly asks.`;
+        }
+
         // Snapshot context file mtimes for drift detection (checked every 5 turns)
         if (this.workspaceRoot) {
             this._contextFileMtimes = snapshotContextFileMtimes(this.workspaceRoot);
@@ -5509,13 +5542,17 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             try {
                 const tier3 = this.memory.getTier(3)
                     .filter(e => e.tags?.includes('session-end') || e.tags?.includes('completed'))
-                    .slice(0, 2);
+                    .slice(-2);
                 const tier2disc = this.memory.getTier(2)
                     .filter(e => e.tags?.includes('auto-discovery') || e.tags?.includes('stub') || e.tags?.includes('template'))
                     .slice(0, 3);
-                const recentEntries = [...tier3, ...tier2disc].slice(0, 4);
+                // Also include the most recent Tier 4 entries -- these are written by the
+                // agent at session end (e.g. memory_tier_write Tier 4 "Consistency gate integrated...")
+                // and would otherwise be invisible to the briefing since they carry no session-end tag.
+                const tier4recent = this.memory.getTier(4).slice(-2);
+                const recentEntries = [...tier3, ...tier2disc, ...tier4recent].slice(0, 5);
                 if (recentEntries.length > 0) {
-                    const briefing = recentEntries.map(e => `- ${e.content.slice(0, 120)}`).join('\n');
+                    const briefing = recentEntries.map(e => `- ${e.content.slice(0, 200)}`).join('\n');
                     baseSystemWithMemory += `\n\n## Recent work (from memory)\n${briefing}\nUse this to avoid re-discovering facts already known.`;
                     logInfo(`[memory] Injected recent-work briefing: ${recentEntries.length} entries`);
                 }
@@ -6656,38 +6693,50 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     if (recoveredSig && recentRepeatCount >= 2) {
                         this._nativeRecoverySuppressCount = (this._nativeRecoverySuppressCount ?? 0) + 1;
                         logWarn(`[agent] Native tool call recovery suppressed — "${result.toolCalls[0].function.name}" with same args appeared ${recentRepeatCount}x recently (suppression #${this._nativeRecoverySuppressCount})`);
+                        const toolName2 = result.toolCalls[0].function.name;
                         if (this._nativeRecoverySuppressCount >= 3) {
-                            const toolName = result.toolCalls[0].function.name;
                             logWarn(`[agent] Hard-stopping native recovery loop after ${this._nativeRecoverySuppressCount} suppressions`);
                             post({ type: 'streamEnd' });
                             post({ type: 'removeLastAssistant' });
-                            post({ type: 'error', text: `⚠️ Agent stuck: \`${toolName}\` called with same/empty args ${recentRepeatCount}+ times and cannot self-correct. Try: "Use find_files to list files in the workspace, then read the file you need."` });
+                            const stuckHintMsg = toolName2 === 'run_command'
+                                ? `The command has been repeated ${recentRepeatCount}+ times without progress. Try a different command, or describe what you are trying to do.`
+                                : `Use find_files to list files in the workspace, then read the file you need.`;
+                            post({ type: 'error', text: `⚠️ Agent stuck: \`${toolName2}\` called with same/empty args ${recentRepeatCount}+ times and cannot self-correct. ${stuckHintMsg}` });
                             loopExhausted = false;
                             break;
                         }
-                        // Suppressed but not yet hard-stopping: inject a redirect that names
-                        // the actual workspace files so the model can emit a correct <tool> block.
+                        // Suppressed but not yet hard-stopping: inject a redirect.
+                        // For run_command, tell the model to try something different.
+                        // For file tools, list workspace files so it can emit a correct path.
                         toolCalls = [];
-                        const toolName2 = result.toolCalls[0].function.name;
-                        let fileList = '';
-                        try {
-                            const wsEntries = fs.readdirSync(this.workspaceRoot, { withFileTypes: true });
-                            fileList = wsEntries
-                                .filter(e => e.isFile() && !e.name.startsWith('.'))
-                                .map(e => `"${e.name}"`)
-                                .join(', ');
-                        } catch { /* ignore */ }
-                        const exampleFile = fileList ? fileList.split(',')[0].trim().replace(/^"|"$/g, '') : 'FILENAME';
-                        const exampleArgs = toolName2 === 'shell_read'
-                            ? `{"command":"cat ${exampleFile}"}`
-                            : `{"path":"${exampleFile}"}`;
-                        const fileHint = fileList
-                            ? `The workspace contains: ${fileList}. Output ONLY a <tool> block like: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`
-                            : `Output ONLY a <tool> block: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`;
-                        this.history.pop();
-                        this.history.push({ role: 'user', content: `[SYSTEM: You called ${toolName2} with no path. ${fileHint}]` });
-                        post({ type: 'removeLastAssistant' });
-                        logWarn(`[agent] Injecting file-list redirect for empty-args ${toolName2}`);
+                        if (toolName2 === 'run_command') {
+                            const lastArgs = result.toolCalls[0].function.arguments ?? {};
+                            const lastCmd = (lastArgs as Record<string, unknown>).command ?? '';
+                            this.history.pop();
+                            this.history.push({ role: 'user', content: `[SYSTEM: You called run_command with the same command "${lastCmd}" ${recentRepeatCount} times. That command is not working. Stop repeating it. Either try a different command to accomplish the same goal, or call write_file / edit_file to make the change directly without running a shell command.]` });
+                            post({ type: 'removeLastAssistant' });
+                            logWarn(`[agent] Injecting run_command retry-redirect for stuck command: ${lastCmd}`);
+                        } else {
+                            let fileList = '';
+                            try {
+                                const wsEntries = fs.readdirSync(this.workspaceRoot, { withFileTypes: true });
+                                fileList = wsEntries
+                                    .filter(e => e.isFile() && !e.name.startsWith('.'))
+                                    .map(e => `"${e.name}"`)
+                                    .join(', ');
+                            } catch { /* ignore */ }
+                            const exampleFile = fileList ? fileList.split(',')[0].trim().replace(/^"|"$/g, '') : 'FILENAME';
+                            const exampleArgs = toolName2 === 'shell_read'
+                                ? `{"command":"cat ${exampleFile}"}`
+                                : `{"path":"${exampleFile}"}`;
+                            const fileHint = fileList
+                                ? `The workspace contains: ${fileList}. Output ONLY a <tool> block like: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`
+                                : `Output ONLY a <tool> block: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`;
+                            this.history.pop();
+                            this.history.push({ role: 'user', content: `[SYSTEM: You called ${toolName2} with no path. ${fileHint}]` });
+                            post({ type: 'removeLastAssistant' });
+                            logWarn(`[agent] Injecting file-list redirect for empty-args ${toolName2}`);
+                        }
                         continue;
                     } else {
                         logInfo(`[agent] Recovered ${result.toolCalls.length} native tool call(s) from Ollama response in text-mode`);
@@ -6924,8 +6973,20 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // — it stalls silently (producing think-only or empty turns). The stall handler above
                 // (turnHasThinkOnly || turnIsEmpty) catches Qwen3 stalls; this handler catches gemma4's
                 // explicit self-stop messages. Both paths converge on the same circuit-breaker logic.
-                const MODEL_SELF_STOP_RE = /^\s*\[Generation stopped[\s—\-]/i;
-                if (!toolCalls.length && (MODEL_SELF_STOP_RE.test(displayContent) || MODEL_SELF_STOP_RE.test(result.content)) && this.autoRetryCount < this.effectiveMaxRetries) {
+                // Also catch plain-language self-stops the model emits when it decides it
+                // cannot proceed ("I'll stop", "I can't continue", "I'm stopping", etc.).
+                // These are the same class of event as gemma4's "[Generation stopped...]"
+                // messages — the model is bailing out mid-task — so they route through the
+                // same circuit-breaker retry path below rather than surfacing as a hard stop.
+                const MODEL_SELF_STOP_RE = /^\s*(\[Generation stopped[\s—\-]|I(?:'ll| will) stop|I(?:'m| am) stopping|I can'?t continue|I cannot continue|I'?ll stop here|I'?m unable to continue)/i;
+                // Mid-message fallback: catches self-stops after a brief summary.
+                // Only unambiguous phrases (no bare "I'll stop" / "I'm stopping"
+                // to avoid matching "I'll stop the server"). Requires sentence
+                // boundary before the phrase.
+                const MODEL_SELF_STOP_MID_RE = /(?:^|(?<=[.!?]\s))(?:\[Generation stopped[\s—\-]|I can'?t continue|I cannot continue|I'?ll stop here|I'?m unable to continue)/i;
+                const isSelfStop = MODEL_SELF_STOP_RE.test(displayContent) || MODEL_SELF_STOP_RE.test(result.content)
+                    || MODEL_SELF_STOP_MID_RE.test(displayContent) || MODEL_SELF_STOP_MID_RE.test(result.content);
+                if (!toolCalls.length && isSelfStop && this.autoRetryCount < this.effectiveMaxRetries) {
                     this.stopRef.stop = false; // Clear stop flag -- thinking-block abort leaves it set, which breaks the next iteration
                     this.autoRetryCount++;
                     this._consecutiveAborts++;
@@ -8870,6 +8931,62 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         } // end else (no safe translation)
                     }
                 }
+
+                // ── Consistency gate (R_sc) for mutating tools ──────────────
+                const MUTATING_TOOLS = new Set([
+                    'edit_file', 'edit_file_at_line', 'write_file',
+                    'run_command', 'shell_read',
+                ]);
+                const gateCfg = getConfig();
+                if (gateCfg.consistencyGateEnabled && MUTATING_TOOLS.has(name) && !this.stopRef.stop) {
+                    try {
+                        const K = Math.max(2, gateCfg.consistencyGateSamples);
+                        const gateModel = this.currentModel || gateCfg.model;
+                        const gatePrompt: OllamaMessage[] = [
+                            { role: 'system', content: 'You are a coding assistant. Restate in one sentence what the next tool call will do. Be specific about the file path and the change.' },
+                            { role: 'user', content: `The agent is about to call ${name} with args: ${JSON.stringify(args).slice(0, 500)}. Restate the intent in one sentence.` },
+                        ];
+                        const samples: string[] = [];
+                        for (let s = 0; s < K; s++) {
+                            if (this.stopRef.stop) break;
+                            try {
+                                const sampleResult = await streamChatRequest(
+                                    gateModel,
+                                    gatePrompt,
+                                    [],
+                                    () => {},
+                                    this.stopRef,
+                                    { numPredict: 64 },
+                                );
+                                samples.push(sampleResult.content.trim());
+                            } catch {
+                                // sample failed — skip
+                            }
+                        }
+                        if (samples.length >= 2) {
+                            const decision = evaluateGate(samples, {
+                                passThreshold: gateCfg.consistencyGatePass,
+                                blockThreshold: gateCfg.consistencyGateBlock,
+                            });
+                            if (decision.decision === 'BLOCK') {
+                                logWarn(`[gate] BLOCKED ${name}: ${decision.reason}`);
+                                this.history.push({
+                                    role: 'user',
+                                    content: `[consistency-gate] Tool "${name}" was BLOCKED. ${decision.reason}. The model's intent samples were inconsistent. Re-read the target file and re-derive the exact edit before retrying.`,
+                                });
+                                continue;
+                            } else if (decision.decision === 'REVIEW') {
+                                logWarn(`[gate] REVIEW ${name}: ${decision.reason}`);
+                            } else {
+                                logInfo(`[gate] PASS ${name}: ${decision.reason}`);
+                            }
+                        }
+                    } catch (gateErr) {
+                        logWarn(`[gate] Error during consistency gate for ${name}: ${toErrorMessage(gateErr)}`);
+                        // gate error → allow the tool to proceed
+                    }
+                }
+                // ── End consistency gate ─────────────────────────────────────
 
                 let toolResult: string;
                 try {

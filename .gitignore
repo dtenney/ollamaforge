@@ -9,3 +9,6 @@ __pycache__/
 
 # AI assistant local settings — machine-specific paths and credentials
 .claude/
+
+# Internal working docs — not for public
+plans/
