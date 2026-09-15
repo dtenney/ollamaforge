@@ -23,7 +23,7 @@ import { ingestMarkdownFiles } from './markdownIngest';
 import { CodeIndexer } from './codeIndex';
 import { ensureGitignore } from './codeGraph';
 import { ensureEnvironmentContext } from './environmentProbe';
-import { detectShellEnvironment } from './agent';
+import { detectShellEnvironment } from './agentShellEnv';
 import { runDreamCycle } from './dreamAgent';
 import { decayMap } from './systemMap';
 import { checkAll, formatReport, executeHeal, HealAction } from './stackHealth';

@@ -39,6 +39,8 @@ const SECRET_PATTERNS: { re: RegExp; marker: string }[] = [
     { re: /\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}/g, marker: '[REDACTED:JWT]' },
     // OpenAI-style keys
     { re: /\bsk-[A-Za-z0-9]{20,}\b/g, marker: '[REDACTED:OPENAI_KEY]' },
+    // High-entropy opaque tokens (40+ chars, mixed case+digits) — mirrors logger.ts
+    { re: /\b(?=[A-Za-z0-9+/]{40,}={0,2}\b)(?=[^=]*[0-9])(?=[^=]*[A-Za-z])[A-Za-z0-9+/]{40,}={0,2}\b/g, marker: '[REDACTED:TOKEN]' },
 ];
 
 /**

@@ -42,7 +42,7 @@ const BUILTIN_DENY: RegExp[] = [
     /\bdd\s+.*\bof=\/dev\//,                            // dd of=/dev/sda
     /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;/,             // fork bomb
     /\bshred\s+.*\/dev\//,                              // shred /dev/...
-    /\bchmod\s+(-[a-z]*\s+)?777\s+\/(\s|$)/,            // chmod -R 777 /
+    /\bchmod\s+(-[a-zA-Z]*\s+)?777\s+\/(\s|$)/,           // chmod -R 777 /
     /\bformat\s+[a-z]:/i,                               // format C:
     /\bRemove-Item\s+.*-Recurse\s+.*\/(home|Users)\b/i, // Remove-Item -Recurse /home
     /\bdrop\s+(database|table)\b/i,                     // SQL drop
@@ -164,17 +164,29 @@ export function checkEgress(cmd: string, allowlist?: string[]): string | null {
     if (!allowlist || allowlist.length === 0) return null;
 
     // Extract hosts from common network commands
-    const hostPatterns: RegExp[] = [
-        /(?:curl|wget|scp|sftp|ssh|nc|ncat|netcat)\s+(?:-[a-zA-Z]+\s+)*([a-zA-Z0-9._-]+)(?::\d+)?/,
-        /https?:\/\/([a-zA-Z0-9._-]+)/,
-        /git\s+(?:clone|push|pull|fetch)\s+(?:https?:\/\/)?([a-zA-Z0-9._-]+)/,
-    ];
-
     const hosts = new Set<string>();
-    for (const re of hostPatterns) {
-        const m = cmd.match(re);
-        if (m && m[1]) hosts.add(m[1].toLowerCase());
+
+    // 1. URL-based: http(s)://host — most reliable
+    const urlMatch = cmd.match(/https?:\/\/([a-zA-Z0-9._-]+)/);
+    if (urlMatch) hosts.add(urlMatch[1].toLowerCase());
+
+    // 2. scp/sftp: host is always immediately before ':/' in the remote path
+    if (/\b(scp|sftp)\b/.test(cmd)) {
+        const scpMatch = cmd.match(/([a-zA-Z0-9._-]+):\//);
+        if (scpMatch) hosts.add(scpMatch[1].toLowerCase());
     }
+
+    // 3. ssh: user@host or bare host (no colon-path)
+    const sshMatch = cmd.match(/\bssh\s+(?:-[a-zA-Z]+\s+)*(?:[\w.-]+@)?([a-zA-Z0-9._-]+)\b/);
+    if (sshMatch && !sshMatch[1].startsWith('-')) hosts.add(sshMatch[1].toLowerCase());
+
+    // 4. git clone/push/pull/fetch (without URL scheme)
+    const gitMatch = cmd.match(/git\s+(?:clone|push|pull|fetch)\s+(?:https?:\/\/)?(?:[\w.-]+@)?([a-zA-Z0-9._-]+)\b/);
+    if (gitMatch && !gitMatch[1].startsWith('-')) hosts.add(gitMatch[1].toLowerCase());
+
+    // 5. nc/ncat/netcat: nc host port
+    const ncMatch = cmd.match(/\b(?:nc|ncat|netcat)\s+(?:-[a-zA-Z]+\s+)*([a-zA-Z0-9._-]+)\b/);
+    if (ncMatch && !ncMatch[1].startsWith('-')) hosts.add(ncMatch[1].toLowerCase());
 
     // Localhost / loopback / private ranges are always allowed
     const isLocal = (h: string): boolean =>
