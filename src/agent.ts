@@ -10284,7 +10284,7 @@ If the code looks correct, respond with exactly: OK`;
                 if (this.shouldRunTests()) {
                     const testFile = this.findTestFile(full);
                     if (testFile) {
-                        const relTest = path.relative(root, testFile).replace(/\\/g, '/');
+                        const relTest = path.relative(this.workspaceRoot, testFile).replace(/\\/g, '/');
                         logInfo(`[test-runner] Running ${relTest}`);
                         const { passed, output } = this.runTestFile(testFile);
                         const icon = passed ? '[done]' : 'âŒ';
@@ -10498,7 +10498,7 @@ If the code looks correct, respond with exactly: OK`;
                                         } catch { return `  ${e.name}`; }
                                     });
                                 if (siblings.length > 0) {
-                                    const dirRel = path.relative(root, dir).replace(/\\/g, '/') || '.';
+                                    const dirRel = path.relative(this.workspaceRoot, dir).replace(/\\/g, '/') || '.';
                                     newFileDirNote = `\n\n[DIRECTORY: ${dirRel}/]\n${siblings.join('\n')}\n[END DIRECTORY]\nThese files already exist. Your new file will be added alongside them.`;
                                     logInfo(`[write_file] newFileDirNote injected for ${rel} (${siblings.length} siblings)`);
                                 }
@@ -10730,140 +10730,7 @@ if errors:
 
             // â"€â"€ edit_file_at_line â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'edit_file_at_line': {
-                // Sweep tasks must use edit_file (exact string matching) -- line numbers shift after each edit
-                // and cause corruption. Redirect to a helpful error so the model falls back to edit_file.
-                if (this._isSweepTask) {
-                    // If edit_file_at_line was auto-approved, carry that approval over to edit_file
-                    // so the user doesn't have to re-approve every edit when they clicked "Accept All"
-                    if (this._isToolApproved('edit_file_at_line')) {
-                        this._autoApprovedTools.add('edit_file');
-                    }
-                    return `edit_file_at_line is disabled for sweep tasks because line numbers shift after each edit and cause file corruption. Use edit_file with old_string/new_string instead -- copy the exact current function body from the file as old_string.`;
-                }
-
-                const rel2       = String(args.path ?? '');
-                const startLine  = Math.round(Number(args.start_line ?? 0));
-                const endLine    = Math.round(Number(args.end_line ?? 0));
-                // Accept new_string as an alias for new_content (models sometimes confuse the param name)
-                // Normalize CRLF so inserted lines don't introduce mixed endings.
-                const newContent = String(args.new_content ?? args.new_string ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-                if (!rel2)        { throw new Error('path is required'); }
-                if (!startLine)   { throw new Error('start_line is required'); }
-                if (endLine < startLine - 1) { throw new Error(`end_line (${endLine}) must be >= start_line - 1 (${startLine - 1})`); }
-
-                const full2    = this.safePath(root, rel2);
-                const original2 = fs.readFileSync(full2, 'utf8');
-                const lines2   = original2.split('\n');
-                const totalLines = lines2.length;
-
-                if (startLine < 1 || startLine > totalLines + 1) {
-                    throw new Error(`start_line ${startLine} is out of range (file has ${totalLines} lines)`);
-                }
-
-                // Build new file: lines before start, new_content, lines after end
-                const before  = lines2.slice(0, startLine - 1);
-                const after   = endLine >= startLine ? lines2.slice(endLine) : lines2.slice(startLine - 1);
-                let newLines = newContent === '' ? [] : newContent.split('\n');
-                // Auto-dedent: if every non-empty line in new_content has leading spaces but the
-                // start_line in the file is at col 0 (top-level def/decorator), strip the common indent.
-                // This prevents models from nesting functions by accidentally adding 4-space padding.
-                if (newLines.length > 0) {
-                    const targetLineIndent = (lines2[startLine - 1] ?? '').match(/^(\s*)/)?.[1]?.length ?? 0;
-                    const nonEmpty = newLines.filter(l => l.trim().length > 0);
-                    if (nonEmpty.length > 0) {
-                        const minIndent = Math.min(...nonEmpty.map(l => l.match(/^(\s*)/)?.[1]?.length ?? 0));
-                        if (minIndent > targetLineIndent) {
-                            const strip = minIndent - targetLineIndent;
-                            newLines = newLines.map(l => l.length >= strip && l.slice(0, strip).trim() === '' ? l.slice(strip) : l);
-                        }
-                    }
-                }
-                const newFile  = [...before, ...newLines, ...after].join('\n');
-
-                // If the file wouldn't change, the edit is already done -- skip and say so
-                if (newFile === original2) {
-                    return `Already done: lines ${startLine}-${endLine} in ${rel2} already contain the requested content. Mark this item [x] in your plan and move to the next unchecked item.`;
-                }
-
-                const replacedCount = endLine >= startLine ? endLine - startLine + 1 : 0;
-                const action = replacedCount === 0 ? 'insert' : 'replace';
-
-                const isAutoApproved3 = this._isToolApproved('edit_file_at_line');
-                if (!isAutoApproved3) {
-                    await this.diffViewManager.showDiffPreview(full2, original2, newFile);
-                }
-                const detail3 = action === 'insert'
-                    ? `Insert ${newLines.length} line(s) at line ${startLine} in "${rel2}"`
-                    : `Replace lines ${startLine}-${endLine} (${replacedCount} line(s)) in "${rel2}"`;
-                const accepted3 = await this.requestConfirmation('edit', detail3, 'edit_file_at_line');
-                if (!isAutoApproved3) { this.diffViewManager.closeDiffPreview(); }
-                if (!accepted3) { return 'Edit cancelled by user.'; }
-
-                fs.writeFileSync(full2, newFile, 'utf8');
-                this._recordFileOp({ path: rel2, originalContent: original2, action: 'edited' });
-                this.postFn({ type: 'fileChanged', path: rel2, action: 'edited' });
-                if (!this._filesChangedThisRun.includes(rel2)) { this._filesChangedThisRun.push(rel2); }
-                const editResult3 = action === 'insert'
-                    ? `Inserted ${newLines.length} line(s) at line ${startLine} in ${rel2}`
-                    : `Replaced lines ${startLine}-${endLine} with ${newLines.length} line(s) in ${rel2}`;
-                const isPyFile3 = path.extname(full2).toLowerCase() === '.py';
-                if (!isPyFile3) {
-                    const editDiags3 = this.getDiagnostics(root, rel2);
-                    if (editDiags3 !== 'No errors or warnings found.') {
-                        return `${editResult3}\n\nDiagnostics after edit:\n${editDiags3}`;
-                    }
-                }
-                const syntaxErr3 = this.syntaxCheck(full2);
-                if (syntaxErr3) {
-                    logWarn(`[syntax-check] ${rel2}: ${syntaxErr3.slice(0, 100)}`);
-                    this._guardEvents.push({ type: 'syntax-error', reason: syntaxErr3.slice(0, 120), file: rel2 });
-                    return `${editResult3}\n\nâš  Syntax error detected after edit:\n${syntaxErr3}\n\nFix this by calling edit_file again with corrected code.`;
-                }
-                // Signature-change caller awareness (same logic as edit_file handler):
-                // if a required parameter was added to a Python function, all callers will break.
-                {
-                    const oldLines2 = original2.split('\n').slice(startLine - 1, endLine).join('\n');
-                    const pyFnOld2 = oldLines2.match(/def\s+(\w+)\s*\(([^)]*)\)/);
-                    const pyFnNew2 = newContent.match(/def\s+(\w+)\s*\(([^)]*)\)/);
-                    if (pyFnOld2 && pyFnNew2 && pyFnOld2[1] === pyFnNew2[1] && pyFnOld2[2] !== pyFnNew2[2]) {
-                        const requiredParams2 = (paramStr: string) =>
-                            paramStr.split(',').map(p => p.trim()).filter(p => p && p !== 'self' && !p.includes('=') && !p.startsWith('*') && !p.startsWith('**'));
-                        const oldRequired2 = requiredParams2(pyFnOld2[2]);
-                        const newRequired2 = requiredParams2(pyFnNew2[2]);
-                        const addedRequired2 = newRequired2.filter(p => !oldRequired2.includes(p));
-                        if (addedRequired2.length > 0) {
-                            const sigNudge2 = `\n\n[IMPACT] You added required parameter(s) [${addedRequired2.join(', ')}] to \`${pyFnNew2[1]}\`. Every existing caller will now raise TypeError.\n\nRequired next step -- do this before any further edits:\n1. Run: grep -rn "${pyFnNew2[1]}(" . (excluding the file you just edited)\n2. List the results for the user in your next message\n3. Ask the user whether they want you to update the callers\n\nDo NOT silently update callers. Report the impact first and wait for confirmation.`;
-                            return `${editResult3}${sigNudge2}`;
-                        }
-                    }
-                }
-
-                if (this.shouldRunTests()) {
-                    const testFile2 = this.findTestFile(full2);
-                    if (testFile2) {
-                        const relTest2 = path.relative(root, testFile2).replace(/\\/g, '/');
-                        logInfo(`[test-runner] Running ${relTest2}`);
-                        const { passed: passed2, output: output2 } = this.runTestFile(testFile2);
-                        const icon2 = passed2 ? '[done]' : 'âŒ';
-                        return `${editResult3}\n\n${icon2} Tests (${relTest2}):\n${output2}`;
-                    }
-                }
-                // For sweep tasks: append fresh numbered file content so model has
-                // current line numbers for the next edit without needing to re-read.
-                if (this._currentTaskMessage && (
-                    /\b(all|every|each|any)\b.{0,40}\b(route|function|endpoint|def)\b/i.test(this._currentTaskMessage)
-                    || /\b(missing|without|lacks?|no\s+error|no\s+try)\b/i.test(this._currentTaskMessage)
-                    || /\b(add|fix).{0,30}\b(all|every|each|any)\b/i.test(this._currentTaskMessage)
-                )) {
-                    const updatedContent = fs.readFileSync(full2, 'utf8');
-                    const numberedLines = updatedContent.split('\n')
-                        .map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`)
-                        .join('\n');
-                    const planPath2 = rel2.replace(/[^/]+$/, '.ollamaforge-plan.md');
-                    return `${editResult3}\n\n[UPDATED FILE - fresh line numbers]\n${numberedLines}\n\n[SWEEP TASK] Next steps:\n1. Update the plan file "${planPath2}": mark the item you just finished as done (change "- [ ]" to "- [x]").\n2. Look at the updated file above. Find the NEXT unchecked route/function from your plan that is missing the change.\n3. Call edit_file_at_line for that function -- use start_line (the def line) through end_line (last line of function). Replace the ENTIRE function. Keep indentation at top level (no leading spaces on def/decorators).\n4. Repeat until all items in the plan are checked off.`;
-                }
-                return editResult3;
+                return this.executeEditFileAtLine(args);
             }
 
             // â"€â"€ gather_context â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -10933,7 +10800,7 @@ if errors:
                             const lineCount = fileContent.split('\n').length;
                             if (lineCount < LARGE_FILE_LINE_THRESHOLD) { continue; }
                             // File is large -- check for cached summary
-                            const relToRoot = path.relative(root, absFilePath).replace(/\\/g, '/');
+                            const relToRoot = path.relative(this.workspaceRoot, absFilePath).replace(/\\/g, '/');
                             const summaryPath = path.join(idxBaseDir, relToRoot + '.summary.md');
                             if (fs.existsSync(summaryPath)) {
                                 const summaryAge = Date.now() - fs.statSync(summaryPath).mtimeMs;
@@ -13229,94 +13096,7 @@ ${sampleHtml}
 
             // â"€â"€ workspace_index â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'workspace_index': {
-                const idxPaths: string[] = Array.isArray(args.paths) ? args.paths.map(String).filter(Boolean) : [];
-                if (idxPaths.length === 0) { return `[SYSTEM: workspace_index requires a non-empty "paths" array. Example: {"paths": ["loot/handshakes/*.22000"]}. For the current task, you do NOT need workspace_index -- just call run_command with the relevant script directly. If scripts/update_combined_handshakes.py exists, run it now.]`; }
-                const idxForce = Boolean(args.force ?? false);
-                const STALE_MS = 7 * 24 * 60 * 60 * 1000;
-                const idxDir = path.join(root, '.ollamaforge', 'index');
-                if (!fs.existsSync(idxDir)) { fs.mkdirSync(idxDir, { recursive: true }); }
-
-                const indexed: string[] = [];
-                const skipped: string[] = [];
-
-                for (const pattern of idxPaths) {
-                    // Resolve glob to actual files using simple recursive scan
-                    const absPattern = path.isAbsolute(pattern) ? pattern : path.join(root, pattern);
-                    let candidates: string[] = [];
-                    try {
-                        // Use shell_read-style find to list files matching the pattern
-                        const { execSync: execS } = require('child_process') as typeof import('child_process');
-                        const findCmd = `find "${root}" -type f -name "${path.basename(pattern)}" 2>/dev/null`;
-                        const out = execS(findCmd, { timeout: 10000, encoding: 'utf8' });
-                        candidates = out.split('\n').map(l => l.trim()).filter(Boolean);
-                    } catch {
-                        // Fall back to treating as literal file path
-                        if (fs.existsSync(absPattern)) { candidates = [absPattern]; }
-                    }
-
-                    for (const filePath of candidates) {
-                        let lineCount = 0;
-                        try { lineCount = fs.readFileSync(filePath, 'utf8').split('\n').length; } catch { continue; }
-                        if (lineCount < 200) { skipped.push(`${filePath} (${lineCount} lines -- too small)`); continue; }
-
-                        const relPath = path.relative(root, filePath).replace(/\\/g, '/');
-                        const summaryPath = path.join(idxDir, relPath + '.summary.md');
-                        const summaryDir = path.dirname(summaryPath);
-
-                        // Check freshness
-                        if (!idxForce && fs.existsSync(summaryPath)) {
-                            const age = Date.now() - fs.statSync(summaryPath).mtimeMs;
-                            if (age < STALE_MS) { skipped.push(`${relPath} (fresh summary exists)`); continue; }
-                        }
-
-                        if (!fs.existsSync(summaryDir)) { fs.mkdirSync(summaryDir, { recursive: true }); }
-
-                        // Build summary based on file type
-                        const ext = path.extname(filePath).toLowerCase();
-                        const now = new Date().toISOString().slice(0, 10);
-                        let summaryContent = `# Index: ${relPath}\n\nIndexed: ${now} | Lines: ${lineCount}\n\n`;
-
-                        try {
-                            const raw = fs.readFileSync(filePath, 'utf8');
-                            const lines = raw.split('\n');
-
-                            if (['.ts', '.js', '.py', '.go', '.java', '.cs', '.rs'].includes(ext)) {
-                                // Extract function/class/method signatures
-                                const sigPatterns = [
-                                    /^(export\s+)?(async\s+)?function\s+\w+/,
-                                    /^(export\s+)?(abstract\s+)?class\s+\w+/,
-                                    /^\s*(public|private|protected|async|static)?\s*(async\s+)?\w+\s*\([^)]*\)\s*[:{]/,
-                                    /^def\s+\w+/,
-                                    /^(pub\s+)?fn\s+\w+/,
-                                    /^func\s+\w+/,
-                                ];
-                                const sigs = lines.filter((l, i) => sigPatterns.some(p => p.test(l)) && i > 0)
-                                    .slice(0, 80)
-                                    .map(l => l.trim());
-                                summaryContent += `## Signatures\n\`\`\`\n${sigs.join('\n')}\n\`\`\`\n\n`;
-                                summaryContent += `## First 20 lines\n\`\`\`\n${lines.slice(0, 20).join('\n')}\n\`\`\`\n`;
-                            } else if (['.csv', '.tsv'].includes(ext)) {
-                                const header = lines[0] ?? '';
-                                const sampleLines = lines.slice(1, 6);
-                                summaryContent += `## Columns\n${header}\n\n## Sample rows (first 5)\n\`\`\`\n${sampleLines.join('\n')}\n\`\`\`\n\n`;
-                                summaryContent += `## Stats\n- Total rows: ${lineCount - 1}\n- Columns: ${header.split(',').length}\n`;
-                            } else if (['.json'].includes(ext)) {
-                                const preview = raw.slice(0, 800);
-                                summaryContent += `## Structure preview\n\`\`\`json\n${preview}\n\`\`\`\n`;
-                            } else {
-                                // Generic: first + last 15 lines
-                                summaryContent += `## First 15 lines\n\`\`\`\n${lines.slice(0, 15).join('\n')}\n\`\`\`\n\n`;
-                                summaryContent += `## Last 15 lines\n\`\`\`\n${lines.slice(-15).join('\n')}\n\`\`\`\n`;
-                            }
-                        } catch { summaryContent += '(could not read file for summary)\n'; }
-
-                        fs.writeFileSync(summaryPath, summaryContent, 'utf8');
-                        indexed.push(`${relPath} (${lineCount} lines)`);
-                    }
-                }
-
-                const result = [`Indexed ${indexed.length} file(s):`, ...indexed.map(f => `  [ok] ${f}`), skipped.length > 0 ? `Skipped ${skipped.length}: ${skipped.slice(0, 3).join(', ')}` : ''].filter(Boolean).join('\n');
-                return result || 'No files matched the provided paths.';
+                return this.executeWorkspaceIndex(args);
             }
 
             // â"€â"€ schedule_task â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -13388,67 +13168,7 @@ ${sampleHtml}
 
             // â"€â"€ system_map_update â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'system_map_update': {
-                // Default action to 'add_node' when omitted -- models frequently forget it
-                const smAction = String(args.action ?? (args.id || args.node_id ? 'add_node' : ''));
-                if (smAction === 'add_node') {
-                    // Accept node_id as alias for id -- models naturally use node_id
-                    const smId   = String(args.id ?? args.node_id ?? '').trim();
-                    const smType = String(args.type        ?? 'other').trim() as NodeType;
-                    const smLabel = String(args.label      ?? smId).trim();
-                    // Accept description from top-level or from inside properties/metadata object
-                    const rawProps = args.metadata ?? args.properties ?? {} as Record<string, string>;
-                    const smDesc  = String(args.description ?? (rawProps as any)?.description ?? '').trim();
-                    // Accept 'properties' as alias for 'metadata' -- models often use it
-                    const rawMeta = args.metadata ?? args.properties ?? {};
-                    const smMeta  = (rawMeta && typeof rawMeta === 'object')
-                        ? rawMeta as Record<string, string>
-                        : {};
-                    if (!smId) { throw new Error('system_map_update add_node: id is required'); }
-                    upsertNode({ id: smId, type: smType, label: smLabel, description: smDesc, metadata: smMeta });
-                    logInfo(`[system_map] Node upserted: ${smId} (${smType})`);
-
-                    // Auto-mirror key fact to Tier 0 memory so it survives fast lookup without
-                    // querying the system map. Bypasses the per-response rate limiter since this
-                    // is a system action, not a model-initiated write.
-                    if (this.memory) {
-                        try {
-                            // Build concise fact string: prefer path for workspaces, host/URL for services/machines.
-                            // Also check smId itself -- models sometimes use the path as the node id.
-                            const looksLikePath = (s: string) => /^[a-zA-Z]:[\\/]|^[/~]/.test(s);
-                            const pathFact = smMeta['path'] ?? smMeta['workspace_path']
-                                ?? (looksLikePath(smId) ? smId : '');
-                            const hostFact = smMeta['host'] ?? smMeta['url'] ?? smMeta['port'] ?? '';
-                            const factBase = pathFact || hostFact;
-                            // Use description from top-level or from metadata; fall back to label
-                            const descFact = smDesc || smMeta['description'] || smLabel;
-                            if (factBase) {
-                                const memContent = `${smLabel} (${smType}): ${descFact}. Path/host: ${factBase}`;
-                                const isDupe = await this.memory.isSemanticDuplicate(memContent, 0.85).catch(() => false);
-                                if (!isDupe) {
-                                    await this.memory.addEntry(0, memContent, [`system_map`, smType, smId]);
-                                    logInfo(`[system_map] Auto-mirrored Tier 0 memory for node "${smId}"`);
-                                }
-                            }
-                        } catch (memErr) {
-                            logInfo(`[system_map] Tier 0 auto-mirror skipped: ${toErrorMessage(memErr)}`);
-                        }
-                    }
-
-                    return `System map updated: node "${smLabel}" (${smType}) saved to ~/.ollamaforge/system-map.json`;
-
-                } else if (smAction === 'add_edge') {
-                    const smFrom  = String(args.from             ?? '').trim();
-                    const smTo    = String(args.to               ?? '').trim();
-                    const smEType = String(args.edge_type        ?? 'related').trim() as EdgeType;
-                    const smEDesc = String(args.edge_description ?? '').trim();
-                    if (!smFrom || !smTo) { throw new Error('system_map_update add_edge: from and to are required'); }
-                    upsertEdge({ from: smFrom, to: smTo, type: smEType, description: smEDesc });
-                    logInfo(`[system_map] Edge upserted: ${smFrom} -[${smEType}]-> ${smTo}`);
-                    return `System map updated: relationship "${smFrom}" ->[${smEType}]-> "${smTo}" saved`;
-
-                } else {
-                    throw new Error(`system_map_update: unknown action "${smAction}". Use "add_node" or "add_edge".`);
-                }
+                return this.executeSystemMapUpdate(args);
             }
 
             // â"€â"€ system_map_query â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -14776,7 +14496,7 @@ ${sampleHtml}
         for (const [uri, diags] of allDiags) {
             const filePath = uri.fsPath;
             if (!filePath.startsWith(root)) { continue; }
-            const rel = path.relative(root, filePath).replace(/\\/g, '/');
+            const rel = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
 
             for (const d of diags) {
                 if (d.severity > vscode.DiagnosticSeverity.Warning) { continue; }
@@ -14910,7 +14630,7 @@ ${sampleHtml}
                 const out = ((e.stdout ?? '') + (e.stderr ?? '')).trim();
                 if (!out) { return null; }
                 // Filter to only errors that mention this specific file
-                const relFile = path.relative(root, absPath).replace(/\\/g, '/');
+                const relFile = path.relative(this.workspaceRoot, absPath).replace(/\\/g, '/');
                 const relevantLines = out.split('\n')
                     .filter((l: string) => l.includes(relFile) || l.match(/error TS/))
                     .slice(0, 5);
@@ -14933,7 +14653,7 @@ ${sampleHtml}
         const ext = path.extname(absSourcePath);
         const base = path.basename(absSourcePath, ext);
         const dir  = path.dirname(absSourcePath);
-        const relDir = path.relative(root, dir).replace(/\\/g, '/');
+        const relDir = path.relative(this.workspaceRoot, dir).replace(/\\/g, '/');
 
         const candidates: string[] = [];
 
@@ -15224,6 +14944,301 @@ ${sampleHtml}
      *  Returns { path } on success, or { blocked } with a user-facing message. Shared by
      *  read_file (and any future tool that accepts an absolute/external path) so the
      *  policy lives in exactly one place. */
+    /** Execute the workspace_index tool. */
+    private async executeWorkspaceIndex(args: Record<string, unknown>): Promise<string> {
+        const root = this.workspaceRoot;
+        const idxPaths: string[] = Array.isArray(args.paths) ? args.paths.map(String).filter(Boolean) : [];
+        if (idxPaths.length === 0) { return `[SYSTEM: workspace_index requires a non-empty "paths" array. Example: {"paths": ["loot/handshakes/*.22000"]}. For the current task, you do NOT need workspace_index -- just call run_command with the relevant script directly. If scripts/update_combined_handshakes.py exists, run it now.]`; }
+        const idxForce = Boolean(args.force ?? false);
+        const STALE_MS = 7 * 24 * 60 * 60 * 1000;
+        const idxDir = path.join(root, '.ollamaforge', 'index');
+        if (!fs.existsSync(idxDir)) { fs.mkdirSync(idxDir, { recursive: true }); }
+
+        const indexed: string[] = [];
+        const skipped: string[] = [];
+
+        for (const pattern of idxPaths) {
+            // Resolve glob to actual files using simple recursive scan
+            const absPattern = path.isAbsolute(pattern) ? pattern : path.join(root, pattern);
+            let candidates: string[] = [];
+            try {
+                // Use shell_read-style find to list files matching the pattern
+                const { execSync: execS } = require('child_process') as typeof import('child_process');
+                const findCmd = `find "${root}" -type f -name "${path.basename(pattern)}" 2>/dev/null`;
+                const out = execS(findCmd, { timeout: 10000, encoding: 'utf8' });
+                candidates = out.split('\n').map(l => l.trim()).filter(Boolean);
+            } catch {
+                // Fall back to treating as literal file path
+                if (fs.existsSync(absPattern)) { candidates = [absPattern]; }
+            }
+
+            for (const filePath of candidates) {
+                let lineCount = 0;
+                try { lineCount = fs.readFileSync(filePath, 'utf8').split('\n').length; } catch { continue; }
+                if (lineCount < 200) { skipped.push(`${filePath} (${lineCount} lines -- too small)`); continue; }
+
+                const relPath = path.relative(root, filePath).replace(/\\/g, '/');
+                const summaryPath = path.join(idxDir, relPath + '.summary.md');
+                const summaryDir = path.dirname(summaryPath);
+
+                // Check freshness
+                if (!idxForce && fs.existsSync(summaryPath)) {
+                    const age = Date.now() - fs.statSync(summaryPath).mtimeMs;
+                    if (age < STALE_MS) { skipped.push(`${relPath} (fresh summary exists)`); continue; }
+                }
+
+                if (!fs.existsSync(summaryDir)) { fs.mkdirSync(summaryDir, { recursive: true }); }
+
+                // Build summary based on file type
+                const ext = path.extname(filePath).toLowerCase();
+                const now = new Date().toISOString().slice(0, 10);
+                let summaryContent = `# Index: ${relPath}\n\nIndexed: ${now} | Lines: ${lineCount}\n\n`;
+
+                try {
+                    const raw = fs.readFileSync(filePath, 'utf8');
+                    const lines = raw.split('\n');
+
+                    if (['.ts', '.js', '.py', '.go', '.java', '.cs', '.rs'].includes(ext)) {
+                        // Extract function/class/method signatures
+                        const sigPatterns = [
+                            /^(export\s+)?(async\s+)?function\s+\w+/,
+                            /^(export\s+)?(abstract\s+)?class\s+\w+/,
+                            /^\s*(public|private|protected|async|static)?\s*(async\s+)?\w+\s*\([^)]*\)\s*[:{]/,
+                            /^def\s+\w+/,
+                            /^(pub\s+)?fn\s+\w+/,
+                            /^func\s+\w+/,
+                        ];
+                        const sigs = lines.filter((l, i) => sigPatterns.some(p => p.test(l)) && i > 0)
+                            .slice(0, 80)
+                            .map(l => l.trim());
+                        summaryContent += `## Signatures\n\`\`\`\n${sigs.join('\n')}\n\`\`\`\n\n`;
+                        summaryContent += `## First 20 lines\n\`\`\`\n${lines.slice(0, 20).join('\n')}\n\`\`\`\n`;
+                    } else if (['.csv', '.tsv'].includes(ext)) {
+                        const header = lines[0] ?? '';
+                        const sampleLines = lines.slice(1, 6);
+                        summaryContent += `## Columns\n${header}\n\n## Sample rows (first 5)\n\`\`\`\n${sampleLines.join('\n')}\n\`\`\`\n\n`;
+                        summaryContent += `## Stats\n- Total rows: ${lineCount - 1}\n- Columns: ${header.split(',').length}\n`;
+                    } else if (['.json'].includes(ext)) {
+                        const preview = raw.slice(0, 800);
+                        summaryContent += `## Structure preview\n\`\`\`json\n${preview}\n\`\`\`\n`;
+                    } else {
+                        // Generic: first + last 15 lines
+                        summaryContent += `## First 15 lines\n\`\`\`\n${lines.slice(0, 15).join('\n')}\n\`\`\`\n\n`;
+                        summaryContent += `## Last 15 lines\n\`\`\`\n${lines.slice(-15).join('\n')}\n\`\`\`\n`;
+                    }
+                } catch { summaryContent += '(could not read file for summary)\n'; }
+
+                fs.writeFileSync(summaryPath, summaryContent, 'utf8');
+                indexed.push(`${relPath} (${lineCount} lines)`);
+            }
+        }
+
+        const result = [`Indexed ${indexed.length} file(s):`, ...indexed.map(f => `  [ok] ${f}`), skipped.length > 0 ? `Skipped ${skipped.length}: ${skipped.slice(0, 3).join(', ')}` : ''].filter(Boolean).join('\n');
+        return result || 'No files matched the provided paths.';
+    }
+    /** Execute the edit_file_at_line tool. */
+    private async executeEditFileAtLine(args: Record<string, unknown>): Promise<string> {
+        const root = this.workspaceRoot;
+        // Sweep tasks must use edit_file (exact string matching) -- line numbers shift after each edit
+        // and cause corruption. Redirect to a helpful error so the model falls back to edit_file.
+        if (this._isSweepTask) {
+            // If edit_file_at_line was auto-approved, carry that approval over to edit_file
+            // so the user doesn't have to re-approve every edit when they clicked "Accept All"
+            if (this._isToolApproved('edit_file_at_line')) {
+                this._autoApprovedTools.add('edit_file');
+            }
+            return `edit_file_at_line is disabled for sweep tasks because line numbers shift after each edit and cause file corruption. Use edit_file with old_string/new_string instead -- copy the exact current function body from the file as old_string.`;
+        }
+
+        const rel2       = String(args.path ?? '');
+        const startLine  = Math.round(Number(args.start_line ?? 0));
+        const endLine    = Math.round(Number(args.end_line ?? 0));
+        // Accept new_string as an alias for new_content (models sometimes confuse the param name)
+        // Normalize CRLF so inserted lines don't introduce mixed endings.
+        const newContent = String(args.new_content ?? args.new_string ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        if (!rel2)        { throw new Error('path is required'); }
+        if (!startLine)   { throw new Error('start_line is required'); }
+        if (endLine < startLine - 1) { throw new Error(`end_line (${endLine}) must be >= start_line - 1 (${startLine - 1})`); }
+
+        const full2    = this.safePath(root, rel2);
+        const original2 = fs.readFileSync(full2, 'utf8');
+        const lines2   = original2.split('\n');
+        const totalLines = lines2.length;
+
+        if (startLine < 1 || startLine > totalLines + 1) {
+            throw new Error(`start_line ${startLine} is out of range (file has ${totalLines} lines)`);
+        }
+
+        // Build new file: lines before start, new_content, lines after end
+        const before  = lines2.slice(0, startLine - 1);
+        const after   = endLine >= startLine ? lines2.slice(endLine) : lines2.slice(startLine - 1);
+        let newLines = newContent === '' ? [] : newContent.split('\n');
+        // Auto-dedent: if every non-empty line in new_content has leading spaces but the
+        // start_line in the file is at col 0 (top-level def/decorator), strip the common indent.
+        // This prevents models from nesting functions by accidentally adding 4-space padding.
+        if (newLines.length > 0) {
+            const targetLineIndent = (lines2[startLine - 1] ?? '').match(/^(\s*)/)?.[1]?.length ?? 0;
+            const nonEmpty = newLines.filter(l => l.trim().length > 0);
+            if (nonEmpty.length > 0) {
+                const minIndent = Math.min(...nonEmpty.map(l => l.match(/^(\s*)/)?.[1]?.length ?? 0));
+                if (minIndent > targetLineIndent) {
+                    const strip = minIndent - targetLineIndent;
+                    newLines = newLines.map(l => l.length >= strip && l.slice(0, strip).trim() === '' ? l.slice(strip) : l);
+                }
+            }
+        }
+        const newFile  = [...before, ...newLines, ...after].join('\n');
+
+        // If the file wouldn't change, the edit is already done -- skip and say so
+        if (newFile === original2) {
+            return `Already done: lines ${startLine}-${endLine} in ${rel2} already contain the requested content. Mark this item [x] in your plan and move to the next unchecked item.`;
+        }
+
+        const replacedCount = endLine >= startLine ? endLine - startLine + 1 : 0;
+        const action = replacedCount === 0 ? 'insert' : 'replace';
+
+        const isAutoApproved3 = this._isToolApproved('edit_file_at_line');
+        if (!isAutoApproved3) {
+            await this.diffViewManager.showDiffPreview(full2, original2, newFile);
+        }
+        const detail3 = action === 'insert'
+            ? `Insert ${newLines.length} line(s) at line ${startLine} in "${rel2}"`
+            : `Replace lines ${startLine}-${endLine} (${replacedCount} line(s)) in "${rel2}"`;
+        const accepted3 = await this.requestConfirmation('edit', detail3, 'edit_file_at_line');
+        if (!isAutoApproved3) { this.diffViewManager.closeDiffPreview(); }
+        if (!accepted3) { return 'Edit cancelled by user.'; }
+
+        fs.writeFileSync(full2, newFile, 'utf8');
+        this._recordFileOp({ path: rel2, originalContent: original2, action: 'edited' });
+        this.postFn({ type: 'fileChanged', path: rel2, action: 'edited' });
+        if (!this._filesChangedThisRun.includes(rel2)) { this._filesChangedThisRun.push(rel2); }
+        const editResult3 = action === 'insert'
+            ? `Inserted ${newLines.length} line(s) at line ${startLine} in ${rel2}`
+            : `Replaced lines ${startLine}-${endLine} with ${newLines.length} line(s) in ${rel2}`;
+        const isPyFile3 = path.extname(full2).toLowerCase() === '.py';
+        if (!isPyFile3) {
+            const editDiags3 = this.getDiagnostics(root, rel2);
+            if (editDiags3 !== 'No errors or warnings found.') {
+                return `${editResult3}\n\nDiagnostics after edit:\n${editDiags3}`;
+            }
+        }
+        const syntaxErr3 = this.syntaxCheck(full2);
+        if (syntaxErr3) {
+            logWarn(`[syntax-check] ${rel2}: ${syntaxErr3.slice(0, 100)}`);
+            this._guardEvents.push({ type: 'syntax-error', reason: syntaxErr3.slice(0, 120), file: rel2 });
+            return `${editResult3}\n\nâš  Syntax error detected after edit:\n${syntaxErr3}\n\nFix this by calling edit_file again with corrected code.`;
+        }
+        // Signature-change caller awareness (same logic as edit_file handler):
+        // if a required parameter was added to a Python function, all callers will break.
+        {
+            const oldLines2 = original2.split('\n').slice(startLine - 1, endLine).join('\n');
+            const pyFnOld2 = oldLines2.match(/def\s+(\w+)\s*\(([^)]*)\)/);
+            const pyFnNew2 = newContent.match(/def\s+(\w+)\s*\(([^)]*)\)/);
+            if (pyFnOld2 && pyFnNew2 && pyFnOld2[1] === pyFnNew2[1] && pyFnOld2[2] !== pyFnNew2[2]) {
+                const requiredParams2 = (paramStr: string) =>
+                    paramStr.split(',').map(p => p.trim()).filter(p => p && p !== 'self' && !p.includes('=') && !p.startsWith('*') && !p.startsWith('**'));
+                const oldRequired2 = requiredParams2(pyFnOld2[2]);
+                const newRequired2 = requiredParams2(pyFnNew2[2]);
+                const addedRequired2 = newRequired2.filter(p => !oldRequired2.includes(p));
+                if (addedRequired2.length > 0) {
+                    const sigNudge2 = `\n\n[IMPACT] You added required parameter(s) [${addedRequired2.join(', ')}] to \`${pyFnNew2[1]}\`. Every existing caller will now raise TypeError.\n\nRequired next step -- do this before any further edits:\n1. Run: grep -rn "${pyFnNew2[1]}(" . (excluding the file you just edited)\n2. List the results for the user in your next message\n3. Ask the user whether they want you to update the callers\n\nDo NOT silently update callers. Report the impact first and wait for confirmation.`;
+                    return `${editResult3}${sigNudge2}`;
+                }
+            }
+        }
+
+        if (this.shouldRunTests()) {
+            const testFile2 = this.findTestFile(full2);
+            if (testFile2) {
+                const relTest2 = path.relative(root, testFile2).replace(/\\/g, '/');
+                logInfo(`[test-runner] Running ${relTest2}`);
+                const { passed: passed2, output: output2 } = this.runTestFile(testFile2);
+                const icon2 = passed2 ? '[done]' : 'âŒ';
+                return `${editResult3}\n\n${icon2} Tests (${relTest2}):\n${output2}`;
+            }
+        }
+        // For sweep tasks: append fresh numbered file content so model has
+        // current line numbers for the next edit without needing to re-read.
+        if (this._currentTaskMessage && (
+            /\b(all|every|each|any)\b.{0,40}\b(route|function|endpoint|def)\b/i.test(this._currentTaskMessage)
+            || /\b(missing|without|lacks?|no\s+error|no\s+try)\b/i.test(this._currentTaskMessage)
+            || /\b(add|fix).{0,30}\b(all|every|each|any)\b/i.test(this._currentTaskMessage)
+        )) {
+            const updatedContent = fs.readFileSync(full2, 'utf8');
+            const numberedLines = updatedContent.split('\n')
+                .map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`)
+                .join('\n');
+            const planPath2 = rel2.replace(/[^/]+$/, '.ollamaforge-plan.md');
+            return `${editResult3}\n\n[UPDATED FILE - fresh line numbers]\n${numberedLines}\n\n[SWEEP TASK] Next steps:\n1. Update the plan file "${planPath2}": mark the item you just finished as done (change "- [ ]" to "- [x]").\n2. Look at the updated file above. Find the NEXT unchecked route/function from your plan that is missing the change.\n3. Call edit_file_at_line for that function -- use start_line (the def line) through end_line (last line of function). Replace the ENTIRE function. Keep indentation at top level (no leading spaces on def/decorators).\n4. Repeat until all items in the plan are checked off.`;
+        }
+        return editResult3;
+    }
+    /** Execute the system_map_update tool. */
+    private async executeSystemMapUpdate(args: Record<string, unknown>): Promise<string> {
+        const root = this.workspaceRoot;
+        // Default action to 'add_node' when omitted -- models frequently forget it
+        const smAction = String(args.action ?? (args.id || args.node_id ? 'add_node' : ''));
+        if (smAction === 'add_node') {
+            // Accept node_id as alias for id -- models naturally use node_id
+            const smId   = String(args.id ?? args.node_id ?? '').trim();
+            const smType = String(args.type        ?? 'other').trim() as NodeType;
+            const smLabel = String(args.label      ?? smId).trim();
+            // Accept description from top-level or from inside properties/metadata object
+            const rawProps = args.metadata ?? args.properties ?? {} as Record<string, string>;
+            const smDesc  = String(args.description ?? (rawProps as any)?.description ?? '').trim();
+            // Accept 'properties' as alias for 'metadata' -- models often use it
+            const rawMeta = args.metadata ?? args.properties ?? {};
+            const smMeta  = (rawMeta && typeof rawMeta === 'object')
+                ? rawMeta as Record<string, string>
+                : {};
+            if (!smId) { throw new Error('system_map_update add_node: id is required'); }
+            upsertNode({ id: smId, type: smType, label: smLabel, description: smDesc, metadata: smMeta });
+            logInfo(`[system_map] Node upserted: ${smId} (${smType})`);
+
+            // Auto-mirror key fact to Tier 0 memory so it survives fast lookup without
+            // querying the system map. Bypasses the per-response rate limiter since this
+            // is a system action, not a model-initiated write.
+            if (this.memory) {
+                try {
+                    // Build concise fact string: prefer path for workspaces, host/URL for services/machines.
+                    // Also check smId itself -- models sometimes use the path as the node id.
+                    const looksLikePath = (s: string) => /^[a-zA-Z]:[\\/]|^[/~]/.test(s);
+                    const pathFact = smMeta['path'] ?? smMeta['workspace_path']
+                        ?? (looksLikePath(smId) ? smId : '');
+                    const hostFact = smMeta['host'] ?? smMeta['url'] ?? smMeta['port'] ?? '';
+                    const factBase = pathFact || hostFact;
+                    // Use description from top-level or from metadata; fall back to label
+                    const descFact = smDesc || smMeta['description'] || smLabel;
+                    if (factBase) {
+                        const memContent = `${smLabel} (${smType}): ${descFact}. Path/host: ${factBase}`;
+                        const isDupe = await this.memory.isSemanticDuplicate(memContent, 0.85).catch(() => false);
+                        if (!isDupe) {
+                            await this.memory.addEntry(0, memContent, [`system_map`, smType, smId]);
+                            logInfo(`[system_map] Auto-mirrored Tier 0 memory for node "${smId}"`);
+                        }
+                    }
+                } catch (memErr) {
+                    logInfo(`[system_map] Tier 0 auto-mirror skipped: ${toErrorMessage(memErr)}`);
+                }
+            }
+
+            return `System map updated: node "${smLabel}" (${smType}) saved to ~/.ollamaforge/system-map.json`;
+
+        } else if (smAction === 'add_edge') {
+            const smFrom  = String(args.from             ?? '').trim();
+            const smTo    = String(args.to               ?? '').trim();
+            const smEType = String(args.edge_type        ?? 'related').trim() as EdgeType;
+            const smEDesc = String(args.edge_description ?? '').trim();
+            if (!smFrom || !smTo) { throw new Error('system_map_update add_edge: from and to are required'); }
+            upsertEdge({ from: smFrom, to: smTo, type: smEType, description: smEDesc });
+            logInfo(`[system_map] Edge upserted: ${smFrom} -[${smEType}]-> ${smTo}`);
+            return `System map updated: relationship "${smFrom}" ->[${smEType}]-> "${smTo}" saved`;
+
+        } else {
+            throw new Error(`system_map_update: unknown action "${smAction}". Use "add_node" or "add_edge".`);
+        }
+    }
     private async resolvePathWithPolicy(rawPath: string, toolName: string): Promise<{ path: string } | { blocked: string }> {
         try {
             return { path: this.safePath(this.workspaceRoot, rawPath) };
