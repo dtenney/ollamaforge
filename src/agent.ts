@@ -7322,7 +7322,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         || /\bRemove-Item\b|\bClear-Content\b/i.test(cmdStr0)
                         || /(?<![0-9])>\s*[\w\\/:.]+\.(db|sqlite|sqlite3|json|csv|log|conf|cfg|env)\b/.test(cmdStr0) // overwrite redirect, not 2>/dev/null
                     );
-                    if (isDestructiveCmd && !this._isToolApproved('run_command_destructive')) {
+                    // Skip destructive guard if commandPolicy already confirmed this command
+                    // (policy.verdict === 'confirm' was already approved above — don't ask twice).
+                    const policyAlreadyConfirmed = policy.verdict === 'confirm';
+                    if (isDestructiveCmd && !policyAlreadyConfirmed && !this._isToolApproved('run_command_destructive')) {
                         logInfo(`[destructive-guard] Destructive command requires confirmation: ${cmdStr0.slice(0, 80)}`);
                         // Destructive ops always ask per-occurrence — no Accept All button.
                         const confirmed = await this.requestConfirmation(
