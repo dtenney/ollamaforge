@@ -7787,10 +7787,27 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             const _cmdNotFoundMatch = _failText.match(/(?:bash|sh|zsh): line \d+: (\S+): command not found/);
                             const _missingCmd = _cmdNotFoundMatch?.[1] ?? '';
                             if (_isSshCmd && _missingCmd) {
-                                _failHint = `SSH non-interactive shells do not source ~/.bashrc or ~/.profile, so "${_missingCmd}" is not on PATH even if it works interactively. Fix by one of:\n` +
-                                    `1. Find the full path: ssh ... "which ${_missingCmd} || find ~/.local/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null | head -5"\n` +
-                                    `2. Source the profile: ssh ... "source ~/.bashrc && ${_missingCmd} ..."\n` +
-                                    `3. Use the full path directly once found (e.g. ~/.local/bin/${_missingCmd})`;
+                                const _dbClients: Record<string, string> = {
+                                    mysql: 'apt-get install -y mysql-client  # or: mariadb-client',
+                                    mysqldump: 'apt-get install -y mysql-client',
+                                    psql: 'apt-get install -y postgresql-client',
+                                    pg_dump: 'apt-get install -y postgresql-client',
+                                    'redis-cli': 'apt-get install -y redis-tools',
+                                    mongo: 'apt-get install -y mongodb-clients',
+                                    mongodump: 'apt-get install -y mongodb-clients',
+                                };
+                                const _dbInstall = _dbClients[_missingCmd];
+                                if (_dbInstall) {
+                                    _failHint = `"${_missingCmd}" client is not installed on the remote host (this is separate from the server package). Options:\n` +
+                                        `1. Install it: ssh ... "sudo ${_dbInstall}"\n` +
+                                        `2. Verify server-side access instead: ssh ... "sudo systemctl status ${_missingCmd.replace(/-cli$|-dump$/, '')} 2>/dev/null || sudo journalctl -u ${_missingCmd.replace(/-cli$|-dump$/, '')} -n 20"\n` +
+                                        `3. Find any existing client binary: ssh ... "which ${_missingCmd} || find /usr/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null"`;
+                                } else {
+                                    _failHint = `SSH non-interactive shells do not source ~/.bashrc or ~/.profile, so "${_missingCmd}" is not on PATH even if it works interactively. Fix by one of:\n` +
+                                        `1. Find the full path: ssh ... "which ${_missingCmd} || find ~/.local/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null | head -5"\n` +
+                                        `2. Source the profile: ssh ... "source ~/.bashrc && ${_missingCmd} ..."\n` +
+                                        `3. Use the full path directly once found (e.g. ~/.local/bin/${_missingCmd})`;
+                                }
                             } else {
                                 _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
                             }
@@ -7866,7 +7883,11 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         // even though it exited non-zero) — repeated partial-success runs are not stuck loops.
                         const cbIsTimeout = toolResult.includes('timed out after');
                         const cbIsPartialSuccess = /\b(CLEANED|DONE|OK|SUCCESS|installed|created|started|stopped|deployed|wrote|updated)\b/i.test(toolResult.slice(-300));
-                        if (!isTextMode && name === 'run_command' && !cbIsTimeout && !cbIsPartialSuccess) {
+                        // Skip circuit breaker for not-found errors on SSH commands — the taxonomy hint
+                        // already gives the agent 3 specific recovery paths. Retrying the exact same
+                        // command makes no sense (it will always fail), so counting failures is noise.
+                        const cbIsNotFoundSsh = _failClass === 'not-found' && /^ssh\s/.test(String(args.command ?? '').trim());
+                        if (!isTextMode && name === 'run_command' && !cbIsTimeout && !cbIsPartialSuccess && !cbIsNotFoundSsh) {
                             const cmdSigCB = String(args.command ?? '').toLowerCase().trim().slice(0, 200);
                             const cbCount = (this._failedCommandSignatures.get(cmdSigCB) ?? 0) + 1;
                             this._failedCommandSignatures.set(cmdSigCB, cbCount);
