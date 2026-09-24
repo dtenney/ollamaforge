@@ -1663,6 +1663,8 @@ export class Agent {
      *  Capped at 500 entries (oldest evicted) to prevent unbounded growth in long sessions. */
     private _filesReadThisSession = new Set<string>();
     private readonly MAX_FILES_READ_SESSION = 500;
+    /** Per-path read counts for this run — reset each user message. Used to detect same-file re-read loops. */
+    private _pathReadCountsThisRun = new Map<string, number>();
     /** Track last successfully written file path -- used to detect write_file -> write_file spirals */
     private _lastWrittenFilePath = '';
     /** All paths written this session -- persists across runs to catch cross-turn rewrite spirals */
@@ -1940,6 +1942,7 @@ export class Agent {
     private _activePlanFile: string | null = null;
     /** True once the plan-file completion guard has fired this run — prevents a nudge spiral */
     private _planStopGuardFiredThisRun: boolean = false;
+    private _velocityNudgeFiredThisRun: boolean = false;
     /** Absolute path of the active PROJECT.md (project-level tracker), or null if none */
     private _activeProjectFile: string | null = null;
     /** Turn number when the project context was last injected — throttles re-injection */
@@ -2815,10 +2818,12 @@ export class Agent {
         this._projectStopGuardFiredThisRun = false; // Reset project stop guard so it can fire once per user message
         this._planStopGuardFiredThisRun = false;    // Reset plan-file completion guard so it can fire once per user message
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
+        this._velocityNudgeFiredThisRun = false;     // Reset velocity check so it fires once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._editContextInjected = false;     // Reset read-then-act flag
         this._editsThisRun = 0;                // Reset per-turn edit counter (session total in _totalEditsThisSession)
         this._readOnlyTurnsSinceLastEdit = 0;  // Reset read-only turn counter -- fresh budget each user message
+        this._pathReadCountsThisRun.clear();   // Reset per-path read counts for same-file loop detection
         // Detect auto-continuations so we don't reset loop-detection state across them.
         // "keep going" / "keep going from <path>" are injected by continueTask; [TASK N/M] by multi-task.
         // Preserving fingerprints + gather-stall count across these prevents the novelty detector
@@ -4561,6 +4566,25 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     logWarn(`[context-drift] Context files changed during session: ${changedFiles.join(', ')}`);
                     const driftMsg = `[SYSTEM: The following project context files have changed on disk since this session started: ${changedFiles.join(', ')}. The project conventions or architecture may have been updated. Continue using the conventions you were given, but be aware that new rules may apply. The user may need to start a new session to pick up the changes.]`;
                     this.history.push({ role: 'user', content: driftMsg });
+                }
+            }
+
+            // ── Velocity check ────────────────────────────────────────────────────
+            // If the task appears to be an edit/write task (agent has called read tools
+            // but zero write tools after 12+ turns), inject a one-time nudge to stop
+            // gathering and start acting. This catches over-researching before the
+            // read-saturation guard fires (which is per-tool-call, not per-turn).
+            // Only fires once per run to avoid spiraling into nudge loops.
+            if (turn === 12 && this._editsThisRun === 0 && !this._isSweepTask
+                && this._toolCallsThisRun.length >= 6
+                && !this._velocityNudgeFiredThisRun) {
+                const readToolCount = this._toolCallsThisRun.filter(t =>
+                    t.name === 'read_file' || t.name === 'shell_read' || t.name === 'find_files' || t.name === 'search_files'
+                ).length;
+                if (readToolCount >= 4) {
+                    this._velocityNudgeFiredThisRun = true;
+                    logWarn(`[agent] Velocity check: ${turn} turns, 0 writes, ${readToolCount} reads — injecting act nudge`);
+                    this.history.push({ role: 'user', content: `[SYSTEM: You have spent ${turn} turns reading and researching with no file changes. If this is a write/edit task, you have enough context — stop reading and make the change now. Call write_file or edit_file with your changes. If this is a pure research or Q&A task, write your answer to the user and stop.]` });
                 }
             }
 
@@ -6765,6 +6789,18 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 const tcPath = String(args.path ?? args.file_path ?? args.command ?? args.query ?? args.url ?? '') || undefined;
                 this._toolCallsThisRun.push({ name, path: tcPath });
                 this._consecutiveAborts = 0; // model made a real tool call -- abort streak is over
+
+                // ── Per-path re-read tracker ───────────────────────────────────────────
+                // Count how many times this run the model has read the same file path.
+                // Nudge appended to tool result on 4th+ read (see toolResultForHistory section below).
+                if ((name === 'read_file' || (name === 'shell_read' && /\bcat\b/.test(String(args.command ?? '')))) && tcPath && !this._isSweepTask) {
+                    const normPath = tcPath.replace(/\\/g, '/').toLowerCase();
+                    this._pathReadCountsThisRun.set(normPath, (this._pathReadCountsThisRun.get(normPath) ?? 0) + 1);
+                }
+                // Clear path read count when a write/edit to that path succeeds
+                if ((name === 'write_file' || name === 'edit_file' || name === 'edit_file_at_line') && tcPath) {
+                    this._pathReadCountsThisRun.delete(tcPath.replace(/\\/g, '/').toLowerCase());
+                }
                 // Also decay autoRetryCount on successful tool calls so long autonomous runs
                 // don't exhaust the budget across multiple phases from a single user message.
                 if (this.autoRetryCount > 0) { this.autoRetryCount = Math.max(0, this.autoRetryCount - 1); }
@@ -8910,6 +8946,16 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         const omitted = toolResultForHistory.length - 6500 - 1500;
                         toolResultForHistory = `${head}\n\n[...${omitted} chars omitted...]\n\n${tail}`;
                     }
+                    // Same-path re-read nudge (text mode)
+                    if (tcPath && !this._isSweepTask) {
+                        const _normPath = tcPath.replace(/\\/g, '/').toLowerCase();
+                        const _readCount = this._pathReadCountsThisRun.get(_normPath) ?? 0;
+                        if (_readCount >= 4) {
+                            logWarn(`[agent] Same-path re-read (text): "${_normPath}" read ${_readCount}x — appending action nudge`);
+                            this._pathReadCountsThisRun.set(_normPath, 0); // reset so it fires again after 4 more
+                            toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${tcPath}" ${_readCount} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
+                        }
+                    }
                     this.history.push({
                         role: 'user',
                         content: `Tool ${name} returned:\n${toolResultForHistory}\n---\n${nudge}${deferredReminder}${this.buildOrientationAnchor(name)}`,
@@ -8967,6 +9013,16 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     const hasProgressSignal = toolResultForHistory.includes('[PROGRESS]');
                     if (isReadOrSshTool && isMultiStepTask && isProgressCheckpoint && !hasProgressSignal) {
                         toolResultForHistory += `\n\n[PROGRESS CHECK] You have now made ${callCount} tool calls. Before calling the next tool, write 1-2 sentences for the user summarizing what you have found so far. The user cannot see tool outputs -- they are waiting for your update.`;
+                    }
+                    // Same-path re-read nudge (native mode)
+                    if (tcPath && !this._isSweepTask) {
+                        const _normPath2 = tcPath.replace(/\\/g, '/').toLowerCase();
+                        const _readCount2 = this._pathReadCountsThisRun.get(_normPath2) ?? 0;
+                        if (_readCount2 >= 4) {
+                            logWarn(`[agent] Same-path re-read (native): "${_normPath2}" read ${_readCount2}x — appending action nudge`);
+                            this._pathReadCountsThisRun.set(_normPath2, 0);
+                            toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${tcPath}" ${_readCount2} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
+                        }
                     }
 
                     this.history.push({ role: 'tool', content: toolResultForHistory });
