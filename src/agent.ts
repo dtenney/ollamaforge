@@ -884,6 +884,9 @@ function stableStringify(value: unknown): unknown {
 }
 
 
+/** Pre-compiled: JSON inside markdown code blocks — ```json\n{...}\n``` */
+const CODE_BLOCK_JSON_RE = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?```/gi;
+
 /** Parse <tool>...</tool> blocks, raw JSON, or JSON in markdown code blocks from text-mode model output. */
 function parseTextToolCalls(text: string): OllamaToolCall[] {
     const calls: OllamaToolCall[] = [];
@@ -1158,9 +1161,9 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
 
     // Try JSON inside markdown code blocks: ```json\n{...}\n```
     if (calls.length === 0) {
-        const codeBlockRegex = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?```/gi;
+        CODE_BLOCK_JSON_RE.lastIndex = 0;
         let match: RegExpExecArray | null;
-        while ((match = codeBlockRegex.exec(text)) !== null) {
+        while ((match = CODE_BLOCK_JSON_RE.exec(text)) !== null) {
             try {
                 const parsed = JSON.parse(match[1]);
                 addCall(parsed, 'markdown code block');
@@ -2426,6 +2429,8 @@ export class Agent {
         if (this.trustLevel === 'normal') {
             // Normal: toolName sent from webview is the exact command string for run_command,
             // or a tool name for non-command tools. Store in command set if it looks like a command.
+            // Cap at 200 entries — evict oldest to prevent unbounded growth in very long sessions
+            if (this._approvedCommandStrings.size >= 200) { this._approvedCommandStrings.delete(this._approvedCommandStrings.values().next().value!); }
             this._approvedCommandStrings.add(toolName);
             logInfo(`[agent] Normal-mode: approved command string "${toolName.slice(0, 80)}" for this session`);
         } else {
@@ -2827,6 +2832,7 @@ export class Agent {
         this._planStopGuardFiredThisRun = false;    // Reset plan-file completion guard so it can fire once per user message
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
+        this._preExecCache.clear();            // Reset pre-exec cache -- stale entries from prior run waste memory
         this._editContextInjected = false;     // Reset read-then-act flag
         this._editsThisRun = 0;                // Reset per-turn edit counter (session total in _totalEditsThisSession)
         this._readOnlyTurnsSinceLastEdit = 0;  // Reset read-only turn counter -- fresh budget each user message
@@ -4703,8 +4709,12 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         logInfo(`[context] Synchronous WIP snapshot saved to Tier 2 (${wipLines.length} lines)`);
                     }
 
-                    // Core compaction: shrink + compact + anti-thrash
-                    const compactOutcome = this.performCoreCompaction(contextStats, post);
+                    // Core compaction: shrink + compact + anti-thrash.
+                    // Pass accurateStats (not the heuristic contextStats) so the
+                    // target-token budget and the system/memory token counts handed
+                    // to compactHistory match the accurate counts we just used to
+                    // decide to compact. modelLimit is identical either way.
+                    const compactOutcome = this.performCoreCompaction(accurateStats, post);
                     if (compactOutcome.shouldBreak) { break; }
                     const { messagesRemoved, autoDropped } = compactOutcome;
 
@@ -9493,6 +9503,8 @@ If the code looks correct, respond with exactly: OK`;
             if (this._preExecCache.has(key)) { return; }
             logInfo(`[2.6] Pre-executing read-only tool mid-stream: ${name}`);
             const result = await this.executeTool(name, args, `preexec_${name}`);
+            // Cap at 40 entries — evict oldest to prevent unbounded memory growth in long runs
+            if (this._preExecCache.size >= 40) { this._preExecCache.delete(this._preExecCache.keys().next().value!); }
             this._preExecCache.set(key, result);
         } catch { /* malformed block -- ignore, main loop will parse it */ }
     }
