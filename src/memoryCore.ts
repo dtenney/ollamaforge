@@ -837,10 +837,18 @@ export class TieredMemoryManager {
             // The local fallback path (searchLocal) uses the same formula for consistent ranking.
             const now = Date.now();
             const LN2 = Math.LN2;
+            // Composite recall score (borrowed from row-bot memory_policy.py):
+            //   semantic (embedding) 0.75  +  lexical (keyword overlap) 0.25
+            // then modulated by recency. This lifts exact-term matches that the
+            // embedding only partially captured, matching row-bot's 0.25 lexical weight.
+            const W_SEMANTIC = 0.75;
+            const W_LEXICAL  = 0.25;
             const entries: MemoryEntry[] = results.map(r => {
                 const lastAccessedMs = r.payload.timestamp ? new Date(r.payload.timestamp).getTime() : now;
                 const daysOld        = Math.max(0, (now - lastAccessedMs) / 86_400_000);
                 const recency        = 0.5 + 0.5 * Math.exp(-daysOld / 90 * LN2);
+                const lexical        = this.lexicalOverlap(query, r.payload.content);
+                const base           = W_SEMANTIC * r.score + W_LEXICAL * lexical;
                 return {
                     id: r.id,
                     tier: r.payload.tier as 0 | 1 | 2 | 3 | 4 | 5,
@@ -849,14 +857,14 @@ export class TieredMemoryManager {
                     lastAccessed: r.payload.timestamp,
                     accessCount: r.payload.accessCount,
                     tags: r.payload.tags,
-                    relevanceScore: r.score * recency
+                    relevanceScore: base * recency
                 };
             });
 
             // Re-sort after recency adjustment (Qdrant returns by raw score; order may shift slightly)
             entries.sort((a, b) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0));
 
-            logInfo(`[memory] Semantic search for "${query}" returned ${entries.length} results (recency-boosted)`);
+            logInfo(`[memory] Semantic search for "${query}" returned ${entries.length} results (semantic+lexical+recency)`);
             return entries;
         } catch (error) {
             logError(`[memory] Semantic search failed: ${toErrorMessage(error)}`);
@@ -979,6 +987,24 @@ export class TieredMemoryManager {
             }
         }
 
+        // ── [SESSION CONTEXT] — wip-sync entries: always inject the most recent compaction snapshot ──
+        // These are saved at auto-compact time and contain what was being worked on + command results.
+        // They must surface regardless of semantic relevance so the agent always knows its prior state.
+        const wipEntries = [
+            ...core.tier_1_essential,
+            ...core.tier_2_operational,
+        ].filter(e => e.tags?.includes('wip-sync') && !isSuppressed(e))
+         .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+         .slice(0, 2); // most recent 2 WIP snapshots
+        const shownWipIds = new Set<string>();
+        if (wipEntries.length > 0 && addLine('\n[SESSION CONTEXT]\n')) {
+            for (const entry of wipEntries) {
+                if (!addLine(`- ${entry.content}\n`)) { break; }
+                shownWipIds.add(entry.id);
+                this.recordAccess(entry.id, 'passive_load');
+            }
+        }
+
         // ── [RELEVANT MEMORY] — semantic/keyword search across remaining tiers ──
         if (userMessage && userMessage.trim()) {
             try {
@@ -995,6 +1021,7 @@ export class TieredMemoryManager {
                     const shownIds = new Set([
                         ...core.tier_0_critical.map(e => e.id),
                         ...seededEntries.map(e => e.id),
+                        ...shownWipIds,
                     ]);
                     // isSuppressed check here uses local-tier fields only; Qdrant results
                     // may lack these fields, so we gate on what's available (undefined = not suppressed).
@@ -1316,6 +1343,21 @@ export class TieredMemoryManager {
      *   Floor of 0.5 ensures old entries are never fully suppressed by age alone.
      * Invalidated and validUntil-expired entries are excluded.
      */
+    /**
+     * Lexical overlap score (0..1) between a query and a text. Borrowed from
+     * row-bot's memory_policy.py, which weights lexical recall at 0.25 alongside
+     * semantic similarity. Measures the fraction of significant query terms
+     * present in the text — boosts exact-term matches even when the embedding
+     * is only a partial match.
+     */
+    private lexicalOverlap(query: string, text: string): number {
+        const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+        if (words.length === 0) { return 0; }
+        const hay = text.toLowerCase();
+        const hits = words.filter(w => hay.includes(w)).length;
+        return hits / words.length;
+    }
+
     private searchLocal(query: string, tier?: number, limit: number = 5): MemoryEntry[] {
         const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
         if (words.length === 0) { return []; }

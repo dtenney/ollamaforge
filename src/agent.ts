@@ -4,15 +4,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as http from 'http';
 import * as https from 'https';
+import * as crypto from 'crypto';
 import { spawn, execSync, execFileSync } from 'child_process';
 
-import { streamChatRequest, OllamaMessage, OllamaToolCall, StreamResult, ToolsNotSupportedError } from './ollamaClient';
+import { streamChatRequest, OllamaMessage, OllamaToolCall, StreamResult, ToolsNotSupportedError, setContextWarnPostFn } from './ollamaClient';
 import { getConfig, getSearchConfig, getComfyUIConfig } from './config';
 import { logInfo, logError, logWarn, toErrorMessage } from './logger';
 import { buildWorkspaceSummary, clearWorkspaceSummaryCache, SKIP_DIRS, detectPythonEnvironment, formatPythonEnvironment, PythonEnvironment } from './workspace';
 import { TieredMemoryManager, MemoryEntry } from './memoryCore';
 import { isMCPTool, parseMCPToolName, callMCPTool, mcpToolsToOllamaFormat } from './mcpClient';
-import { calculateContextStats, calculateContextStatsAccurate, compactHistory, shrinkLargeToolMessages, ContextLevel, resolveModelContextLimit } from './contextCalculator';
+import { calculateContextStats, calculateContextStatsAccurate, compactHistory, shrinkLargeToolMessages, ContextLevel, ContextStats, resolveModelContextLimit } from './contextCalculator';
 import { DiffViewManager } from './diffView';
 import { CodeIndexer } from './codeIndex';
 import { MultiFileRefactoringManager, RefactoringPlan } from './multiFileRefactor';
@@ -24,7 +25,7 @@ import { appendSessionLog, GuardEvent, ToolCallRecord } from './sessionLog';
 import { upsertNode, upsertEdge, queryMap, formatMapAsText, formatMapAsMermaid, NodeType, EdgeType } from './systemMap';
 import type { ActiveTaskState } from './chatStorage';
 import { CodeGraph, loadRouterMd, generateRouterMd, isRouterMdStale } from './codeGraph';
-import { evaluateCommand, checkEgress, CommandPolicyConfig } from './commandPolicy';
+import { evaluateCommand, checkEgress, checkBuiltinBlock, CommandPolicyConfig } from './commandPolicy';
 import { redactSecrets, containsSecret } from './secretRedaction';
 import { validatePythonImports, formatImportWarning, validateDoctests, formatDoctestWarning, probeRegistry, formatRegistryWarning, RegistryProbeResult } from './importResolver';
 import { classifyIntent, IntentResult } from './core/promptIntentClassifier';
@@ -257,7 +258,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'run_command',
-            description: `Run a shell command that may MODIFY files or state. Requires user confirmation. Use for: running tests, linting, installing dependencies, building, running scripts, npm/pip install, make, etc. For read-only commands (git log, ls, cat, etc.) prefer shell_read instead.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH -- use bash/Unix commands. NEVER use PowerShell cmdlets (Get-ChildItem, Set-Content, etc.) for local operations -- use bash equivalents (find, cat, cp, mv, rm, mkdir). SSH/remote commands are fine as-is.' : ''} Destructive operations (rm, delete, overwrite) require prior listing and user confirmation. Dry-run first for any script that moves/renames/deletes files. Result includes [CWD: ...] for orientation.`,
+            description: `Run a shell command. Use for any action step: building, testing, linting, deploying, flashing firmware, installing packages, running migrations, restarting services, pushing to git, running scripts, or any other command that advances the task. For read-only commands (git log, ls, cat, grep, etc.) prefer shell_read instead.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH -- use bash/Unix commands. NEVER use PowerShell cmdlets (Get-ChildItem, Set-Content, etc.) for local operations -- use bash equivalents (find, cat, cp, mv, rm, mkdir). SSH/remote commands are fine as-is.' : ''} Run action commands directly — do not hand them back to the user. Only pause before permanently destructive operations with no recovery path (dropping a production database, wiping a disk, deleting backups). Result includes [CWD: ...] for orientation.`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -324,7 +325,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_tier_write',
-            description: 'Save ONE atomic piece of information to a specific memory tier. When user provides multiple pieces of information, call this tool MULTIPLE TIMES (once per concept). Use appropriate tier: 0=critical (IPs, URLs, ports, paths, credentials), 1=essential (frameworks, tools, deployment processes, hosting), 2=operational (current work, bugs), 3=collaboration (conventions, workflows), 4=references (past solutions).',
+            description: 'Save ONE atomic piece of information to a specific memory tier. When user provides multiple pieces of information, call this tool MULTIPLE TIMES (once per concept). Use appropriate tier: 0=critical (IPs, URLs, ports, paths, credentials, serial ports like /dev/ttyUSB0, baud rates, device names/configs, tool paths like ~/.local/bin/esphome, firmware locations), 1=essential (frameworks, tools, deployment processes, hosting), 2=operational (current work, bugs), 3=collaboration (conventions, workflows), 4=references (past solutions). IMPORTANT: Save device-specific facts (baud rate, serial port, flash method, device name) to tier 0 as soon as they are discovered — do not wait for the user to ask.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -853,6 +854,34 @@ export const TOOL_CONTEXT_COST: Record<string, ToolContextCost> = {
 
 // repairToolJson, fixRawNewlinesInJson, extractEditFileArgs, extractJsonStringValue
 // now live in ./agentToolJsonRepair (imported above).
+
+
+/**
+ * Canonical digest of a tool call (name + args) for no-progress detection.
+ * Steal from row-bot (agent_budget.py): hash a stable JSON serialization of
+ * (tool_name, args) so that repeated identical calls can be counted.
+ */
+function toolCallDigest(name: string, args: Record<string, unknown>): string {
+    // Sort keys for a stable canonical form regardless of insertion order.
+    const canonical = JSON.stringify({ name, args: stableStringify(args) });
+    return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+}
+
+/** Recursively sort object keys so JSON.stringify is order-independent. */
+function stableStringify(value: unknown): unknown {
+    if (Array.isArray(value)) {
+        return value.map(stableStringify);
+    }
+    if (value && typeof value === 'object') {
+        const obj = value as Record<string, unknown>;
+        const sorted: Record<string, unknown> = {};
+        for (const k of Object.keys(obj).sort()) {
+            sorted[k] = stableStringify(obj[k]);
+        }
+        return sorted;
+    }
+    return value;
+}
 
 
 /** Parse <tool>...</tool> blocks, raw JSON, or JSON in markdown code blocks from text-mode model output. */
@@ -1617,7 +1646,7 @@ export class Agent {
     private readonly MAX_EDIT_SIGNATURE_CACHE = 300;
     /** Track total edit_file failures per file path regardless of old_string variation */
     private _failedEditByFile = new Map<string, number>();
-    private readonly MAX_FILE_EDIT_FAILURES = 3;
+    private readonly MAX_FILE_EDIT_FAILURES = 2;
     /** Files where edit_file is hard-blocked after too many failures -- model must use write_file */
     private _editFileHardBlocked = new Set<string>();
     /** Track the new_string of the last successful edit per file -- used to detect revert-and-redo spirals.
@@ -1681,6 +1710,7 @@ export class Agent {
      *  their own guard. See OLLAMA_LOOP_BUG.md -- gemma4 backtick format loops. */
     private _unparsedToolTurns = 0;
     private readonly MAX_UNPARSED_TOOL_TURNS = 3;
+    private _preDraftRecoveryAttempts = 0;
     private consecutiveSameToolCalls = 0;
     /**
      * Sliding window of recent tool call signatures (tool_name + args hash).
@@ -1777,6 +1807,7 @@ export class Agent {
     private _editsThisRun = 0; // count of successful file edits in current agent turn
     private _totalEditsThisSession = 0; // cumulative edits across all turns this chat session
     private _lastEditedFilePath: string = ''; // path of last successfully edited file
+    private _lastAttemptedEditPath: string = ''; // path of last attempted edit (even on failure)
     private _lastReadFilePath: string = '';    // path of last successfully read file (used for path auto-recovery)
     private _wasReviewTask: boolean = false;   // true if the most recent non-confirmation turn was a review task
     private _lastEditedSnippet: string = '';   // snippet feedback from last successful edit (for re-read interception)
@@ -1811,6 +1842,8 @@ export class Agent {
     private _autoApprovedTools = new Set<string>();
     /** Tool names permanently approved via trust level -- never cleared between turns. */
     private _trustedTools = new Set<string>();
+    /** Exact command strings approved via Normal-mode "Accept All" -- session-scoped, not cleared between turns. */
+    private _approvedCommandStrings = new Set<string>();
     /** Per-instance tool allowlist -- null means all tools allowed. Set by delegate_task to
      *  restrict subagents without touching the global static middleware chain. */
     private _allowedTools: Set<string> | null = null;
@@ -1879,6 +1912,10 @@ export class Agent {
     private _lastWebFetchTurn: number = -1;
     /** Set when the last web content matched imperative/injection patterns (1.1) */
     private _webFetchImperative: boolean = false;
+    /** No-progress detector (steal from row-bot agent_budget.py): canonical digest of the last tool call. */
+    private _lastToolDigest: string = '';
+    /** Consecutive count of identical (name+args) tool calls. Reset when a different call runs. */
+    private _repeatToolCount: number = 0;
     /** How the current run ended -- set by stop() or error path, reset at run start */
     private _runOutcome: 'done' | 'error' | 'stopped' = 'done';
     /** Critic model for the current run (resolved from routing config at run start) */
@@ -2370,14 +2407,22 @@ export class Agent {
         }
     }
 
-    /** Resolve confirmation AND auto-approve all future calls to this tool name */
+    /** Resolve confirmation AND auto-approve all future calls.
+     *  Normal mode: toolName is the exact command string — approve just that command.
+     *  Trust mode: toolName is the tool name — approve the whole tool (used for non-destructive edits etc).
+     *  YOLO: never called (YOLO auto-approves in requestConfirmation before any prompt). */
     resolveConfirmationAll(toolName: string): void {
-        // Add to _trustedTools (persists across user turns) AND _autoApprovedTools (current run).
-        // Previously only _autoApprovedTools was set, which got cleared on each new user message,
-        // causing "Accept All" to stop working after the user sent the next message.
-        this._trustedTools.add(toolName);
-        this._autoApprovedTools.add(toolName);
-        logInfo(`[agent] Permanently approved "${toolName}" for this session`);
+        if (this.trustLevel === 'normal') {
+            // Normal: toolName sent from webview is the exact command string for run_command,
+            // or a tool name for non-command tools. Store in command set if it looks like a command.
+            this._approvedCommandStrings.add(toolName);
+            logInfo(`[agent] Normal-mode: approved command string "${toolName.slice(0, 80)}" for this session`);
+        } else {
+            // Trust: approve the whole tool class
+            this._trustedTools.add(toolName);
+            this._autoApprovedTools.add(toolName);
+            logInfo(`[agent] Trust-mode: approved tool "${toolName}" for this session`);
+        }
         this.resolveConfirmation(true);
     }
 
@@ -2406,6 +2451,11 @@ export class Agent {
         return this._trustedTools.has(toolName) || this._autoApprovedTools.has(toolName);
     }
 
+    /** Returns true if an exact command string was approved via Normal-mode "Accept All this command". */
+    private _isCommandApproved(cmd: string): boolean {
+        return this._approvedCommandStrings.has(cmd.trim());
+    }
+
     /** Current trust/autonomy level -- controls both tool auto-approval and proceed-question behavior. */
     trustLevel: 'normal' | 'trust' | 'yolo' = 'normal';
 
@@ -2425,6 +2475,7 @@ export class Agent {
     clearAutoApprovals(): void {
         this._trustedTools.clear();
         this._autoApprovedTools.clear();
+        this._approvedCommandStrings.clear();
         logInfo('[agent] Auto-approvals cleared');
     }
 
@@ -2433,6 +2484,12 @@ export class Agent {
      *  @param toolName -- the tool name, used for "Accept All" batch approval.
      */
     private requestConfirmation(action: string, detail: string, toolName?: string): Promise<boolean> {
+        // YOLO: auto-approve everything — no prompts ever
+        if (this.trustLevel === 'yolo') {
+            logInfo(`[agent] YOLO auto-approved: ${toolName ?? action}`);
+            this.postFn({ type: 'autoApproved', action, detail });
+            return Promise.resolve(true);
+        }
         // If this tool was approved via trust level or "Accept All", skip the UI prompt
         if (toolName && this._isToolApproved(toolName)) {
             logInfo(`[agent] Auto-approved: ${toolName} (trusted=${this._trustedTools.has(toolName)})`);
@@ -2454,7 +2511,10 @@ export class Agent {
             // stops the agent, or sends a new message (which calls rejectPendingConfirmation).
             this._confirmTimeout = null;
             const confirmId = `confirm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-            this.postFn({ type: 'confirmAction', id: confirmId, action, detail, toolName: toolName ?? action });
+            // Pass trustLevel so webview knows whether to show Accept All button:
+            // Normal: show Accept All (scoped to this command string)
+            // Trust: hide Accept All (destructive ops always ask per-occurrence)
+            this.postFn({ type: 'confirmAction', id: confirmId, action, detail, toolName: toolName ?? action, trustLevel: this.trustLevel });
         });
     }
 
@@ -2540,6 +2600,8 @@ export class Agent {
         this._externalStop = false;
         this.postFn  = post;
         this.currentModel = model; // Store current model for accurate context calculations
+        // Register post function so context-length warnings appear in the chat UI
+        setContextWarnPostFn(post);
         this._currentTaskMessage = userMessage; // Capture task for use in tool interception
 
         // â"€â"€ Safety: deferred loop.done â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -2548,81 +2610,14 @@ export class Agent {
         // exitReason is overwritten at natural exit points; stays 'error' on crash.
         let _loopExitReason: 'complete' | 'stop' | 'exhausted' | 'error' = 'error';
         const _runStart = Date.now();
-        const _ensureStop = () => {
-            // Warn about uncollected async subagent handles -- model called delegate_task_async
-            // but never called delegate_task_await. The subagents may still be running.
-            if (this._asyncHandles.size > 0) {
-                logWarn(`[delegate_task_async] ${this._asyncHandles.size} uncollected handle(s) at run end: ${[...this._asyncHandles.keys()].join(', ')}`);
-                this._asyncHandles.clear();
-            }
-            // If the run stopped because a confirmation timed out (user stepped away),
-            // post a visible message explaining what was pending so the user knows what
-            // to approve when they return.
-            if (this._confirmTimedOut) {
-                post({ type: 'token', text: '\n\n*Paused -- waiting for your approval. The pending edit is shown above. Click Accept to apply it, or send a new message to continue.* ' });
-                post({ type: 'assistantMessage', content: '' });
-            }
-            post({ type: 'runEnd', reason: _loopExitReason, durationMs: Date.now() - _runStart });
-        };
-        // We use a flag instead of try/finally to avoid wrapping 7000+ lines.
-        // _ensureStop() is called at every exit path below. Any path that does NOT
-        // call it will leave _loopExitReason='error' and the webview will surface it.
-        void _ensureStop; // used at end of run()
+        const _ensureStop = () => this.ensureStop(_loopExitReason, _runStart, post);
 
-        // Conflicting requirements detection: if the user's message contains patterns that
-        // suggest two requirements that cannot both be satisfied without a trade-off,
-        // annotate the message with a conflict note so the agent surfaces it before acting.
-        let conflictNote = '';
-        {
-            const conflictPairs: Array<[RegExp, RegExp, string]> = [
-                [
-                    /\bnot\s+null\b/i,
-                    /\bbackward.?compat|don'?t\s+break\s+existing|existing\s+(?:db|database|callers?|code)\b/i,
-                    'Adding a NOT NULL column without a DEFAULT breaks existing databases on ALTER TABLE -- existing rows have no value for the new column. Before editing: tell the user this conflict, propose a resolution (e.g. use DEFAULT \'unknown\', or drop NOT NULL), and ask which they prefer.'
-                ],
-                [
-                    /\badd\s+(?:a\s+)?(?:required|mandatory)\s+(?:field|column|parameter)\b/i,
-                    /\bdon'?t\s+break|existing\s+callers?\b/i,
-                    'A required field/parameter will break all existing callers -- these requirements conflict.'
-                ],
-            ];
-            for (const [patA, patB, note] of conflictPairs) {
-                if (patA.test(userMessage) && patB.test(userMessage)) {
-                    logInfo(`[conflict-detect] Conflicting requirements detected in task message`);
-                    conflictNote = `\n\n[CONFLICTING REQUIREMENTS] ${note}\n\nBefore editing any files: tell the user about this conflict in one sentence, propose your resolution (e.g. use DEFAULT NULL, or add a migration), and ask if that is acceptable. Do not edit until confirmed.`;
-                    break;
-                }
-            }
-        }
+        const conflictNote = this.detectConflictingRequirements(userMessage);
 
 
-        // Pre-classify model: known text-mode families skip detection entirely (no toast, no wasted turn)
-        if (this.toolMode === 'native') {
-            if (Agent.isKnownTextModeModel(model)) {
-                this.toolMode = 'text';
-                Agent.textModeModels.add(model);
-                logInfo(`Model ${model} -> text-mode (known family, no detection needed)`);
-                // No modeSwitch notification -- user doesn't need to see this
-            } else if (Agent.textModeModels.has(model)) {
-                this.toolMode = 'text';
-                logInfo(`Model ${model} -> text-mode (learned from previous session)`);
-                // No notification -- already established, no surprise
-            }
-        }
+        this.preClassifyModelMode(model);
         
-        // Trim history BEFORE adding new message to prevent exceeding limit.
-        // If context is already at 16%+ of the model's window, trim more aggressively
-        // to give the new turn enough headroom. At 20%+ with 100 messages, Ollama can
-        // abort the stream at turn 0 due to OOM or server-side timeout.
-        const contextPct = this._lastContextPct ?? 0;
-        const effectiveMax = contextPct >= 16
-            ? Math.floor(this.MAX_HISTORY_MESSAGES * 0.6)  // 60 messages when context is high
-            : this.MAX_HISTORY_MESSAGES;
-        if (this.history.length >= effectiveMax) {
-            const removed = this.history.length - effectiveMax;
-            this.history = this.history.slice(-effectiveMax);
-            logInfo(`[agent] History trimmed: removed ${removed} old messages (ctx=${contextPct.toFixed(1)}%, cap=${effectiveMax})`);
-        }
+        this.trimHistoryForContext();
         
         // Detect if user message is a short confirmation ("yes", "go ahead", etc.)
         // and inject an action nudge so the model starts calling tools immediately.
@@ -2733,64 +2728,7 @@ export class Agent {
             }
         }
         // ── Workspace snapshot injection ───────────────────────────────────────────────
-        // When the user asks to modify or create files, inject a directory listing for
-        // the relevant area so the model knows exactly what exists before it starts.
-        // This is proactive context -- prevents the model from hallucinating filenames
-        // or creating duplicates because it didn't know what was already there.
-        if (!isConfirmation && this.workspaceRoot) {
-            try {
-                const isFileTask = /\b(edit|modify|update|change|fix|write|create|add|build|implement|refactor|make|adjust|rebuild|redo|redo|rewrite)\b/i.test(userMessage);
-                if (isFileTask) {
-                    // Extract directory hints from the message (e.g. "docs/prototype/handheld_base.scad" → "docs/prototype")
-                    const pathMentions = userMessage.match(/(?:[A-Za-z]:[\\/]|\.\.?[\\/]|[\w-]+\/)+[\w.-]+\.[\w]+/g) ?? [];
-                    const dirHints = pathMentions.map(p => path.dirname(p.replace(/\\/g, '/'))).filter(d => d !== '.');
-                    // Also look for bare extension mentions to know which file types are relevant
-                    const extMentions = (userMessage.match(/\.(py|ts|js|scad|yaml|yml|json|md|html|css|go|rs|java|rb|txt|sh)\b/gi) ?? [])
-                        .map(e => e.toLowerCase());
-
-                    // Determine the directory to snapshot
-                    let snapshotDir = this.workspaceRoot;
-                    if (dirHints.length > 0) {
-                        const candidate = path.join(this.workspaceRoot, dirHints[0]);
-                        if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
-                            snapshotDir = candidate;
-                        }
-                    }
-
-                    const skipDirsSnap = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build', '.ollamaforge', '.cache']);
-                    const entries = fs.readdirSync(snapshotDir, { withFileTypes: true });
-                    const lines: string[] = [];
-                    for (const e of entries) {
-                        if (e.name.startsWith('.') || skipDirsSnap.has(e.name)) { continue; }
-                        const eFull = path.join(snapshotDir, e.name);
-                        if (e.isDirectory()) {
-                            lines.push(`  ${e.name}/`);
-                        } else {
-                            // Only show files matching the mentioned extension if any were mentioned
-                            const extMatch = extMentions.length === 0 || extMentions.some(ext => e.name.toLowerCase().endsWith(ext));
-                            if (!extMatch) { continue; }
-                            let lineCount = '';
-                            try {
-                                const lc = fs.readFileSync(eFull, 'utf8').split('\n').length;
-                                lineCount = ` (${lc} lines)`;
-                            } catch { /* skip */ }
-                            lines.push(`  ${e.name}${lineCount}`);
-                        }
-                        if (lines.length >= 40) { lines.push('  ... (more files)'); break; }
-                    }
-
-                    if (lines.length > 0 && lines.length <= 40) {
-                        const dirRel = path.relative(this.workspaceRoot, snapshotDir).replace(/\\/g, '/') || '.';
-                        const snapshotNote = `\n\n[WORKSPACE: ${dirRel}/]\n${lines.join('\n')}\n[END WORKSPACE]\nThese are the actual files on disk. Use exact filenames -- do not guess or reconstruct from memory.`;
-                        const lastEntry = this.history[this.history.length - 1];
-                        if (lastEntry && lastEntry.role === 'user' && typeof lastEntry.content === 'string') {
-                            lastEntry.content += snapshotNote;
-                            logInfo(`[workspace-snapshot] Injected ${lines.length} entries from ${dirRel}`);
-                        }
-                    }
-                }
-            } catch { /* non-fatal -- snapshot is best-effort */ }
-        }
+        this.injectWorkspaceSnapshot(userMessage, isConfirmation);
 
         this.userTurnCount++;
         // Auto-learn correction rules from user feedback.
@@ -2868,6 +2806,7 @@ export class Agent {
         this.consecutiveFailures = 0;          // Reset consecutive failure counter (BUG-09: stale across runs)
         this.consecutiveRepeats = 0;           // Reset consecutive repeat counter (BUG-09: stale across runs)
         this._unparsedToolTurns = 0;           // Reset unparsed-tool-output loop counter (OLLAMA_LOOP_BUG)
+        this._preDraftRecoveryAttempts = 0;    // Reset pre-draft recovery counter
         this._historyPoisonReverts = 0;        // Reset history-poisoning revert counter
         // NOTE: _failedEditSignatures intentionally NOT cleared between turns -- persistent across
         // the session so the same broken old_string doesn't retry indefinitely across user replies.
@@ -2955,6 +2894,7 @@ export class Agent {
         this._compactionRatios = [];
         this._contextDriftWarned = false;
         this._lastEditedFilePath = '';
+        this._lastAttemptedEditPath = '';
         this._lastReadFilePath = '';
         this._lastEditedSnippet = '';
         // NOTE: _lastWrittenFilePath is intentionally NOT reset between runs -- persists
@@ -2966,6 +2906,8 @@ export class Agent {
         this._guardEvents = [];
         this._filesChangedThisRun = [];
         this._runTurnCount = 0;
+        this._lastToolDigest = '';
+        this._repeatToolCount = 0;
         this._runOutcome = 'done';
         this._confirmTimedOut = false;
         this._currentRunModel = model;
@@ -3842,14 +3784,21 @@ export class Agent {
         }
 
         const cfg = getConfig();
+        // When the context window is already full before any work can start (early-compaction
+        // stall), fall back to the compact small-model prompt so the plan ledger + task
+        // description can actually fit. Skip all verbose addendums below.
+        const _useSlimPrompt = this._earlyCompactionStalls >= 1;
         let baseSystemContent = cfg.systemPrompt.trim()
-            || (this._isSmallModel
+            || (_useSlimPrompt || this._isSmallModel
                 ? buildSmallModelSystemPrompt(this.workspaceRoot)
                 : await buildSystemPromptAsync(cfg.autoSaveMemory, this.workspaceRoot));
+        if (_useSlimPrompt) {
+            logInfo(`[context] Early-compaction stall #${this._earlyCompactionStalls} — using slim system prompt`);
+        }
 
         // ── Intent-based context strategy ─────────────────────────────────────
         const intentResult: IntentResult = classifyIntent(userMessage);
-        if (intentResult.intent !== 'general') {
+        if (!_useSlimPrompt && intentResult.intent !== 'general') {
             logInfo(`[intent] ${intentResult.intent} (confidence=${intentResult.confidence}) — prioritize: ${intentResult.contextPriorities.join(', ')} | skip: ${intentResult.contextSkips.join(', ') || 'none'}`);
             baseSystemContent += `\n\n## CONTEXT STRATEGY (intent: ${intentResult.intent})
 Prioritize these context sources: ${intentResult.contextPriorities.join(', ')}.
@@ -3863,7 +3812,7 @@ Adapt your tool calls accordingly — e.g. if git_diff is skipped, do not call s
         }
 
         // â"€â"€ Security scan addendum â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        if (isSecurityScan) {
+        if (!_useSlimPrompt && isSecurityScan) {
             baseSystemContent += `\n\n## SECURITY AUDIT MODE
 You are performing a security vulnerability scan. Your job is to systematically read source files and identify real, exploitable security issues. Follow this process:
 
@@ -3895,7 +3844,7 @@ You are performing a security vulnerability scan. Your job is to systematically 
         }
 
         // â"€â"€ Autonomy level addendum â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        if (this.trustLevel === 'yolo') {
+        if (!_useSlimPrompt && this.trustLevel === 'yolo') {
             baseSystemContent += `\n\n## AUTONOMY MODE: YOLO -- Full autonomous execution
 The user has set trust level to YOLO. This means:
 - **Never ask "Want me to proceed--, "Should I continue--, "Would you like me to X--** -- just do it.
@@ -3906,7 +3855,8 @@ The user has set trust level to YOLO. This means:
 - After completing ALL steps, give a concise summary of what was done. No follow-up questions unless you hit a genuine blocker (missing credentials, ambiguous destructive action).
 - Treat every user message as full authorization to complete the entire implied task autonomously.
 - **When the user's message contains a numbered list or checklist of tasks, work through them in order without pausing.** Complete ALL items before stopping. Do NOT ask which item to work on -- just start with item 1.
-- **NEVER end a response with a prompt like "Say 'next' and I'll...", "Let me know when to continue", "Which section should I tackle first?", or any variant.** These are forbidden. If there are remaining items, pick the next one and start working on it immediately.`;
+- **NEVER end a response with a prompt like "Say 'next' and I'll...", "Let me know when to continue", "Which section should I tackle first?", or any variant.** These are forbidden. If there are remaining items **within the current request**, pick the next one and start working on it immediately.
+- **When the current task is fully complete, stop.** Do NOT scan plan files, task logs, memory, or the codebase looking for adjacent or unrelated work to start on your own. "Remaining items" means items the user explicitly asked for in this message — not anything else you find in the workspace. If you notice something related that might be worth doing, say it in one sentence ("I also noticed X — want me to address that?") then stop. The user decides what comes next.`;
         } else if (this.trustLevel === 'trust') {
             baseSystemContent += `\n\n## AUTONOMY MODE: Trust -- Reduced confirmation
 The user has set trust level to Trust. This means:
@@ -3938,7 +3888,7 @@ The user has set trust level to Trust. This means:
         // Don't gate on first-turn: the multi-step request often arrives as a follow-up message
         // (e.g. "morning" → "review workspace" → "let's go through each item").
         const _taskLogNotYetCalled = !this._activeTask?.taskId;
-        if (_isMultiStepTask && _taskLogNotYetCalled && !isConfirmation) {
+        if (!_useSlimPrompt && _isMultiStepTask && _taskLogNotYetCalled && !isConfirmation) {
             baseSystemContent += `\n\n## MULTI-STEP TASK — LOG YOUR PLAN FIRST
 Before executing anything, call task_plan with action="create" and a "steps" array listing the steps you plan to take (e.g. ["Review X", "Fix Y", "Deploy Z"]). Then call task_plan action="advance" after each step completes. The ledger persists to disk and is re-injected every turn, so you never lose track of what is done vs. pending across context compactions and turn-limit resets.`;
         }
@@ -3967,6 +3917,17 @@ ${_nextIdx !== -1 ? `NEXT STEP: ${_ledger.steps[_nextIdx].text}. Work on it now,
                     }
                 }
             } catch { /* ledger read failure is non-fatal */ }
+        }
+
+        // ── Active task anchor ────────────────────────────────────────────────────
+        // Inject the current task into the system prompt so the model never loses it
+        // after compaction drops old history messages. This is a system-level directive
+        // so it survives any amount of history trimming.
+        // Skip on first-ever user turn (userTurnCount === 1) to avoid redundancy when
+        // the task is already visible as the top history message.
+        const _anchorTask = this._currentTaskMessage || this._originalTaskMessage;
+        if (_anchorTask) {
+            baseSystemContent += `\n\n## ACTIVE TASK\n${_anchorTask.slice(0, 300)}\nDo NOT ask what to work on — continue until this task is complete.`;
         }
 
         // ── Project-level task detection ──────────────────────────────────────────
@@ -4004,8 +3965,8 @@ This task spans multiple phases or streams. A PROJECT.md skeleton has been creat
             } catch { /* non-fatal */ }
         }
 
-        // Inject active skill prompt into system content
-        if (this.activeSkill) {
+        // Inject active skill prompt into system content (skip when using slim prompt to save space)
+        if (!_useSlimPrompt && this.activeSkill) {
             baseSystemContent += `
 
 ## ACTIVE SKILL: ${this.activeSkill.name}
@@ -4014,7 +3975,8 @@ ${this.activeSkill.prompt}`;
         }
 
         // Trigger hints: nudge the agent toward skills whose triggers match the current query
-        try {
+        if (_useSlimPrompt) { /* skip skill trigger hints to save context */ }
+        else try {
             const { loadSkills, matchesSkillTriggers, formatTriggerHint } = await import('./skillLibrary');
             const wsRoot = this.workspaceRoot ?? process.cwd();
             const allSkills = loadSkills(wsRoot);
@@ -4573,7 +4535,10 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
         const _noveltyStallThreshold = _isThinkingModel ? 2 : 3;
         let _lastReadToolResultSize = 0; // chars of the last read_file/shell_read result
         for (let turn = 0; turn < MAX_TURNS; turn++) {
-            if ((this.stopRef.stop || this._externalStop) && !_midStreamSpiralAborted) { this._runOutcome = 'stopped'; break; }
+            // User-initiated stop always breaks the loop — never masked by spiral-abort retry.
+            if (this._externalStop) { this._runOutcome = 'stopped'; break; }
+            // Internal spiral abort: allow retry (guarded by _midStreamSpiralAborted below).
+            if (this.stopRef.stop && !_midStreamSpiralAborted) { this._runOutcome = 'stopped'; break; }
             this.stopRef.stop = false; // Clear any stop flag set by previous turn's stream abort -- only a mid-loop break should stop us
             this._runTurnCount = turn + 1;
             post({ type: 'agentStatus', turn: turn + 1, maxTurns: MAX_TURNS, phase: 'thinking' });
@@ -4682,107 +4647,22 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     logWarn(`[context] Auto-compacting at ${accurateStats.usagePercentage.toFixed(1)}% (accurate)`);
 
                     // === EARLY-COMPACTION STALL DETECTION ===
-                    // If compaction fires before any real work (turn 0-1, zero edits), the session
-                    // overhead alone fills the context window. Two consecutive such runs means we are
-                    // in an unrecoverable "read plan → exhaust context → compact → repeat" loop.
-                    if (turn <= 1 && this._editsThisRun === 0) {
-                        this._earlyCompactionStalls++;
-                        logWarn(`[context] Early-compaction stall #${this._earlyCompactionStalls} (turn=${turn}, edits=0)`);
-                        if (this._earlyCompactionStalls >= 2) {
-                            logWarn(`[context] Early-compaction stall limit reached — stopping to break loop`);
-                            post({ type: 'streamEnd' });
-                            post({
-                                type: 'error',
-                                text: `[warn] The context window fills up before any work can be done (stall #${this._earlyCompactionStalls}). ` +
-                                    `This usually means the system prompt + memory + task description alone exceeds the model's context budget. ` +
-                                    `Try: switching to a model with a larger context window, clearing session memory, or breaking the task into a smaller first step.`
-                            });
-                            this._runOutcome = 'error';
-                            return;
-                        }
-                    }
+                    // Early-compaction stall detection: if context fills before any work is done,
+                    // two consecutive such runs means an unrecoverable loop.
+                    if (this.checkEarlyCompactionStall(turn, post)) { return; }
+
+                    // Signal the webview that compaction is starting so it can show a card.
+                    post({ type: 'compactingStarted' });
 
                     // Capture history snapshot BEFORE any compaction or modification.
                     // Used both for the WIP snapshot (tool results) and post-compact diff.
                     const historyBeforeCompact = this.history.slice();
 
                     // === SYNCHRONOUS WORK-IN-PROGRESS SNAPSHOT ===
-                    // Build this BEFORE compactHistory drops messages so we still have full history.
-                    // This is the key recovery mechanism -- no LLM call needed, uses available state.
-                    const wipLines: string[] = [];
-                    wipLines.push(`[WORK IN PROGRESS -- Context was compacted at ${contextStats.usagePercentage.toFixed(0)}% usage]`);
-                    const sessionTask = this._originalTaskMessage || this._currentTaskMessage;
-                    wipLines.push(`Original task: ${sessionTask}`);
-                    if (this._currentTaskMessage !== sessionTask) {
-                        wipLines.push(`Most recent user message: ${this._currentTaskMessage}`);
-                    }
-
-                    // Files read this session
-                    if (this._filesAutoReadThisRun.size > 0) {
-                        wipLines.push(`Files read this session: ${[...this._filesAutoReadThisRun].join(', ')}`);
-                    }
-
-                    // Edit state
-                    if (this._editsThisRun > 0) {
-                        wipLines.push(`Edits made this session: ${this._editsThisRun} edit(s), last file: ${this._lastEditedFilePath || 'unknown'}`);
-                    } else {
-                        wipLines.push(`No file edits made yet this session.`);
-                    }
-
-                    // Active task state (if tracked)
-                    if (this._activeTask) {
-                        if (this._activeTask.stepsCompleted.length) {
-                            wipLines.push(`Steps completed: ${this._activeTask.stepsCompleted.join(' | ')}`);
-                        }
-                        if (this._activeTask.stepsPending.length) {
-                            wipLines.push(`Steps still pending: ${this._activeTask.stepsPending.join(' | ')}`);
-                        }
-                        if (this._activeTask.filesConfirmed.length) {
-                            wipLines.push(`Files confirmed correct: ${this._activeTask.filesConfirmed.join(', ')}`);
-                        }
-                        if (this._activeTask.filesRuledOut.length) {
-                            wipLines.push(`Files ruled out (stubs/wrong): ${this._activeTask.filesRuledOut.join(', ')}`);
-                        }
-                    }
-
-                    // Extract last assistant message(s) -- what was the model doing right before compaction?
-                    const lastAssistantMsgs = this.history
-                        .filter(m => m.role === 'assistant' && typeof m.content === 'string' && (m.content as string).trim().length > 0)
-                        .slice(-3);
-                    if (lastAssistantMsgs.length > 0) {
-                        const lastMsg = lastAssistantMsgs[lastAssistantMsgs.length - 1];
-                        const snippet = (lastMsg.content as string).slice(0, 600).trim();
-                        wipLines.push(`Last action / progress before compaction:\n${snippet}`);
-                    }
-
-                    // Extract key shell/SSH command results from tool messages in the dropped history.
-                    // This is critical for sessions heavy on run_command/SSH work where _editsThisRun=0
-                    // but significant real-world actions were taken (e.g. deleting files, API calls).
-                    const toolResults = historyBeforeCompact
-                        .filter(m => m.role === 'tool' && typeof m.content === 'string')
-                        .filter(m => (m.content as string).startsWith('[TOOL RESULT: run_command]') || (m.content as string).startsWith('[TOOL RESULT: shell_read]'))
-                        .slice(-6); // last 6 command results
-                    if (toolResults.length > 0) {
-                        const cmdSummary = toolResults.map(m => {
-                            const body = (m.content as string)
-                                .replace(/^\[TOOL RESULT: \w+\]\n/, '')
-                                .replace(/\[SELF-CHECK\][\s\S]*/g, '')
-                                .trim()
-                                .slice(0, 200);
-                            return body;
-                        }).filter(Boolean).join('\n---\n');
-                        if (cmdSummary) {
-                            wipLines.push(`Recent command outputs (last ${toolResults.length}):\n${cmdSummary}`);
-                        }
-                    }
-
-                    wipLines.push(`IMPORTANT: Do NOT repeat work already done. Continue from where you left off.`);
+                    const wipLines = this.buildWipSnapshot(contextStats.usagePercentage, historyBeforeCompact);
                     const wipSnapshot = wipLines.join('\n');
 
                     // === SYNCHRONOUS TIER 2 SAVE ===
-                    // Save the WIP snapshot to Tier 2 memory NOW, before the async LLM extraction,
-                    // so that recentMemFacts on the very next turn already has current session context.
-                    // The async LLM extraction will add richer structured facts on top of this.
                     if (this.memory) {
                         const syncMemNote = wipLines
                             .filter(l => !l.startsWith('[WORK IN PROGRESS') && !l.startsWith('IMPORTANT:'))
@@ -4791,233 +4671,24 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         logInfo(`[context] Synchronous WIP snapshot saved to Tier 2 (${wipLines.length} lines)`);
                     }
 
-                    // Store old count (historyBeforeCompact already captured above)
-                    const oldMessageCount = this.history.length;
+                    // Core compaction: shrink + compact + anti-thrash
+                    const compactOutcome = this.performCoreCompaction(contextStats, post);
+                    if (compactOutcome.shouldBreak) { break; }
+                    const { messagesRemoved, autoDropped } = compactOutcome;
 
-                    // Step 1: Proportional shrink -- trim the largest tool-result messages first
-                    // so compactHistory (oldest-first drop) can retain more recent turns.
-                    const targetTokens = Math.floor((contextStats.modelLimit * 50) / 100)
-                        - contextStats.systemPromptTokens - contextStats.memoryTokens;
-                    this.history = shrinkLargeToolMessages(this.history, targetTokens);
-
-                    // Step 2: Score-based compaction -- drop lowest-value messages until we hit the token target
-                    const compactResult = compactHistory(
-                        this.history,
-                        50, // Target 50% usage after compaction
-                        contextStats.modelLimit,
-                        contextStats.systemPromptTokens,
-                        contextStats.memoryTokens
-                    );
-                    this.history = compactResult.kept;
-                    let autoDropped = compactResult.dropped;
-
-                    // Guarantee at least 40% of messages are removed -- same floor as compactContext().
-                    // Without this, compactHistory may return 0 removals when context is dense
-                    // (large messages eat most tokens), leaving the context still full and causing
-                    // the model to produce blank/empty responses on the very next turn.
-                    const minAutoRemove = Math.max(Math.floor(oldMessageCount * 0.4), 4);
-                    if (oldMessageCount - this.history.length < minAutoRemove && oldMessageCount > minAutoRemove) {
-                        const extra = minAutoRemove - (oldMessageCount - this.history.length);
-                        const moved = this.history.slice(0, extra);
-                        this.history = this.history.slice(extra);
-                        autoDropped = [...moved, ...autoDropped];
-                        logInfo(`[context] Auto-compact minRemove floor applied: forced ${minAutoRemove} drops`);
+                    // Save structured facts from dropped messages to Tier 2 memory (async, fire-and-forget)
+                    if (messagesRemoved > 0) {
+                        this.saveDroppedToMemory(autoDropped);
                     }
 
-                    // Calculate removed count AFTER compaction
-                    const messagesRemoved = oldMessageCount - this.history.length;
-
-                    // Anti-thrash: track savings ratio; if compaction has happened 3 times
-                    // with < 10% savings each time, the context is too dense to shrink -- stop cycling.
-                    const savingsRatio = oldMessageCount > 0 ? messagesRemoved / oldMessageCount : 0;
-                    this._compactionRatios.push(savingsRatio);
-                    const THRASH_MIN_SAVINGS = 0.10;
-                    const THRASH_WINDOW = 3;
-                    if (this._compactionRatios.length >= THRASH_WINDOW) {
-                        const recentRatios = this._compactionRatios.slice(-THRASH_WINDOW);
-                        const allBelowThreshold = recentRatios.every(r => r < THRASH_MIN_SAVINGS);
-                        if (allBelowThreshold) {
-                            logWarn(`[context] Anti-thrash: ${THRASH_WINDOW} compactions all saved < ${(THRASH_MIN_SAVINGS * 100).toFixed(0)}% -- context cannot be meaningfully shrunk. Stopping loop to avoid infinite compaction cycle.`);
-                            post({ type: 'error', text: `**Context compaction stuck** -- the conversation history cannot be meaningfully reduced (${THRASH_WINDOW} attempts all saved < ${(THRASH_MIN_SAVINGS * 100).toFixed(0)}%). Please start a new conversation or use /compact to manually summarize.` });
-                            break; // Break the outer turn loop
-                        }
-                    }
-
-                    // Save structured facts from dropped messages to Tier 2 memory so discoveries
-                    // survive even silent auto-compaction. Use the same LLM-based structured
-                    // extraction as manual compact -- run async so it doesn't block this turn.
-                    if (this.memory && messagesRemoved > 0) {
-                        // compactHistory returns the exact dropped messages
-                        const droppedForSave = autoDropped;
-                        const droppedText = droppedForSave
-                            .filter(m => m.role === 'user' || m.role === 'assistant')
-                            .map(m => `${m.role}: ${m.content.slice(0, 500)}`)
-                            .join('\n');
-                        const currentModel2 = this.currentModel || getConfig().model;
-                        const taskMsgSnap = this._currentTaskMessage;
-                        // Fire-and-forget: run LLM extraction in background, save to memory when done
-                        (async () => {
-                            try {
-                                let rawSummary = '';
-                                if (droppedText.trim()) {
-                                    await streamChatRequest(
-                                        currentModel2,
-                                        [
-                                            {
-                                                role: 'system',
-                                                content: [
-                                                    'You are a context extractor. Extract structured facts from this conversation.',
-                                                    'Output ONLY a JSON object with these keys (omit any key with an empty value):',
-                                                    '  task: string -- one sentence describing what was being worked on',
-                                                    '  files_confirmed: string[] -- real file paths that were found and confirmed correct',
-                                                    '  files_ruled_out: string[] -- stub files, wrong paths, files that do not exist',
-                                                    '  decisions: string[] -- key decisions made',
-                                                    '  edits_made: string[] -- describe each successful file edit',
-                                                    '  blockers: string[] -- anything that failed or was unclear',
-                                                    '  next_step: string -- what should happen next if the task is not done',
-                                                    'Output ONLY the JSON. No explanation, no markdown fences.',
-                                                ].join('\n'),
-                                            },
-                                            { role: 'user', content: droppedText.slice(0, 6000) },
-                                        ],
-                                        [],
-                                        (token) => { rawSummary += token; },
-                                        { stop: false },
-                                        { numPredict: -1 }  // summarizer must emit full JSON — uncapped
-                                    );
-                                }
-                                let structured: Record<string, unknown> = {};
-                                try {
-                                    const jsonMatch = rawSummary.match(/\{[\s\S]*\}/);
-                                    if (jsonMatch) { structured = JSON.parse(jsonMatch[0]); }
-                                } catch { /* fall through */ }
-                                const lines: string[] = [];
-                                if (taskMsgSnap) { lines.push(`Task: ${taskMsgSnap.slice(0, 80)}`); }
-                                if (structured.task) { lines.push(`Summary: ${structured.task}`); }
-                                if (Array.isArray(structured.files_confirmed) && structured.files_confirmed.length) {
-                                    lines.push(`Files confirmed: ${(structured.files_confirmed as string[]).join(', ')}`);
-                                }
-                                if (Array.isArray(structured.files_ruled_out) && structured.files_ruled_out.length) {
-                                    lines.push(`Files ruled out: ${(structured.files_ruled_out as string[]).join(', ')}`);
-                                }
-                                if (Array.isArray(structured.decisions) && structured.decisions.length) {
-                                    lines.push(`Decisions: ${(structured.decisions as string[]).join(' | ')}`);
-                                }
-                                if (Array.isArray(structured.edits_made) && structured.edits_made.length) {
-                                    lines.push(`Edits made: ${(structured.edits_made as string[]).join(' | ')}`);
-                                }
-                                if (structured.next_step) { lines.push(`Next step: ${structured.next_step}`); }
-                                if (Array.isArray(structured.blockers) && structured.blockers.length) {
-                                    lines.push(`Blockers: ${(structured.blockers as string[]).join(' | ')}`);
-                                }
-                                lines.push(`(auto-compact ${new Date().toLocaleTimeString()})`);
-                                const memNote = lines.join('\n');
-                                this.memory!.addEntry(2, memNote, ['auto-compact', 'session']).catch((e) => logWarn(`[memory] background write failed: ${toErrorMessage(e)}`));
-                                logInfo(`[context] Auto-compact: saved structured snapshot to Tier 2 memory (${lines.length} facts)`);
-                            } catch (err) {
-                                logWarn(`[context] Auto-compact: structured extraction failed, falling back to regex: ${toErrorMessage(err)}`);
-                                // Fallback: plain regex scrape
-                                const editFacts = droppedForSave
-                                    .filter(m => m.role === 'assistant')
-                                    .flatMap(m => {
-                                        const edits = [...m.content.matchAll(/Edited:\s*([^\s--]+)/g)].map(x => `edited ${x[1]}`);
-                                        const paths = [...m.content.matchAll(/['"](app\/[^'"]+\.[a-z]+)['"]/g)].map(x => x[1]);
-                                        return [...edits, ...paths];
-                                    })
-                                    .filter((v, i, a) => a.indexOf(v) === i)
-                                    .slice(0, 8);
-                                if (editFacts.length > 0 || taskMsgSnap) {
-                                    const fallbackNote = [
-                                        taskMsgSnap ? `Task: ${taskMsgSnap.slice(0, 80)}` : '',
-                                        editFacts.length ? `Progress: ${editFacts.join(', ')}` : '',
-                                        `(auto-compact fallback ${new Date().toLocaleTimeString()})`,
-                                    ].filter(Boolean).join('\n');
-                                    this.memory!.addEntry(2, fallbackNote, ['auto-compact', 'session']).catch((e) => logWarn(`[memory] background write failed: ${toErrorMessage(e)}`));
-                                }
-                            }
-                        })();
-                    }
 
                     // After compaction, inject WIP snapshot + recent Tier 2 memory at the front of history.
-                    // This ensures the model knows exactly what it was doing and what not to repeat.
-                    // NOTE: compactSummary is built below -- injection uses wipSnapshot here, then we
-                    // update the injected message after compactSummary is available.
-                    let injectedCompactNote = '';
-                    if (this._currentTaskMessage) {
-                        // Load any recent Tier 2 memory facts (includes the sync WIP entry we just saved)
-                        let recentMemFacts = '';
-                        if (this.memory) {
-                            try {
-                                const tier2 = this.memory.getTier(2)
-                                    .filter(e => e.tags?.includes('auto-compact') || e.tags?.includes('wip-sync'))
-                                    .slice(0, 4);
-                                if (tier2.length) {
-                                    recentMemFacts = '\n\nSession memory (from compaction):\n' + tier2.map(e => `- ${e.content.slice(0, 150)}`).join('\n');
-                                }
-                            } catch { /* skip */ }
-                        }
-
-                        // Read task log file -- the richest record of what was planned and completed.
-                        // This is the ground truth the agent wrote itself; always include it when available.
-                        let taskLogContent = '';
-                        const taskLogId = this._activeTask?.taskId;
-                        if (taskLogId && this.workspaceRoot) {
-                            try {
-                                const taskLogPath = path.join(this.workspaceRoot, '.ollamaforge', 'tasks', taskLogId, 'log.md');
-                                if (fs.existsSync(taskLogPath)) {
-                                    const raw = fs.readFileSync(taskLogPath, 'utf8');
-                                    // Trim to last 3000 chars to avoid re-filling the context we just freed
-                                    const trimmed = raw.length > 3000 ? '...(truncated)\n' + raw.slice(-3000) : raw;
-                                    taskLogContent = `\n\nTask log (.ollamaforge/tasks/${taskLogId}/log.md):\n${trimmed}`;
-                                    logInfo(`[context] Injected task log (${raw.length} chars, taskId=${taskLogId}) into compact note`);
-                                }
-                            } catch { /* skip */ }
-                        }
-
-                        injectedCompactNote = `${wipSnapshot}${taskLogContent}${recentMemFacts}\n\nResume task: ${this._currentTaskMessage}`;
-                        this.history.unshift({ role: 'user', content: injectedCompactNote });
-                        logInfo(`[context] Injected WIP snapshot after compaction (${wipLines.length} facts, taskLog=${taskLogId ?? 'none'})`);
-                    }
+                    const injectedCompactNote = this.injectPostCompactContext(wipSnapshot, wipLines);
 
                     this.lastContextLevel = 'safe';
 
                     // Build a human-readable summary of what we remember, shown in chat
-                    const compactSummaryLines: string[] = [];
-                    const summaryTask = this._originalTaskMessage || this._currentTaskMessage;
-                    if (summaryTask) {
-                        compactSummaryLines.push(`**Task:** ${summaryTask.slice(0, 200)}`);
-                    }
-                    if (this._editsThisRun > 0) {
-                        compactSummaryLines.push(`**Edits made:** ${this._editsThisRun} file${this._editsThisRun !== 1 ? 's' : ''}${this._lastEditedFilePath ? ` (last: ${this._lastEditedFilePath.split('/').pop()})` : ''}`);
-                    }
-                    if (this._filesAutoReadThisRun.size > 0) {
-                        const readList = [...this._filesAutoReadThisRun].slice(0, 8).map(f => f.split('/').pop()).join(', ');
-                        compactSummaryLines.push(`**Files reviewed:** ${readList}`);
-                    }
-                    if (this._activeTask?.stepsCompleted.length) {
-                        compactSummaryLines.push(`**Completed:** ${this._activeTask.stepsCompleted.join(', ')}`);
-                    }
-                    if (this._activeTask?.stepsPending.length) {
-                        compactSummaryLines.push(`**Still to do:** ${this._activeTask.stepsPending.join(', ')}`);
-                    }
-                    // Pull last assistant message snippet as "last action"
-                    const lastAsstMsg = this.history.filter(m => m.role === 'assistant' && typeof m.content === 'string' && (m.content as string).trim().length > 20).slice(-1)[0];
-                    if (lastAsstMsg) {
-                        const snippet = (lastAsstMsg.content as string)
-                            // Strip well-formed tool call blocks
-                            .replace(/<tool>[\s\S]*?<\/tool>/g, '')
-                            // Strip malformed/truncated tool fragments (open tag without close, or broken JSON inside)
-                            .replace(/<tool>[\s\S]*/g, '')
-                            // Strip [SYSTEM:...] injections that may have been appended to assistant turns
-                            .replace(/\[SYSTEM:[\s\S]*?\]/g, '')
-                            // Strip think blocks
-                            .replace(/<think>[\s\S]*?<\/think>/g, '')
-                            .trim()
-                            .slice(0, 200);
-                        if (snippet) { compactSummaryLines.push(`**Last action:** ${snippet}`); }
-                    }
-                    compactSummaryLines.push(`*(${messagesRemoved} old message${messagesRemoved !== 1 ? 's' : ''} removed -- continuing from here)*`);
-                    const compactSummary = compactSummaryLines.join('\n');
+                    const compactSummary = this.buildCompactSummary(messagesRemoved);
 
                     post({
                         type: 'contextCompacted',
@@ -5507,12 +5178,22 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             logWarn(`[agent] Hard-stopping native recovery loop after ${this._nativeRecoverySuppressCount} suppressions`);
                             post({ type: 'streamEnd' });
                             post({ type: 'removeLastAssistant' });
+                            // Show a chat bubble (not a red error) so the user can reply and continue
+                            const _taskCtx = (this._originalTaskMessage || this._currentTaskMessage || '').slice(0, 150);
                             const stuckHintMsg = toolName2 === 'run_command'
-                                ? `The command has been repeated ${recentRepeatCount}+ times without progress. Try a different command, or describe what you are trying to do.`
+                                ? `The command has been repeated ${recentRepeatCount}+ times without progress. Try rephrasing the task or splitting it into a smaller step.`
                                 : toolName2 === 'shell_read'
-                                ? `The same shell command has been repeated ${recentRepeatCount}+ times. Try a different command (e.g. \`ls\`, \`find\`, or \`cat <filename>\`), or describe what you are trying to do.`
-                                : `Use find_files to list files in the workspace, then read the file you need.`;
-                            post({ type: 'error', text: `⚠️ Agent stuck: \`${toolName2}\` called with same/empty args ${recentRepeatCount}+ times and cannot self-correct. ${stuckHintMsg}` });
+                                ? `The same shell command has been repeated ${recentRepeatCount}+ times. Try a different approach — use \`find_files\` or \`read_file\` instead.`
+                                : `\`${toolName2}\` was called with empty or missing arguments ${recentRepeatCount}+ times and could not recover. The model may be struggling with its current context.`;
+                            const stuckNote = [
+                                `I got stuck trying to call \`${toolName2}\` — the same call repeated ${recentRepeatCount}+ times with no progress.`,
+                                stuckHintMsg,
+                                _taskCtx ? `\nI was working on: _${_taskCtx}_` : '',
+                                `\nYou can reply to try again, rephrase the task, or type \`/compact\` to clear context and restart.`,
+                            ].filter(Boolean).join(' ');
+                            post({ type: 'streamStart' });
+                            post({ type: 'token', text: stuckNote });
+                            post({ type: 'streamEnd' });
                             loopExhausted = false;
                             break;
                         }
@@ -5540,12 +5221,14 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             const exampleArgs = toolName2 === 'shell_read'
                                 ? `{"command":"cat ${exampleFile}"}`
                                 : `{"path":"${exampleFile}"}`;
+                            const _taskAnchor2 = (this._originalTaskMessage || this._currentTaskMessage || '').slice(0, 150);
+                            const taskLine = _taskAnchor2 ? ` Your current task is: "${_taskAnchor2}".` : '';
                             const fileHint = fileList
-                                ? `The workspace contains: ${fileList}. Output ONLY a <tool> block like: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`
+                                ? `The workspace contains: ${fileList}.${taskLine} Output ONLY a <tool> block like: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`
                                 : `Output ONLY a <tool> block: <tool>{"name":"${toolName2}","arguments":${exampleArgs}}</tool>`;
                             const stuckMsg = toolName2 === 'shell_read'
                                 ? `[SYSTEM: You called shell_read with the same command repeatedly and it is not working. Try a different command. ${fileHint}]`
-                                : `[SYSTEM: You called ${toolName2} with no path. ${fileHint}]`;
+                                : `[SYSTEM: You called ${toolName2} with no path or the same path repeatedly. ${fileHint}]`;
                             this.history.pop();
                             this.history.push({ role: 'user', content: stuckMsg });
                             post({ type: 'removeLastAssistant' });
@@ -5590,17 +5273,73 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         logWarn(`[agent] Unparseable tool output (turn ${this._unparsedToolTurns}/${this.MAX_UNPARSED_TOOL_TURNS}): ${raw.slice(0, 120)}`);
                         if (this._unparsedToolTurns >= this.MAX_UNPARSED_TOOL_TURNS) {
                             this._unparsedToolTurns = 0;
-                            const isPreDraftLoop = result.content.includes('writing the file content inside your thinking block');
+                            // Count how many pre-draft nudges already injected this run (avoids matching model output)
+                            const preDraftNudgesInjected = this.history.filter(
+                                m => m.role === 'user' && typeof m.content === 'string'
+                                    && (m.content.includes('writing the file content inside your thinking block')
+                                        || m.content.includes('STOP writing content in your thinking block')
+                                        || m.content.includes('pre-drafted in thinking'))
+                            ).length;
+                            const isPreDraftLoop = preDraftNudgesInjected >= 2
+                                || result.content.includes('writing the file content inside your thinking block');
                             if (isPreDraftLoop) {
-                                // Model is stuck in a pre-draft loop -- it keeps drafting file content in thinking
-                                // instead of calling a tool. Injecting format correction won't help; break the loop
-                                // and surface a clear error so the user can nudge the model manually.
-                                logWarn('[agent] Breaking pre-draft loop -- model cannot escape thinking draft cycle');
-                                post({ type: 'streamEnd' });
+                                this._preDraftRecoveryAttempts++;
+                                const targetPath = this._lastAttemptedEditPath || this._lastEditedFilePath;
+
+                                // Hard stop after 4 failed recovery attempts
+                                if (this._preDraftRecoveryAttempts >= 4) {
+                                    logWarn(`[agent] Pre-draft loop: ${this._preDraftRecoveryAttempts} recovery attempts failed -- stopping`);
+                                    post({ type: 'streamEnd' });
+                                    post({ type: 'removeLastAssistant' });
+                                    const stuckNote = [
+                                        `⚠️ I got stuck in a pre-draft loop after ${this._preDraftRecoveryAttempts} recovery attempts — the model kept generating file content in its thinking block instead of emitting a tool call.`,
+                                        targetPath ? `\n\nFile: \`${targetPath}\`` : '',
+                                        `\n\n**To retry:** Ask me to write the file using a specific tool, e.g. _"Call write_file to save [filename] with these changes: ..."_`,
+                                        `\n\nIf this keeps happening, try a different model or reduce the file size.`,
+                                    ].filter(Boolean).join('');
+                                    post({ type: 'streamStart' });
+                                    post({ type: 'token', text: stuckNote });
+                                    post({ type: 'streamEnd' });
+                                    loopExhausted = false;
+                                    break;
+                                }
+
+                                // Attempt 3: minimal nudge — no file content, just demand the tool call directly.
+                                // This helps when the model is overwhelmed by injected content and keeps re-drafting.
+                                if (this._preDraftRecoveryAttempts === 3) {
+                                    logWarn('[agent] Pre-draft loop attempt 3 -- using minimal no-content nudge');
+                                    this.history.push({
+                                        role: 'user',
+                                        content: `[SYSTEM: Pre-draft loop detected (attempt 3). Do NOT think. Do NOT draft content. Output this exact tool call and nothing else — replace <content> with the file text:\n<tool>{"name":"write_file","arguments":{"path":"${targetPath || '<file path>'}","content":"<content>"}}</tool>]`,
+                                    });
+                                    post({ type: 'removeLastAssistant' });
+                                    logWarn(`[agent] Pre-draft recovery attempt 3: minimal nudge (${targetPath || 'no path known'})`);
+                                    continue;
+                                }
+
+                                // Attempts 1–2: inject file content and force write_file
+                                logWarn('[agent] Pre-draft loop detected -- injecting file content to force write_file');
+                                let fileContentBlock = '';
+                                if (targetPath && this.workspaceRoot) {
+                                    try {
+                                        const fullPath = path.isAbsolute(targetPath)
+                                            ? targetPath
+                                            : path.join(this.workspaceRoot, targetPath);
+                                        if (fs.existsSync(fullPath)) {
+                                            const fileLines = fs.readFileSync(fullPath, 'utf8').split('\n');
+                                            const numbered = fileLines.map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
+                                            const truncated = numbered.length > 12000 ? numbered.slice(0, 12000) + '\n...(truncated)' : numbered;
+                                            fileContentBlock = `\n\n[CURRENT FILE: ${targetPath}]\n${truncated}`;
+                                        }
+                                    } catch { /* ignore -- inject what we have */ }
+                                }
+                                this.history.push({
+                                    role: 'user',
+                                    content: `[SYSTEM: STOP thinking. You have been in a pre-draft loop — drafting file content in thinking instead of calling a tool. Your thinking is being cut off each time. DO NOT draft in thinking again.${fileContentBlock}\n\nEmit ONE tool call NOW:\n<tool>{"name":"write_file","arguments":{"path":"${targetPath || '<target file>'}","content":"<full updated file content>"}}</tool>\nUse the file content above as your base. Output ONLY the tool call — no thinking, no explanation.]`,
+                                });
                                 post({ type: 'removeLastAssistant' });
-                                post({ type: 'error', text: `⚠️ Agent stuck in pre-draft loop -- the model keeps writing file content in its thinking block instead of calling a tool. Try saying: "Read [filename] then call write_file to apply the changes."` });
-                                loopExhausted = false;
-                                break;
+                                logWarn(`[agent] Pre-draft recovery attempt ${this._preDraftRecoveryAttempts}: injected file content (${targetPath || 'no path known'}), forcing write_file`);
+                                continue;
                             }
                             logWarn('[agent] Breaking unparseable-tool loop -- injecting format correction');
                             this.history.push({
@@ -5956,13 +5695,18 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     const toolSig = firstTool
                         ? `${firstTool.function.name}|${String(firstTool.function.arguments?.path ?? firstTool.function.arguments?.command ?? JSON.stringify(firstTool.function.arguments)).slice(0, 60).replace(/\d+/g, 'N')}`
                         : '';
-                    const textSig = displayContent.trim().slice(0, 100).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 |]/g, '');
+                    // Text-only responses use 200 chars for better dedup signal.
+                    // Tool responses use 60 chars of args (already normalized above).
+                    const textSig = displayContent.trim().slice(0, !firstTool ? 200 : 100).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 |]/g, '');
                     const fingerprint = `${toolSig}|${textSig}`;
+                    // Text-only substantial answers (re-answer loop) use threshold=2 —
+                    // the second time the model re-summarises the same answer without a tool call is a loop.
+                    const fpThreshold = (!firstTool && displayContent.trim().length > 300) ? 2 : _noveltyStallThreshold;
                     if (fingerprint.replace(/[| ]/g, '').length > 8) {
                         this._responseFingerprints.push(fingerprint);
                         if (this._responseFingerprints.length > 20) { this._responseFingerprints.shift(); }
                         const fpCount = this._responseFingerprints.filter(f => f === fingerprint).length;
-                        if (fpCount >= _noveltyStallThreshold && this.autoRetryCount < this.effectiveMaxRetries) {
+                        if (fpCount >= fpThreshold && this.autoRetryCount < this.effectiveMaxRetries) {
                             // Before flagging as a loop, check whether the tool results for this
                             // repeated action have been changing. If the last tool result differs
                             // from the one before it, the model is adapting to feedback — not looping.
@@ -6008,98 +5752,41 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // ── Shared locals used by the guards below ─────────────────────────────
                 const resp = (displayContent.trim() || strippedContent).toLowerCase();
                 const responseHasToolBlock = result.content.includes('<tool>');
-                // A legitimate stop is a clean text answer that needs no nudge:
-                //   - substantial text (≥200 chars) with no tool call pending, OR
-                //   - explicit completion/task-done language in the response.
-                // This prevents the no-tool handler from firing on a good answer and
-                // prevents autoRetryCount from escalating across clean text turns.
-                // "is running/working/complete" only counts as completion when at end-of-sentence
-                // (followed by . ! \n or end of string) — not when mid-sentence describing a state
-                // e.g. "Bot is running with Whisper" should NOT match, "Bot is running." SHOULD.
-                const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|awaiting (?:your|hardware|next)|(?:^|\n)done[.!\n]|(?:^|\n)complete[.!\n]|(?:^|\n)finished[.!\n]|(?:successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed))|ready (?:to|for)|let me know (?:when|if)|reach out (?:when|if)|nothing else to (?:act|do|work))\b/i.test(resp)
-                    || /\b(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)[.!\s]*$/i.test(resp);
-                // Planning/narration phrases signal the model is about to act, not that it's done.
-                // "Let me explore...", "I'll check...", "Exciting! Let me make both edits." should never be a stop.
-                // We check anywhere in short responses (< 300 chars) because preamble like "Exciting project!"
-                // can precede the planning phrase without it being at position 0.
+
+                // Planning/narration: model is describing what it will do instead of doing it.
+                // Short responses: check anywhere (preamble like "Exciting!" can precede the phrase).
+                // Long responses: only check at the start (a planning phrase mid-summary is fine).
                 const isPlanningNarration = resp.trim().length < 300
                     ? /\b(?:let me |i(?:'ll| will) (?:check|look|explore|read|find|search|examine|review|start|begin|now)|looking (?:at|for|into)|checking |searching |reading |exploring |now i(?:'ll| will| need| should)|i should |i need to |the user (?:is |wants |has |needs |asked ))\b/i.test(resp)
                     : /^(?:let me |i(?:'ll| will) (?:check|look|explore|read|find|search|examine|review|start|begin|now)|looking (?:at|for|into)|checking |searching |reading |exploring |now i(?:'ll| will| need| should)|i should |i need to |the user (?:is |wants |has |needs |asked ))/i.test(resp.trim());
-                // Mid-task phases (research/acting) should only stop on explicit completion language,
-                // not just on a long text answer — the model may be narrating its next step.
-                // Also treat as mid-task if tools were called this run but phase has already advanced
-                // to 'verifying' — the agent is still working, not done.
-                const isMidTask = this._taskPhase === 'research' || this._taskPhase === 'acting'
-                    || (this._taskPhase === 'verifying' && this._toolCallsThisRun.length > 0);
-                // If tools have been called this run, the agent is mid-task regardless of phase tracking.
-                // This catches cases where _taskPhase hasn't transitioned yet but real work has started.
+
+                // Tools called this run — agent is mid-task.
                 const toolsCalledThisRun = this._toolCallsThisRun.length > 0;
-                // A text-only turn is a legitimate stop only when:
-                //   1. Explicit completion language ("all done", "task complete", etc.), OR
-                //   2. Substantial text + no planning narration + not mid-task + no tools have been called
-                //      (pure Q&A answer with no agentic work needed), OR
-                //   3. Substantial text + no planning narration + not mid-task + tools WERE called
-                //      (model summarising completed work — only if response looks like a summary, not a plan)
-                // Case 3 is the tricky one: "Let me now..." after tools = plan, not summary.
-                // We require hasCompletionLanguage OR the response doesn't contain any forward-looking intent.
-                // Also catch present-progressive action statements like "Running with the venv's interpreter instead."
-                // or "Using X approach" / "Switching to Y" — model stating what it's about to do without a tool call.
-                // Also catch "Need to find/check/look" — agent stating its next required action without a future-tense marker.
-                const hasForwardIntent = /\b(?:let me (?!know\b)|i(?:'ll| will) |i(?:'m| am) going to |now i(?:'ll| will| need)|next[, ]|then[, ]|after that|first[, ].*then|going to |(?:running|using|switching|installing|applying|trying|attempting|executing) (?:with |the |this |a )?(?:\w+ ){0,4}instead\b)\b/i.test(resp)
-                    || /^(?:running |using |switching |installing |applying |trying |attempting |executing )/i.test(resp.trim())
-                    // Obligation without future tense: "need to", "have to", "must", "should" + action verb
-                    || /\b(?:need|have|must|also need|still need|will need) to (?:find|check|look|read|search|examine|trace|investigate|verify|confirm|test|run|install|fix|update|get|see|figure out|grep|cat|ssh|curl|ping|restart|reload|enable|disable|create|write|edit|remove|delete|move|copy)\b/i.test(resp)
-                    || /\bshould (?:find|check|look|read|trace|investigate|verify|test|try|run|fix)\b/i.test(resp)
-                    // "let's" constructions — model includes user as participant
-                    || /\blet'?s (?:check|look|try|run|find|read|see|examine|search|verify|test|fix|start|begin|go|do|use|get|explore|trace|grep|ssh|install|restart)\b/i.test(resp)
-                    // "Next step" / "The next thing" without comma
-                    || /\b(?:next step|the next (?:thing|step|task)|next up)\b/i.test(resp)
-                    // "Worth checking/looking" — hedged intent
-                    || /\bworth (?:checking|looking|reading|examining|investigating|verifying|testing|trying)\b/i.test(resp)
-                    // "About to" / "Time to" — imminent action
-                    || /\b(?:about to|time to) (?:check|look|find|read|run|search|examine|trace|investigate|verify|test|fix|install|try)\b/i.test(resp)
-                    // Response ends with ":" — model was about to show/enumerate something and stopped
-                    || /:\s*$/.test(resp.trim());
-                // A response that ends with a question to the user is always a legitimate stop —
-                // the model is handing control back and waiting for input.
-                // Exception: in trust/yolo mode, permission-seeking questions ("want me to X?",
-                // "shall I take Y next?") are NOT legitimate stops — the agent should just do it.
+
+                // Trust/yolo permission questions are NOT legitimate stops.
                 const endsWithPermissionQuestion = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
                     && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|can i go ahead|shall we|should we)\b.{0,120}\?\s*$/i.test(resp);
-                const endsWithQuestion = /\?\s*$/.test(resp.trim()) && !endsWithPermissionQuestion;
-                // User dismissal: the most recent user message was a conversational close
-                // ("no, just...", "okay thanks", "I'll check later", "got it", "sounds good").
-                // In this case a short acknowledgment with no tool call is always a legitimate stop.
+
+                // Completion language: model stated the task is done.
+                const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|awaiting (?:your|hardware|next)|(?:^|\n)done[.!\n]|(?:^|\n)complete[.!\n]|(?:^|\n)finished[.!\n]|(?:successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed))|(?:correctly|successfully) (?:restored|reverted|applied|updated|changed|fixed|deployed|installed)|(?:verified|confirmed|checked)(?:\s+and)? (?:correct|working|ok|good)|task (?:is )?complete|no (?:further|more) (?:changes|edits|work|action)|(?:everything|all) (?:looks|is) (?:correct|good|right|fine|in order)|ready (?:to|for)|let me know (?:when|if)|reach out (?:when|if)|nothing else to (?:act|do|work))\b/i.test(resp)
+                    || /\b(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)[.!\s]*$/i.test(resp);
+
+                // User dismissal: short conversational close ("got it", "thanks", etc.) — always stop.
                 const lastUserMsg = (this.lastUserMessage ?? '').trim().toLowerCase();
                 const isUserDismissal = lastUserMsg.length < 120
                     && /^(?:ok(?:ay)?[,.]?|got it[,.]?|sounds good[,.]?|thanks?[,.]?|cool[,.]?|alright[,.]?|perfect[,.]?|no[,.]?\s+just\b|never mind|nvm|not now|i(?:'ll| will) (?:check|try|look|let you know|come back)|just (?:let me know|checking)|no[,.]?\s+(?:thanks?|that'?s? (?:fine|ok|good|all|enough)))\b/i.test(lastUserMsg);
-                // Additional completion signals: model confirmed state, reported results, or summarised work
-                const hasConfirmationLanguage = /\b(back to (?:its|the) (?:correct|original|previous)|matches (?:exactly|what)|(?:file|code|script) (?:is|looks) (?:correct|right|good|restored|intact|unchanged)|(?:correctly|successfully) (?:restored|reverted|applied|updated|changed|fixed|deployed|installed)|(?:verified|confirmed|checked)(?:\s+and)? (?:correct|working|ok|good)|task (?:is )?complete|no (?:further|more) (?:changes|edits|work|action)|(?:everything|all) (?:looks|is) (?:correct|good|right|fine|in order))\b/i.test(resp);
-                // Short conversational reply (greeting, clarifying question, brief Q&A):
-                // if the response is short (<120 chars), ends with ?, and has no forward intent,
-                // it's the model handing control back — always a legitimate stop regardless of task phase.
-                const isConversationalStop = resp.trim().length < 120
-                    && endsWithQuestion
-                    && !hasForwardIntent
-                    && !toolCalls.length;
-                // hasForwardIntent normally wins — model stated intent to act next.
-                // Exceptions where completion language overrides forward intent:
-                //   1. User dismissal ("got it", "thanks", etc.) — always a stop
-                //   2. Tools were called this run AND explicit completion language is present —
-                //      forward-looking phrases in a summary ("you can now...", "the script will...")
-                //      are informational, not intent to act again.
-                const completionAfterWork = toolsCalledThisRun && (hasCompletionLanguage || hasConfirmationLanguage)
-                    && !endsWithPermissionQuestion;
-                const isLegitimateStop = (isUserDismissal && turnHasText && resp.trim().length < 300)
-                    || completionAfterWork
-                    || (!hasForwardIntent && (
-                        hasCompletionLanguage
-                        || hasConfirmationLanguage
-                        || isConversationalStop
-                        || endsWithQuestion
-                        || (turnHasText && !isPlanningNarration && !isMidTask && !toolsCalledThisRun)
-                        || (turnHasText && !isPlanningNarration && !isMidTask && toolsCalledThisRun)
-                    ));
+
+                // Legitimate stop: model is done and handing control back to the user.
+                // Three cases:
+                //   1. User said "thanks/got it/ok" — short ack is always a stop.
+                //   2. Response ends with a question (not a permission-seek) — model is waiting for input.
+                //   3. Completion language present — either after doing work, or in a pure Q&A answer.
+                const endsWithQuestion = /\?\s*$/.test(resp.trim()) && !endsWithPermissionQuestion;
+                const isLegitimateStop =
+                    (isUserDismissal && turnHasText && resp.trim().length < 300)
+                    || (endsWithQuestion && !isPlanningNarration)
+                    || (hasCompletionLanguage && !isPlanningNarration)
+                    || (turnHasText && !isPlanningNarration && !toolsCalledThisRun && !(this._taskPhase === 'research' || this._taskPhase === 'acting'));
                 // Reset stall budget when the model gives a real answer — it wasn't stalling,
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
@@ -6152,7 +5839,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // If it declares completion while that plan still has unchecked steps,
                 // block the stop — a model that wrote a checklist must not claim "done"
                 // with items still open. Only fires once per run to prevent a nudge spiral.
-                if (isLegitimateStop && (hasCompletionLanguage || hasConfirmationLanguage)
+                if (isLegitimateStop && hasCompletionLanguage
                     && !isUserDismissal && this._activePlanFile && !this._planStopGuardFiredThisRun) {
                     const planOpen = this.countTrackingDocOpenItems(this._activePlanFile);
                     if (planOpen) {
@@ -6199,7 +5886,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 const autoVerifyEnabled = vscode.workspace.getConfiguration('ollamaForge')
                     .get<boolean>('autoVerifyOnComplete', false);
                 if (autoVerifyEnabled
-                    && isLegitimateStop && (hasCompletionLanguage || hasConfirmationLanguage)
+                    && isLegitimateStop && hasCompletionLanguage
                     && !isUserDismissal && !this._autoVerifyFiredThisRun
                     && this._filesChangedThisRun.length > 0) {
                     const verifiableFiles = this._filesChangedThisRun
@@ -6365,79 +6052,81 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     this._readOnlyTurnsSinceLastEdit++;
                     const toolCallHint = isTextMode ? ' Output only a <tool> block, nothing else.' : ' Call the tool now.';
 
-                    // Fenced tool call: model used ``` instead of <tool>
+                    // ── No-tool nudge ─────────────────────────────────────────────────────
+                    // Two cases get specialised messages because they require a specific format fix:
+                    //   1. Fenced tool call — model used ``` instead of <tool>
+                    //   2. Small-model edit context — file content is pre-loaded, just needs the tool call
+                    // Everything else gets one generic nudge + an optional one-line hint.
                     const hasFencedToolCall = /```[\s\S]*?\b(edit_file|edit_file_at_line|shell_read|run_command|write_file|find_files|search_files)\b[\s\S]*?```/.test(resp);
-                    // Model is asking the user to provide files it can read itself
-                    const isDeflecting = /please provide|provide the (contents|file|code|text)|share the (contents|file|code)|paste the|send me the|provide me with/i.test(resp);
-                    // Model is fabricating an environmental blocker (firewall, network, SSH, etc.) without running a tool to verify it.
-                    // Pattern: claims inability due to environmental reason AND no tool was called this turn.
-                    const isFabricatingBlocker = /\b(firewall|network (issue|block|restrict|problem)|can'?t reach|cannot reach|unable to (connect|reach|access)|connection (refused|blocked|timed out)|no route to host|ssh.*block|blocked by|not accessible|unreachable|vpn required|permission denied)\b/i.test(resp)
-                        && !/the tool returned|error:|exit (code|status) [1-9]|timed out after|failed with/i.test(resp); // no actual tool error in response
-                    // In trust/yolo mode: detect permission-seeking questions the model should just act on instead.
-                    // e.g. "Want me to take the Section 13 cleanup next?" or "Should I proceed with X?"
-                    const isPermissionSeeking = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
-                        && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|ok(ay)? (if|to)|shall we|should we|can i go ahead|want me to (go ahead|proceed|continue|start|tackle|take|handle|do|fix|clean|remove|delete|add|update|check|review|move|push|run))\b/i.test(resp)
-                        && /\?/.test(resp.slice(-120)); // must end with a question
-                    // Model is giving the user instructions instead of executing them
-                    const isGivingInstructions = !isDeflecting && (
-                        /\b(you (should|can|could|need to|must)|you('ll| will) (need|want|have) to)\b.{0,120}\b(run|execute|call|use|add|create|install|edit|update|write|configure)\b/i.test(resp)
-                        || /\b(run (the following|this (command|script|code))|execute (the following|this)|use the following (command|code|script))\b/i.test(resp)
-                        || (/\b(here('s| is) (the|a) (command|script|code|solution|fix))\b/i.test(resp) && /```/.test(resp))
-                    );
 
-                    // Detect planning-narration loop: model keeps describing what it will do without acting.
-                    // Extract the file it mentioned so we can give it a concrete example tool call.
-                    const isPlanningLoop = isPlanningNarration && this.autoRetryCount >= 2;
-                    let planningLoopHint = '';
-                    if (isPlanningLoop) {
+                    // Classify the failure to pick a short hint (not a full custom message).
+                    // Order matters: first match wins.
+                    type NudgeReason = 'fenced' | 'fabricating-blocker' | 'deflecting' | 'task-lost' | 'permission-seeking' | 'giving-instructions' | 'planning-loop' | 'no-tool';
+                    const _taskReminder = (this._originalTaskMessage || this._currentTaskMessage || '').slice(0, 200);
+                    let nudgeReason: NudgeReason = 'no-tool';
+                    let nudgeHint = '';
+                    if (hasFencedToolCall) {
+                        nudgeReason = 'fenced';
+                    } else if (/\b(firewall|network (issue|block|restrict|problem)|can'?t reach|cannot reach|unable to (connect|reach|access)|connection (refused|blocked|timed out)|no route to host|ssh.*block|blocked by|not accessible|unreachable|vpn required|permission denied)\b/i.test(resp)
+                        && !/the tool returned|error:|exit (code|status) [1-9]|timed out after|failed with/i.test(resp)) {
+                        nudgeReason = 'fabricating-blocker';
+                        nudgeHint = ' You claimed a blocker without running a tool to verify it. Run ssh/ping/curl to check first.';
+                    } else if (/please provide|provide the (contents|file|code|text)|share the (contents|file|code)|paste the|send me the|provide me with/i.test(resp)) {
+                        nudgeReason = 'deflecting';
+                        nudgeHint = ' Use shell_read or read_file to read the file yourself — do not ask the user.';
+                    } else if (/\b(what would you like (me to|to)|what('d| would) you like|what (should|shall) (i|we) (do|work on|tackle|start|focus)|where (should|shall) (i|we) (start|begin|focus)|how (can|may) i help|what (would you like|do you want) me to (work on|do|tackle|fix|start|focus)|anything (else|specific) you'?d? like)/i.test(resp)
+                        && /\?/.test(resp.slice(-200))) {
+                        nudgeReason = 'task-lost';
+                        nudgeHint = _taskReminder ? ` Your task: "${_taskReminder}". Continue it — do not ask what to do.` : ' You are mid-task — do not ask what to do, continue working.';
+                    } else if ((this.trustLevel === 'trust' || this.trustLevel === 'yolo')
+                        && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|ok(ay)? (if|to)|shall we|should we|can i go ahead)\b/i.test(resp)
+                        && /\?/.test(resp.slice(-120))) {
+                        nudgeReason = 'permission-seeking';
+                        nudgeHint = ` You are in ${this.trustLevel.toUpperCase()} mode — do not ask for permission, just do it.`;
+                    } else if (/\b(you (should|can|could|need to|must)|you('ll| will) (need|want|have) to)\b.{0,120}\b(run|execute|call|use|add|create|install|edit|update|write|configure)\b/i.test(resp)
+                        || /\b(run (the following|this (command|script|code))|execute (the following|this)|use the following (command|code|script))\b/i.test(resp)
+                        || (/\b(here('s| is) (the|a) (command|script|code|solution|fix))\b/i.test(resp) && /```/.test(resp))) {
+                        nudgeReason = 'giving-instructions';
+                        nudgeHint = ' You gave instructions instead of executing them. Call the tool yourself.';
+                    } else if (isPlanningNarration && this.autoRetryCount >= 2) {
+                        nudgeReason = 'planning-loop';
                         const fileMatch = resp.match(/\b([\w./\\-]+\.(?:scad|py|ts|js|json|yaml|yml|sh|txt|md|toml|cfg|conf|env))\b/i);
                         const filePath = fileMatch ? fileMatch[1] : '';
                         const toolName = /revert|undo|change back|restore|reset/i.test(resp) ? 'edit_file' :
                                          /read|look|check|view|see/i.test(resp) ? 'shell_read' : 'edit_file';
                         const exampleArg = filePath
-                            ? (toolName === 'shell_read'
-                                ? `{"command": "cat '${filePath}'"}`
+                            ? (toolName === 'shell_read' ? `{"command": "cat '${filePath}'"}`
                                 : `{"path": "${filePath}", "old_string": "EXACT_OLD_TEXT", "new_string": "NEW_TEXT"}`)
                             : '{"path": "FILE_PATH", "old_string": "EXACT_OLD_TEXT", "new_string": "NEW_TEXT"}';
-                        planningLoopHint = ` You keep describing what to do but are not doing it. Call ${toolName} RIGHT NOW:\n<tool>{"name": "${toolName}", "arguments": ${exampleArg}}</tool>\nReplace EXACT_OLD_TEXT with the actual current text from the file. Output ONLY the <tool> block.`;
+                        nudgeHint = ` You keep describing what to do but are not doing it. Call ${toolName} RIGHT NOW:\n<tool>{"name": "${toolName}", "arguments": ${exampleArg}}</tool>\nReplace EXACT_OLD_TEXT with the actual current text. Output ONLY the <tool> block.`;
                     }
-                    // Escalate the nudge as retries increase — gentle first, then forceful
-                    const escalatedHint = isPlanningLoop ? planningLoopHint
+
+                    // Escalation suffix for repeated no-tool turns
+                    const escalationSuffix = nudgeReason === 'planning-loop' ? '' // hint already specific
                         : this.autoRetryCount >= 4
-                        ? ` YOU HAVE BEEN TOLD ${this.autoRetryCount} TIMES. Stop narrating. Output ONLY the tool call XML — absolutely nothing else.`
+                        ? ` YOU HAVE BEEN TOLD ${this.autoRetryCount} TIMES. Output ONLY the tool call — nothing else.`
                         : this.autoRetryCount >= 2
-                        ? ` You have described your plan ${this.autoRetryCount} times. Do NOT describe it again. Output the tool call now.`
+                        ? ` You have described your plan ${this.autoRetryCount} times. Stop describing — output the tool call now.`
                         : '';
+
+                    // Build the single nudge message
                     const nudgeContent = hasFencedToolCall
                         ? '[SYSTEM: You wrote a tool call inside a code block (```). That does NOT execute the tool. Output a raw <tool>{"name":"...","arguments":{...}}</tool> XML block — no backticks, no fences. Output ONLY the <tool> block now.]'
-                        : isFabricatingBlocker
-                        ? `[SYSTEM: CRITICAL — You claimed a network/firewall/connectivity blocker WITHOUT running a tool to verify it. That claim is fabricated. You MUST run the actual tool (run_command / shell_read with ssh, ping, or curl) RIGHT NOW to check connectivity. Do NOT claim a blocker you have not actually observed from a tool result. Call the tool now.${toolCallHint}]`
-                        : isDeflecting
-                        ? `[SYSTEM: You asked the user to provide file contents, but you have tools to read files yourself. Call shell_read or read_file. Do NOT ask the user.${toolCallHint}]`
-                        : isPermissionSeeking
-                        ? `[SYSTEM: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission — just do it. The user already approved this. Call the next tool immediately.${toolCallHint}]`
-                        : isGivingInstructions
-                        ? `[SYSTEM: You gave the user instructions instead of executing them. You are an autonomous agent — call the tool yourself RIGHT NOW.${toolCallHint}]`
                         : (this._isSmallModel && this._editContextInjected)
                         ? '[SYSTEM: The file content is in [PRE-LOADED CONTEXT] above. Call edit_file_at_line NOW with the line numbers shown. Output ONLY the <tool> block.]'
-                        : `[SYSTEM: You did not call any tool and the task is not done. Call the next tool NOW.${toolCallHint}${escalatedHint}]`;
+                        : `[SYSTEM: No tool was called and the task is not done.${nudgeHint} Call the next tool NOW.${toolCallHint}${escalationSuffix}]`;
 
-                    const reason = hasFencedToolCall ? 'fenced' : isFabricatingBlocker ? 'fabricating-blocker' : isDeflecting ? 'deflecting' : isPermissionSeeking ? 'permission-seeking' : isGivingInstructions ? 'giving-instructions' : 'no-tool';
-                    logInfo(`[agent] No-tool nudge (reason=${reason}, turn=${turn}, retry=${this.autoRetryCount})`);
+                    logInfo(`[agent] No-tool nudge (reason=${nudgeReason}, turn=${turn}, retry=${this.autoRetryCount})`);
 
-                    // Decide whether to remove the visible response or keep it.
-                    // Planning narration, deflection, permission-seeking, giving-instructions, and fenced tool calls
-                    // should be removed — they are mid-task artifacts, not useful to the user.
-                    // Substantial text responses (>80 chars, no planning markers) that look like
-                    // real answers should stay visible — the user saw something useful, and hiding it
-                    // is confusing. We keep the history entry and just append the nudge as a new user turn.
+                    // Keep the response visible if it looks like a real answer (substantial text, not
+                    // a mid-task artifact). Remove it if it's planning narration, a fenced tool call,
+                    // or any other mid-task non-answer.
                     const looksLikeRealAnswer = resp.trim().length > 80
                         && !isPlanningNarration
                         && !hasFencedToolCall
-                        && !isDeflecting
-                        && !isPermissionSeeking
-                        && !isGivingInstructions
-                        && !isPlanningLoop;
+                        && nudgeReason !== 'deflecting'
+                        && nudgeReason !== 'giving-instructions'
+                        && nudgeReason !== 'planning-loop';
                     if (looksLikeRealAnswer) {
                         // Keep the assistant message visible; push nudge as next user turn.
                         this.history.push({ role: 'user', content: nudgeContent });
@@ -7520,13 +7209,14 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         continue;
                     }
                     // pip install requires confirmation (not a hard block -- user may explicitly want this)
+                    // Trust/YOLO: auto-approved. Normal: prompt (or check if exact command was Accept-All'd).
                     const isPipInstall = /\bpip3?\s+install\b/i.test(cmdStr0);
-                    if (isPipInstall && !this._isToolApproved('run_command_pip')) {
+                    if (isPipInstall && this.trustLevel === 'normal' && !this._isToolApproved('run_command_pip') && !this._isCommandApproved(cmdStr0)) {
                         logInfo(`[pip-guard] pip install requires confirmation: ${cmdStr0.slice(0, 80)}`);
                         const confirmed = await this.requestConfirmation(
                             'pip_install',
                             `pip install: \`${cmdStr0.slice(0, 120)}\`\n\nThis will install packages into the Python environment. Approve?`,
-                            'run_command_pip'
+                            cmdStr0.trim()
                         );
                         if (!confirmed) {
                             const blockedMsg = `[BLOCKED] pip install was not approved. Report the required package(s) to the user and stop.`;
@@ -7565,14 +7255,30 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         post({ type: 'toolResult', id: toolId, name, success: false, preview: '(command policy: deny)' });
                         continue;
                     }
+                    // Built-in block rules (apt upgrade without dry-run, SSH root scan, etc.)
+                    const blockResult = checkBuiltinBlock(cmdStr0);
+                    if (blockResult) {
+                        logWarn(`[policy] BLOCK (${blockResult.rule}): ${cmdStr0.slice(0, 80)}`);
+                        this._guardEvents.push({ type: 'scope-guard', reason: blockResult.rule });
+                        if (isTextMode) {
+                            this.history.push({ role: 'user', content: `Tool ${name} returned:\n${blockResult.message}` });
+                        } else {
+                            this.history.push({ role: 'tool', content: blockResult.message });
+                        }
+                        post({ type: 'toolResult', id: toolId, name, success: false, preview: `(blocked: ${blockResult.rule})` });
+                        continue;
+                    }
                     // Egress allowlist check (network commands to non-allowlisted hosts)
+                    // Always prompts in Normal and Trust (security boundary). YOLO: requestConfirmation auto-approves.
                     const blockedHost = checkEgress(cmdStr0, policyCfg.egressAllowlist);
                     if (blockedHost && !this._isToolApproved('run_command_destructive')) {
                         logInfo(`[policy] egress blocked host: ${blockedHost}`);
+                        // toolName = undefined for Trust (hides Accept All); command string for Normal
+                        const egressTool = this.trustLevel === 'normal' ? cmdStr0.trim() : undefined;
                         const confirmed = await this.requestConfirmation(
                             'egress',
                             `Network egress to \`${blockedHost}\` is not in the egress allowlist.\n\n\`${cmdStr0.slice(0, 120)}\`\n\nAllow this host?`,
-                            'run_command_destructive'
+                            egressTool
                         );
                         if (!confirmed) {
                             const egressMsg = `[BLOCKED: egress] Host \`${blockedHost}\` is not in the egress allowlist and was not approved. Do not retry.`;
@@ -7586,13 +7292,14 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         }
                     }
                     // confirm verdict: require explicit approval regardless of trust level
+                    // No Accept All for policy-confirm — each occurrence requires deliberate approval.
                     if (policy.verdict === 'confirm' && !this._isToolApproved('run_command_destructive')) {
                         logInfo(`[policy] CONFIRM (${policy.rule}): ${cmdStr0.slice(0, 80)}`);
                         this._guardEvents.push({ type: 'command-policy', reason: `confirm: ${policy.rule}` });
                         const confirmed = await this.requestConfirmation(
                             'command-policy',
                             `Command requires confirmation (${policy.rule}):\n\`${cmdStr0.slice(0, 120)}\`\n\n${policy.reason}`,
-                            'run_command_destructive'
+                            undefined  // no toolName → no Accept All button
                         );
                         if (!confirmed) {
                             const confirmMsg = `[BLOCKED: command policy] This command requires confirmation and was not approved. Do not retry.`;
@@ -7617,10 +7324,11 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     );
                     if (isDestructiveCmd && !this._isToolApproved('run_command_destructive')) {
                         logInfo(`[destructive-guard] Destructive command requires confirmation: ${cmdStr0.slice(0, 80)}`);
+                        // Destructive ops always ask per-occurrence — no Accept All button.
                         const confirmed = await this.requestConfirmation(
                             'destructive_command',
                             `Destructive command: \`${cmdStr0.slice(0, 120)}\`\n\nThis will permanently delete or overwrite files. Approve?`,
-                            'run_command_destructive'
+                            undefined  // no toolName → no Accept All button
                         );
                         if (!confirmed) {
                             const blockedMsg = `[BLOCKED: destructive-guard] The destructive command was not approved by the user. Do not retry this command. If the task requires deleting files, explain what would be deleted and ask the user to confirm before proceeding.`;
@@ -7801,6 +7509,28 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     }
                 }
                 // ── End consistency gate ─────────────────────────────────────
+
+                // ── No-progress detector (steal from row-bot agent_budget.py) ──
+                // Block a tool call if it is the 4th+ consecutive identical
+                // (name+args) call. The model is stuck in a retry spiral.
+                {
+                    const digest = toolCallDigest(name, args);
+                    if (digest === this._lastToolDigest) {
+                        this._repeatToolCount++;
+                    } else {
+                        this._lastToolDigest = digest;
+                        this._repeatToolCount = 1;
+                    }
+                    if (this._repeatToolCount >= 4) {
+                        logWarn(`[no-progress] BLOCKED ${name}: identical call repeated ${this._repeatToolCount}x in a row`);
+                        this.history.push({
+                            role: 'user',
+                            content: `[no-progress] Tool "${name}" was BLOCKED: the exact same call (name + args) has been issued ${this._repeatToolCount} times in a row with no intervening change. Re-reading the same file or re-running the same command will not produce a different result. STOP repeating it. Re-read the target file fresh, re-derive the exact edit, or change your approach entirely.`,
+                        });
+                        continue;
+                    }
+                }
+                // ── End no-progress detector ──────────────────────────────────
 
                 let toolResult: string;
                 try {
@@ -7995,10 +7725,36 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         let _failHint = '';
                         if (/command not found|No such file|not found|ENOENT/i.test(_failText)) {
                             _failClass = 'not-found';
-                            _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
-                        } else if (/Permission denied|EACCES|EPERM/i.test(_failText)) {
+                            // SSH non-interactive shells don't source .bashrc/.profile, so tools
+                            // installed in ~/.local/bin, venv/bin, or via pipx won't be on PATH.
+                            // Detect this by checking if the failing command was run via SSH.
+                            const _cmdStr = String(args.command ?? '');
+                            const _isSshCmd = /^ssh\s/.test(_cmdStr.trim());
+                            const _cmdNotFoundMatch = _failText.match(/(?:bash|sh|zsh): line \d+: (\S+): command not found/);
+                            const _missingCmd = _cmdNotFoundMatch?.[1] ?? '';
+                            if (_isSshCmd && _missingCmd) {
+                                _failHint = `SSH non-interactive shells do not source ~/.bashrc or ~/.profile, so "${_missingCmd}" is not on PATH even if it works interactively. Fix by one of:\n` +
+                                    `1. Find the full path: ssh ... "which ${_missingCmd} || find ~/.local/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null | head -5"\n` +
+                                    `2. Source the profile: ssh ... "source ~/.bashrc && ${_missingCmd} ..."\n` +
+                                    `3. Use the full path directly once found (e.g. ~/.local/bin/${_missingCmd})`;
+                            } else {
+                                _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
+                            }
+                        } else if (/Operation not permitted|Permission denied|EACCES|EPERM/i.test(_failText)) {
                             _failClass = 'permission';
-                            _failHint = 'Permission denied. Check file ownership (ls -la) or try with elevated privileges. Do NOT retry the same command.';
+                            // Distinguish root-owned file vs general permission vs SSH sudo
+                            const _permCmdStr = String(args.command ?? '');
+                            const _isSshPerm = /^ssh\s/.test(_permCmdStr.trim());
+                            const _isRmFail = /rm:.*Operation not permitted|rm:.*Permission denied/i.test(_failText);
+                            if (_isRmFail && _isSshPerm) {
+                                _failHint = 'Cannot remove file — it is owned by root or another user. Options:\n' +
+                                    '1. Use sudo: ssh ... "sudo rm -f /tmp/file"\n' +
+                                    '2. Skip cleanup — /tmp files are ephemeral and will be purged on reboot\n' +
+                                    '3. Overwrite instead: ssh ... "sudo tee /tmp/file < /dev/null"\n' +
+                                    'Do NOT retry the same rm command without sudo.';
+                            } else {
+                                _failHint = 'Permission denied. Check file ownership (ls -la) or try with sudo/elevated privileges. Do NOT retry the same command.';
+                            }
                         } else if (/timed out|timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|socket hang up/i.test(_failText)) {
                             _failClass = 'network';
                             _failHint = 'Network/timeout error. Wait a moment and retry once. If it fails again, check connectivity (ping/curl) before retrying.';
@@ -8052,8 +7808,11 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         // Circuit breaker for structured-tool mode (non-text): escalate repeated identical failures.
                         // Skip if this is a timeout -- the nudge already tells the model not to retry, so
                         // accumulating a circuit-breaker count on top is redundant and can fire prematurely.
+                        // Also skip if the output shows partial success (the command did something useful
+                        // even though it exited non-zero) — repeated partial-success runs are not stuck loops.
                         const cbIsTimeout = toolResult.includes('timed out after');
-                        if (!isTextMode && name === 'run_command' && !cbIsTimeout) {
+                        const cbIsPartialSuccess = /\b(CLEANED|DONE|OK|SUCCESS|installed|created|started|stopped|deployed|wrote|updated)\b/i.test(toolResult.slice(-300));
+                        if (!isTextMode && name === 'run_command' && !cbIsTimeout && !cbIsPartialSuccess) {
                             const cmdSigCB = String(args.command ?? '').toLowerCase().trim().slice(0, 200);
                             const cbCount = (this._failedCommandSignatures.get(cmdSigCB) ?? 0) + 1;
                             this._failedCommandSignatures.set(cmdSigCB, cbCount);
@@ -8077,7 +7836,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                                 } else if (/pytest|python.*test|npm.*test/.test(stuckCmd)) {
                                     stuckHint = 'Tests are failing. Read the error output above to find which test is failing and why, then fix the underlying code.';
                                 } else if (/esphome|platformio|arduino/.test(stuckCmd)) {
-                                    stuckHint = 'Build/validation failed. Remove any `| tail` or `| head` filter and run again to see the full error, then fix the config or code shown in the error.';
+                                    const _buildCmdNotFound = /command not found/i.test(errDisplay);
+                                    stuckHint = _buildCmdNotFound
+                                        ? 'The build tool is not on PATH in the SSH non-interactive shell. Find the full path first: `ssh ... "which esphome || find ~/.local/bin /usr/local/bin ~/.platformio/penv/bin -name esphome 2>/dev/null | head -5"`, then use the full path or source ~/.bashrc in your command.'
+                                        : 'Build/validation failed. Remove any `| tail` or `| head` filter and run again to see the full error, then fix the config or code shown in the error.';
                                 }
                                 const MAX_STUCK_HARD_STOP = 4;
                                 if (cbCount >= MAX_STUCK_HARD_STOP) {
@@ -8332,6 +8094,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
 
                     // Track edit_file failures per (path, old_string) to catch repeated identical failures.
                     if (name === 'edit_file') {
+                        // Always record the attempted path so WIP snapshot can report it even if all edits failed
+                        if (args.path) { this._lastAttemptedEditPath = String(args.path); }
                         // Normalize whitespace before hashing so whitespace-variant retries still count
                         const rawOldStr = String(args.old_string ?? '');
                         const normalizedOld = rawOldStr.split('\n').map(l => l.trim()).join('\n').slice(0, 240);
@@ -8360,8 +8124,18 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             const reason = fileFailCount >= this.MAX_FILE_EDIT_FAILURES
                                 ? `You have made ${fileFailCount} failed edit_file attempts on "${args.path}" with different old_string values.`
                                 : `You have tried to edit "${args.path}" with the same old_string ${editFailCount} times and it keeps failing.`;
-                            const editHint = `${reason}\n\nThe file content was already shown below on your first failure. Use those exact lines as old_string, or switch to write_file to rewrite the file entirely after reading it with read_file. DO NOT write a Python script to make this edit — use write_file directly with the full corrected file content.${sweepHint}`;
-                            logWarn(`[agent] edit_file failure threshold reached (${editFailCount}x same-sig, ${fileFailCount}x file) on "${args.path}" -- hard-blocking`);
+                            // Proactively inject the current file content so the model can write_file
+                            // without another read round-trip — this is the main cause of post-compaction loops.
+                            let fileContentBlock = '';
+                            try {
+                                const absEscPath = path.isAbsolute(filePath) ? filePath : path.join(this.workspaceRoot, filePath.replace(/\//g, path.sep));
+                                const fileLines = fs.readFileSync(absEscPath, 'utf8').split('\n');
+                                const numbered = fileLines.map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
+                                const truncated = numbered.length > 12000 ? numbered.slice(0, 12000) + '\n...(file truncated at 12000 chars)' : numbered;
+                                fileContentBlock = `\n\n[CURRENT FILE CONTENT: ${filePath}]\n${truncated}\n\nUse write_file with path="${filePath}" and the full corrected content. Line numbers above (NNNN:) are for reference only — do NOT include them in write_file content.`;
+                            } catch { /* non-fatal */ }
+                            const editHint = `${reason}\n\nSTOP using edit_file on this file. Switch to write_file: read the current content shown below, apply your change, and call write_file with the complete corrected file. DO NOT use a Python script.${sweepHint}${fileContentBlock}`;
+                            logWarn(`[agent] edit_file failure threshold reached (${editFailCount}x same-sig, ${fileFailCount}x file) on "${args.path}" -- hard-blocking, injecting file content`);
                             this._editFileHardBlocked.add(filePath);
                             if (isTextMode) {
                                 this.history.push({ role: 'user', content: `Tool ${name} returned:\n${toolResult}\n---\n[SYSTEM: ${editHint}]` });
@@ -12186,21 +11960,6 @@ if errors:
                     }
                 }
 
-                // Apt upgrade dry-run guard: block "apt upgrade" / "apt-get upgrade" without --dry-run or -s (simulate).
-                // The agent should always run "apt upgrade --dry-run" (or "apt list --upgradable") first,
-                // show the user what will change, then ask before running the live upgrade.
-                // Exceptions: apt update (safe), apt install <pkg> (single targeted install), apt-get dist-upgrade
-                // when the user has already seen the dry-run output and explicitly approved.
-                {
-                    const aptUpgradeMatch = cmd.match(/\bapt(?:-get)?\s+(?:full-upgrade|upgrade)\b/i);
-                    const hasDryRunFlag = /--dry-run|-s\b|--simulate\b/i.test(cmd);
-                    if (aptUpgradeMatch && !hasDryRunFlag) {
-                        logWarn(`[apt-dry-run-guard] apt upgrade without --dry-run blocked: ${cmd.slice(0, 120)}`);
-                        this._guardEvents.push({ type: 'scope-guard', reason: `apt upgrade without dry-run`, file: '' });
-                        return `[DRY-RUN REQUIRED: apt upgrade]\n\nRunning "apt upgrade" without a preview is too destructive to allow without user review.\n\nFirst run the dry-run to show what will change:\n  sudo apt upgrade --dry-run\n  (or: sudo apt list --upgradable)\n\nShare the output with the user. If they approve, run the real upgrade. Do NOT run the live upgrade without showing the package list first.`;
-                    }
-                }
-
                 // â"€â"€ Steelman check for irreversible bulk operations â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
                 // Triggers when the command deletes/overwrites multiple files or overwrites a remote file via scp.
                 // Skipped in merge mode (already confirmed), when auto-approved, and for single-file ops.
@@ -12227,23 +11986,17 @@ if errors:
                     }
                 }
 
-                // SSH root-scan guard: block `find /` (bare root scan) in SSH commands.
-                // Scanning the root filesystem over SSH hangs for 60-120s and produces unusable output.
-                // Allow `find /etc`, `find /opt`, etc. -- only block scans starting at /.
-                if (/^\s*(ssh|scp|sftp)\b/i.test(cmd)) {
-                    const hasRootFind = /\bfind\s+\/\s+/.test(cmd) || /\bfind\s+"\/"\s/.test(cmd) || /\bfind\s+'\/'\s/.test(cmd);
-                    if (hasRootFind) {
-                        logWarn(`[ssh-root-scan-guard] Blocked root filesystem scan in SSH command: ${cmd.slice(0, 120)}`);
-                        this._guardEvents.push({ type: 'scope-guard', reason: 'SSH root filesystem scan', file: '' });
-                        return `[BLOCKED: SSH root filesystem scan]\n\nScanning the entire remote root filesystem with "find /" takes 60-120 seconds and produces unusably large output.\n\nInstead, search in specific directories:\n- Find a config file: ssh <host> "find /etc /opt /var -name 'sabnzbd.ini' 2>/dev/null"\n- Find an executable: ssh <host> "which sabnzbd || find /usr/local /opt -name 'sabnzbd*' -type f 2>/dev/null | head -10"\n- Find by service:   ssh <host> "systemctl show sabnzbd --property=ExecStart"\n\nDo NOT search from / -- use a known subdirectory (/etc, /opt, /var, /usr/local, /home/<user>, /srv).`;
-                    }
-                }
-
                 // In merge mode, Add-Content and Remove-Item are auto-approved (no user prompt needed)
                 const isMergeAutoApprove = this._mergeMode && (
                     /\bAdd-Content\b/i.test(cmd) || /\bRemove-Item\b/i.test(cmd)
                 );
-                const accepted = isMergeAutoApprove || isAutoApprovedCmd || await this.requestConfirmation('run', cmd, 'run_command');
+                // Trust/YOLO: non-destructive commands are auto-approved; destructive already prompted above.
+                // Normal: check if this exact command string was Accept-All'd, or prompt.
+                const isTrustAutoApprove = this.trustLevel === 'trust' || this.trustLevel === 'yolo';
+                const isNormalCmdApproved = this.trustLevel === 'normal' && (isAutoApprovedCmd || this._isCommandApproved(cmd));
+                const accepted = isMergeAutoApprove || isTrustAutoApprove || isNormalCmdApproved
+                    // Normal mode: pass the command string as toolName so Accept All scopes to this command
+                    || await this.requestConfirmation('run', cmd, this.trustLevel === 'normal' ? cmd.trim() : 'run_command');
                 if (!accepted) { return 'Command cancelled by user.'; }
 
                 // ── Long-running script pre-flight guard ──────────────────────────────────
@@ -12545,12 +12298,12 @@ if errors:
                     const hasPort = /(?:port\s*[:=]?\s*\d{2,5}|:\d{2,5}\b)/.test(content);
                     const hasCredential = /(?:key|token|password|secret|credential)/i.test(content);
                     // Also allow file path facts: entries mentioning a named file with extension
-                    // (e.g. "database path: tasks.db", "config file: settings.json") -- these are
-                    // infrastructure facts even when expressed as relative paths.
                     const hasFilePath = /\b[\w.-]+\.(?:db|sqlite|sqlite3|json|py|ts|js|yaml|yml|conf|cfg|env|sh|log|txt|csv)\b/i.test(content)
                         && /\b(path|file|location|database|config|log|dir|directory)\b/i.test(content);
-                    if (!hasIP && !hasURL && !hasPath && !hasPort && !hasCredential && !hasFilePath) {
-                        return `Tier 0 is reserved for critical infrastructure (IPs, URLs, ports, paths, credentials). "${content.slice(0, 60)}" doesn't match. Use Tier 1 for frameworks/tools or Tier 2 for operational context.`;
+                    // Device/hardware facts: serial ports, baud rates, device names, firmware paths
+                    const hasDeviceFact = /(?:\/dev\/tty|COM\d+|\bbaud\b|\bserial\b|\bdevice\b|\bfirmware\b|\bboard\b|\bflash\b|\besphome\b|\bplatformio\b)/i.test(content);
+                    if (!hasIP && !hasURL && !hasPath && !hasPort && !hasCredential && !hasFilePath && !hasDeviceFact) {
+                        return `Tier 0 is reserved for critical infrastructure (IPs, URLs, ports, paths, credentials, device configs). "${content.slice(0, 60)}" doesn't match. Use Tier 1 for frameworks/tools or Tier 2 for operational context.`;
                     }
                 }
 
@@ -15332,6 +15085,12 @@ ${sampleHtml}
     /** Port pattern that requires explicit "on port" / "port:" context */
     private static readonly PORT_WITH_CONTEXT = /\b(?:(?:on|listening|running|connect)\s+)?port\s+(\d{2,5})\b/gi;
 
+    /** Serial/device port pattern: /dev/ttyUSB0, /dev/ttyACM1, COM3, etc. */
+    private static readonly SERIAL_PORT_WITH_CONTEXT = /(?:(?:serial|uart|device|port|connect(?:ed)?(?:\s+(?:to|via))?|flash(?:ing)?|upload(?:ing)?)\s+(?:(?:is|at|on|via|to|over)\s+)?)?(?:\/dev\/(?:tty(?:USB|ACM|S|AMA|serial)\d*|serial\d*|rfcomm\d*)|COM\d+)\b/gi;
+
+    /** Baud rate pattern: "baud rate 115200", "at 9600 baud", "baudrate=115200" */
+    private static readonly BAUD_RATE_WITH_CONTEXT = /\b(?:baud(?:\s*rate)?|speed)\s*(?:is\s*|[:=]\s*)?(\d{2,7})\b|\b(\d{2,7})\s+baud\b/gi;
+
     /** Known technology names (same set, used only with intent context now) */
     private static readonly KNOWN_TECHNOLOGIES = new Set([
         'react', 'vue', 'angular', 'svelte', 'next.js', 'nuxt', 'express', 'fastify', 'koa', 'hapi',
@@ -15368,23 +15127,33 @@ ${sampleHtml}
      * Requires intent context ("we use X", "server is at X") -- bare keyword mentions are ignored.
      * Skips negative context ("we don't use X", "instead of X").
      */
-    private async autoExtractFacts(userMessage: string, _assistantResponse: string): Promise<void> {
+    private async autoExtractFacts(userMessage: string, assistantResponse: string): Promise<void> {
         if (!this.memory) { return; }
 
-        // Only extract from user message -- assistant responses are too noisy
+        // Extract structured facts from user message (IPs, URLs, ports, SSH, device configs).
+        // Also scan tool results / assistant response for device-specific discoveries (serial ports,
+        // baud rates, tool paths found via `which` commands) — these are too noisy for general
+        // extraction but safe for pattern-matched device facts.
         const text = userMessage;
-        if (text.length < 10) { return; } // Too short to contain meaningful facts
+        // Also scan assistant response for device facts discovered during tool execution
+        const toolText = assistantResponse.slice(0, 3000); // cap to avoid noise
 
         // Quick pre-check: skip if no extractable patterns exist at all
         const hasAnyPattern = Agent.INTENT_PATTERNS.some(p => p.test(text))
             || Agent.IP_WITH_CONTEXT.test(text)
             || Agent.URL_WITH_CONTEXT.test(text)
-            || Agent.PORT_WITH_CONTEXT.test(text);
+            || Agent.PORT_WITH_CONTEXT.test(text)
+            || Agent.SERIAL_PORT_WITH_CONTEXT.test(text)
+            || Agent.BAUD_RATE_WITH_CONTEXT.test(text)
+            || Agent.SERIAL_PORT_WITH_CONTEXT.test(toolText)
+            || Agent.BAUD_RATE_WITH_CONTEXT.test(toolText);
         // Reset lastIndex after test() calls on global regexes
         Agent.IP_WITH_CONTEXT.lastIndex = 0;
         Agent.URL_WITH_CONTEXT.lastIndex = 0;
         Agent.PORT_WITH_CONTEXT.lastIndex = 0;
-        if (!hasAnyPattern) { return; }
+        Agent.SERIAL_PORT_WITH_CONTEXT.lastIndex = 0;
+        Agent.BAUD_RATE_WITH_CONTEXT.lastIndex = 0;
+        if (!hasAnyPattern || text.length < 10) { return; }
 
         const existingContext = this.memory.buildContext([0, 1, 2, 3, 4], 8000).toLowerCase();
         const saves: Array<{ tier: 0|1|2|3|4|5; content: string; tags: string[] }> = [];
@@ -15469,6 +15238,38 @@ ${sampleHtml}
                 }
             } catch (e) {
                 logWarn(`[auto-memory] Failed to update context.md with SSH host: ${toErrorMessage(e)}`);
+            }
+        }
+
+        // â"€â"€ Extract serial/device ports ───────────────────────────────────────────
+        // Scan both user message and tool output text (device paths often come from `which` results)
+        for (const scanText of [text, toolText]) {
+            Agent.SERIAL_PORT_WITH_CONTEXT.lastIndex = 0;
+            while ((match = Agent.SERIAL_PORT_WITH_CONTEXT.exec(scanText)) !== null) {
+                const devMatch = match[0].match(/(?:\/dev\/(?:tty(?:USB|ACM|S|AMA|serial)\d*|serial\d*|rfcomm\d*)|COM\d+)/i);
+                if (!devMatch) { continue; }
+                const devPath = devMatch[0];
+                if (existingContext.includes(devPath.toLowerCase())) { continue; }
+                if (saves.some(s => s.content.includes(devPath))) { continue; }
+                const surrounding = scanText.slice(Math.max(0, match.index - 40), match.index + match[0].length + 40);
+                if (hasNegative(surrounding)) { continue; }
+                saves.push({ tier: 0, content: `Serial port: ${devPath}`, tags: ['serial', 'device', 'infrastructure'] });
+            }
+        }
+
+        // â"€â"€ Extract baud rates ────────────────────────────────────────────────────
+        for (const scanText of [text, toolText]) {
+            Agent.BAUD_RATE_WITH_CONTEXT.lastIndex = 0;
+            while ((match = Agent.BAUD_RATE_WITH_CONTEXT.exec(scanText)) !== null) {
+                const baud = match[1] ?? match[2];
+                if (!baud) { continue; }
+                const VALID_BAUDS = new Set(['300','1200','2400','4800','9600','14400','19200','38400','57600','115200','230400','460800','921600']);
+                if (!VALID_BAUDS.has(baud)) { continue; }
+                if (existingContext.includes(`baud`) && existingContext.includes(baud)) { continue; }
+                if (saves.some(s => s.content.includes(baud) && s.tags.includes('baud'))) { continue; }
+                const surrounding = scanText.slice(Math.max(0, match.index - 40), match.index + match[0].length + 40);
+                if (hasNegative(surrounding)) { continue; }
+                saves.push({ tier: 0, content: `Baud rate: ${baud}`, tags: ['baud', 'serial', 'device', 'infrastructure'] });
             }
         }
 
@@ -17136,5 +16937,467 @@ ${sampleHtml}
         const injection = sections.join('\n');
         logInfo(`[pre-edit] Injected ${injection.length} chars -- file: ${targetRelPath}, models: ${modelsInventory.length}, routes: ${definedRoutes.length}, callers: ${callerReport.reduce((a, c) => a + c.callers.length, 0)} (${callerReport.reduce((a, c) => Math.max(a, c.hopCount), 0)} hops), warnings: ${preValidationWarnings.length}, stub: ${!!stubWarning}, colExists: ${!!columnExistsNote}, jsHandler: ${!!formJsHandler}, backendRoute: ${!!formBackendRoute}`);
         return { injection, blocked: null, pendingSteps: completionChecks };
+    }
+
+    /**
+     * Guarantee the webview spinner always stops -- even if the run() body
+     * throws, panics, or returns early via an unhandled path.
+     */
+    private ensureStop(exitReason: 'complete' | 'stop' | 'exhausted' | 'error', runStart: number, post: PostFn): void {
+        if (this._asyncHandles.size > 0) {
+            logWarn(`[delegate_task_async] ${this._asyncHandles.size} uncollected handle(s) at run end: ${[...this._asyncHandles.keys()].join(', ')}`);
+            this._asyncHandles.clear();
+        }
+        if (this._confirmTimedOut) {
+            post({ type: 'token', text: '\n\n*Paused -- waiting for your approval. The pending edit is shown above. Click Accept to apply it, or send a new message to continue.* ' });
+            post({ type: 'assistantMessage', content: '' });
+        }
+        post({ type: 'runEnd', reason: exitReason, durationMs: Date.now() - runStart });
+    }
+
+    /**
+     * Detect conflicting requirements in the user's message.
+     */
+    private detectConflictingRequirements(userMessage: string): string {
+        const conflictPairs: Array<[RegExp, RegExp, string]> = [
+            [
+                /\bnot\s+null\b/i,
+                /\bbackward.?compat|don'?t\s+break\s+existing|existing\s+(?:db|database|callers?|code)\b/i,
+                'Adding a NOT NULL column without a DEFAULT breaks existing databases on ALTER TABLE -- existing rows have no value for the new column. Before editing: tell the user this conflict, propose a resolution (e.g. use DEFAULT \'unknown\', or drop NOT NULL), and ask which they prefer.'
+            ],
+            [
+                /\badd\s+(?:a\s+)?(?:required|mandatory)\s+(?:field|column|parameter)\b/i,
+                /\bdon'?t\s+break|existing\s+callers?\b/i,
+                'A required field/parameter will break all existing callers -- these requirements conflict.'
+            ],
+        ];
+        for (const [patA, patB, note] of conflictPairs) {
+            if (patA.test(userMessage) && patB.test(userMessage)) {
+                logInfo(`[conflict-detect] Conflicting requirements detected in task message`);
+                return `\n\n[CONFLICTING REQUIREMENTS] ${note}\n\nBefore editing any files: tell the user about this conflict in one sentence, propose your resolution (e.g. use DEFAULT NULL, or add a migration), and ask if that is acceptable. Do not edit until confirmed.`;
+            }
+        }
+        return '';
+    }
+
+    /**
+     * Pre-classify model mode: known text-mode families skip detection entirely.
+     */
+    private preClassifyModelMode(model: string): void {
+        if (this.toolMode === 'native') {
+            if (Agent.isKnownTextModeModel(model)) {
+                this.toolMode = 'text';
+                Agent.textModeModels.add(model);
+                logInfo(`Model ${model} -> text-mode (known family, no detection needed)`);
+            } else if (Agent.textModeModels.has(model)) {
+                this.toolMode = 'text';
+                logInfo(`Model ${model} -> text-mode (learned from previous session)`);
+            }
+        }
+    }
+
+    /**
+     * Trim history before adding a new message to prevent exceeding the model's context window.
+     */
+    private trimHistoryForContext(): void {
+        const contextPct = this._lastContextPct ?? 0;
+        const effectiveMax = contextPct >= 16
+            ? Math.floor(this.MAX_HISTORY_MESSAGES * 0.6)
+            : this.MAX_HISTORY_MESSAGES;
+        if (this.history.length >= effectiveMax) {
+            const removed = this.history.length - effectiveMax;
+            this.history = this.history.slice(-effectiveMax);
+            logInfo(`[agent] History trimmed: removed ${removed} old messages (ctx=${contextPct.toFixed(1)}%, cap=${effectiveMax})`);
+        }
+    }
+
+    /**
+     * Inject a workspace directory listing into the last user message when the
+     * task involves file modifications. Prevents the model from hallucinating filenames.
+     */
+    private injectWorkspaceSnapshot(userMessage: string, isConfirmation: boolean): void {
+        if (isConfirmation || !this.workspaceRoot) { return; }
+        try {
+            const isFileTask = /\b(edit|modify|update|change|fix|write|create|add|build|implement|refactor|make|adjust|rebuild|redo|redo|rewrite)\b/i.test(userMessage);
+            if (!isFileTask) { return; }
+
+            const pathMentions = userMessage.match(/(?:[A-Za-z]:[\\/]|\.\.?[\\/]|[\w-]+\/)+[\w.-]+\.[\w]+/g) ?? [];
+            const dirHints = pathMentions.map(p => path.dirname(p.replace(/\\/g, '/'))).filter(d => d !== '.');
+            const extMentions = (userMessage.match(/\.(py|ts|js|scad|yaml|yml|json|md|html|css|go|rs|java|rb|txt|sh)\b/gi) ?? [])
+                .map(e => e.toLowerCase());
+
+            let snapshotDir = this.workspaceRoot;
+            if (dirHints.length > 0) {
+                const candidate = path.join(this.workspaceRoot, dirHints[0]);
+                if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+                    snapshotDir = candidate;
+                }
+            }
+
+            const skipDirsSnap = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build', '.ollamaforge', '.cache']);
+            const entries = fs.readdirSync(snapshotDir, { withFileTypes: true });
+            const lines: string[] = [];
+            for (const e of entries) {
+                if (e.name.startsWith('.') || skipDirsSnap.has(e.name)) { continue; }
+                const eFull = path.join(snapshotDir, e.name);
+                if (e.isDirectory()) {
+                    lines.push(`  ${e.name}/`);
+                } else {
+                    const extMatch = extMentions.length === 0 || extMentions.some(ext => e.name.toLowerCase().endsWith(ext));
+                    if (!extMatch) { continue; }
+                    let lineCount = '';
+                    try {
+                        const lc = fs.readFileSync(eFull, 'utf8').split('\n').length;
+                        lineCount = ` (${lc} lines)`;
+                    } catch { /* skip */ }
+                    lines.push(`  ${e.name}${lineCount}`);
+                }
+                if (lines.length >= 40) { lines.push('  ... (more files)'); break; }
+            }
+
+            if (lines.length > 0 && lines.length <= 40) {
+                const dirRel = path.relative(this.workspaceRoot, snapshotDir).replace(/\\/g, '/') || '.';
+                const snapshotNote = `\n\n[WORKSPACE: ${dirRel}/]\n${lines.join('\n')}\n[END WORKSPACE]\nThese are the actual files on disk. Use exact filenames -- do not guess or reconstruct from memory.`;
+                const lastEntry = this.history[this.history.length - 1];
+                if (lastEntry && lastEntry.role === 'user' && typeof lastEntry.content === 'string') {
+                    lastEntry.content += snapshotNote;
+                    logInfo(`[workspace-snapshot] Injected ${lines.length} entries from ${dirRel}`);
+                }
+            }
+        } catch { /* non-fatal -- snapshot is best-effort */ }
+    }
+
+    /**
+     * Save structured facts from dropped messages to Tier 2 memory (fire-and-forget async).
+     * Uses LLM extraction with regex fallback.
+     */
+    private saveDroppedToMemory(autoDropped: OllamaMessage[]): void {
+        if (!this.memory) { return; }
+        const droppedForSave = autoDropped;
+        const droppedText = droppedForSave
+            .filter(m => m.role === 'user' || m.role === 'assistant')
+            .map(m => `${m.role}: ${m.content.slice(0, 500)}`)
+            .join('\n');
+        const currentModel2 = this.currentModel || getConfig().model;
+        const taskMsgSnap = this._currentTaskMessage;
+        (async () => {
+            try {
+                let rawSummary = '';
+                if (droppedText.trim()) {
+                    await streamChatRequest(
+                        currentModel2,
+                        [
+                            {
+                                role: 'system',
+                                content: [
+                                    'You are a context extractor. Extract structured facts from this conversation.',
+                                    'Output ONLY a JSON object with these keys (omit any key with an empty value):',
+                                    '  task: string -- one sentence describing what was being worked on',
+                                    '  files_confirmed: string[] -- real file paths that were found and confirmed correct',
+                                    '  files_ruled_out: string[] -- stub files, wrong paths, files that do not exist',
+                                    '  decisions: string[] -- key decisions made',
+                                    '  edits_made: string[] -- describe each successful file edit',
+                                    '  blockers: string[] -- anything that failed or was unclear',
+                                    '  next_step: string -- what should happen next if the task is not done',
+                                    'Output ONLY the JSON. No explanation, no markdown fences.',
+                                ].join('\n'),
+                            },
+                            { role: 'user', content: droppedText.slice(0, 6000) },
+                        ],
+                        [],
+                        (token) => { rawSummary += token; },
+                        { stop: false },
+                        { numPredict: -1 }
+                    );
+                }
+                let structured: Record<string, unknown> = {};
+                try {
+                    const jsonMatch = rawSummary.match(/\{[\s\S]*\}/);
+                    if (jsonMatch) { structured = JSON.parse(jsonMatch[0]); }
+                } catch { /* fall through */ }
+                const lines: string[] = [];
+                if (taskMsgSnap) { lines.push(`Task: ${taskMsgSnap.slice(0, 80)}`); }
+                if (structured.task) { lines.push(`Summary: ${structured.task}`); }
+                if (Array.isArray(structured.files_confirmed) && structured.files_confirmed.length) {
+                    lines.push(`Files confirmed: ${(structured.files_confirmed as string[]).join(', ')}`);
+                }
+                if (Array.isArray(structured.files_ruled_out) && structured.files_ruled_out.length) {
+                    lines.push(`Files ruled out: ${(structured.files_ruled_out as string[]).join(', ')}`);
+                }
+                if (Array.isArray(structured.decisions) && structured.decisions.length) {
+                    lines.push(`Decisions: ${(structured.decisions as string[]).join(' | ')}`);
+                }
+                if (Array.isArray(structured.edits_made) && structured.edits_made.length) {
+                    lines.push(`Edits made: ${(structured.edits_made as string[]).join(' | ')}`);
+                }
+                if (structured.next_step) { lines.push(`Next step: ${structured.next_step}`); }
+                if (Array.isArray(structured.blockers) && structured.blockers.length) {
+                    lines.push(`Blockers: ${(structured.blockers as string[]).join(' | ')}`);
+                }
+                lines.push(`(auto-compact ${new Date().toLocaleTimeString()})`);
+                const memNote = lines.join('\n');
+                this.memory!.addEntry(2, memNote, ['auto-compact', 'session']).catch((e) => logWarn(`[memory] background write failed: ${toErrorMessage(e)}`));
+                logInfo(`[context] Auto-compact: saved structured snapshot to Tier 2 memory (${lines.length} facts)`);
+            } catch (err) {
+                logWarn(`[context] Auto-compact: structured extraction failed, falling back to regex: ${toErrorMessage(err)}`);
+                const editFacts = droppedForSave
+                    .filter(m => m.role === 'assistant')
+                    .flatMap(m => {
+                        const edits = [...m.content.matchAll(/Edited:\s*([^\s--]+)/g)].map(x => `edited ${x[1]}`);
+                        const paths = [...m.content.matchAll(/['"](app\/[^'"]+\.[a-z]+)['"]/g)].map(x => x[1]);
+                        return [...edits, ...paths];
+                    })
+                    .filter((v, i, a) => a.indexOf(v) === i)
+                    .slice(0, 8);
+                if (editFacts.length > 0 || taskMsgSnap) {
+                    const fallbackNote = [
+                        taskMsgSnap ? `Task: ${taskMsgSnap.slice(0, 80)}` : '',
+                        editFacts.length ? `Progress: ${editFacts.join(', ')}` : '',
+                        `(auto-compact fallback ${new Date().toLocaleTimeString()})`,
+                    ].filter(Boolean).join('\n');
+                    this.memory!.addEntry(2, fallbackNote, ['auto-compact', 'session']).catch((e) => logWarn(`[memory] background write failed: ${toErrorMessage(e)}`));
+                }
+            }
+        })();
+    }
+
+    /**
+     * Build a human-readable summary of what we remember after compaction, shown in chat.
+     */
+    private buildCompactSummary(messagesRemoved: number): string {
+        const lines: string[] = [];
+        const summaryTask = this._originalTaskMessage || this._currentTaskMessage;
+        if (summaryTask) {
+            lines.push(`**Task:** ${summaryTask.slice(0, 200)}`);
+        }
+        if (this._editsThisRun > 0) {
+            lines.push(`**Edits made:** ${this._editsThisRun} file${this._editsThisRun !== 1 ? 's' : ''}${this._lastEditedFilePath ? ` (last: ${this._lastEditedFilePath.split('/').pop()})` : ''}`);
+        }
+        if (this._filesAutoReadThisRun.size > 0) {
+            const readList = [...this._filesAutoReadThisRun].slice(0, 8).map(f => f.split('/').pop()).join(', ');
+            lines.push(`**Files reviewed:** ${readList}`);
+        }
+        if (this._activeTask?.stepsCompleted.length) {
+            lines.push(`**Completed:** ${this._activeTask.stepsCompleted.join(', ')}`);
+        }
+        if (this._activeTask?.stepsPending.length) {
+            lines.push(`**Still to do:** ${this._activeTask.stepsPending.join(', ')}`);
+        }
+        const lastAsstMsg = this.history.filter(m => m.role === 'assistant' && typeof m.content === 'string' && (m.content as string).trim().length > 20).slice(-1)[0];
+        if (lastAsstMsg) {
+            const snippet = (lastAsstMsg.content as string)
+                .replace(/<tool>[\s\S]*?<\/tool>/g, '')
+                .replace(/<tool>[\s\S]*/g, '')
+                .replace(/\[system:[\s\S]*?\]/g, '')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+            if (snippet.length > 150) {
+                lines.push(`**Last action:** ${snippet.slice(0, 150)}...`);
+            } else if (snippet.length > 10) {
+                lines.push(`**Last action:** ${snippet}`);
+            }
+        }
+        if (lines.length === 0) {
+            return `Compacted ${messagesRemoved} messages. No task context available.`;
+        }
+        return `Compacted ${messagesRemoved} messages. Context preserved:\n` + lines.join('\n');
+    }
+
+    /**
+     * After compaction, inject WIP snapshot + recent Tier 2 memory + task log
+     * at the front of history so the model knows exactly what it was doing.
+     * Returns the injected note string (empty if no task message).
+     */
+    private injectPostCompactContext(wipSnapshot: string, wipLines: string[]): string {
+        if (!this._currentTaskMessage) { return ''; }
+
+        // Load any recent Tier 2 memory facts (includes the sync WIP entry we just saved)
+        let recentMemFacts = '';
+        if (this.memory) {
+            try {
+                const tier2 = this.memory.getTier(2)
+                    .filter(e => e.tags?.includes('auto-compact') || e.tags?.includes('wip-sync'))
+                    .slice(0, 4);
+                if (tier2.length) {
+                    recentMemFacts = '\n\nSession memory (from compaction):\n' + tier2.map(e => `- ${e.content.slice(0, 150)}`).join('\n');
+                }
+            } catch { /* skip */ }
+        }
+
+        // Read task log file -- the richest record of what was planned and completed.
+        let taskLogContent = '';
+        const taskLogId = this._activeTask?.taskId;
+        if (taskLogId && this.workspaceRoot) {
+            try {
+                const taskLogPath = path.join(this.workspaceRoot, '.ollamaforge', 'tasks', taskLogId, 'log.md');
+                if (fs.existsSync(taskLogPath)) {
+                    const raw = fs.readFileSync(taskLogPath, 'utf8');
+                    const trimmed = raw.length > 3000 ? '...(truncated)\n' + raw.slice(-3000) : raw;
+                    taskLogContent = `\n\nTask log (.ollamaforge/tasks/${taskLogId}/log.md):\n${trimmed}`;
+                    logInfo(`[context] Injected task log (${raw.length} chars, taskId=${taskLogId}) into compact note`);
+                }
+            } catch { /* skip */ }
+        }
+
+        const injectedCompactNote = `${wipSnapshot}${taskLogContent}${recentMemFacts}\n\nResume task: ${this._currentTaskMessage}`;
+        this.history.unshift({ role: 'user', content: injectedCompactNote });
+        logInfo(`[context] Injected WIP snapshot after compaction (${wipLines.length} facts, taskLog=${taskLogId ?? 'none'})`);
+        return injectedCompactNote;
+    }
+
+    /**
+     * Core auto-compaction: shrink large tool messages, score-based compaction,
+     * min-remove floor, and anti-thrash detection.
+     * Returns shouldBreak=true if the anti-thrash limit is hit (caller should break the turn loop).
+     */
+    private performCoreCompaction(
+        contextStats: ContextStats,
+        post: PostFn
+    ): { shouldBreak: boolean; messagesRemoved: number; autoDropped: OllamaMessage[] } {
+        const oldMessageCount = this.history.length;
+
+        // Step 1: Proportional shrink -- trim the largest tool-result messages first
+        const targetTokens = Math.floor((contextStats.modelLimit * 50) / 100)
+            - contextStats.systemPromptTokens - contextStats.memoryTokens;
+        this.history = shrinkLargeToolMessages(this.history, targetTokens);
+
+        // Step 2: Score-based compaction -- drop lowest-value messages until we hit the token target
+        const compactResult = compactHistory(
+            this.history,
+            50,
+            contextStats.modelLimit,
+            contextStats.systemPromptTokens,
+            contextStats.memoryTokens
+        );
+        this.history = compactResult.kept;
+        let autoDropped = compactResult.dropped;
+
+        // Guarantee at least 40% of messages are removed
+        const minAutoRemove = Math.max(Math.floor(oldMessageCount * 0.4), 4);
+        if (oldMessageCount - this.history.length < minAutoRemove && oldMessageCount > minAutoRemove) {
+            const extra = minAutoRemove - (oldMessageCount - this.history.length);
+            const moved = this.history.slice(0, extra);
+            this.history = this.history.slice(extra);
+            autoDropped = [...moved, ...autoDropped];
+            logInfo(`[context] Auto-compact minRemove floor applied: forced ${minAutoRemove} drops`);
+        }
+
+        const messagesRemoved = oldMessageCount - this.history.length;
+
+        // Anti-thrash: if 3 consecutive compactions all saved < 10%, stop cycling
+        const savingsRatio = oldMessageCount > 0 ? messagesRemoved / oldMessageCount : 0;
+        this._compactionRatios.push(savingsRatio);
+        const THRASH_MIN_SAVINGS = 0.10;
+        const THRASH_WINDOW = 3;
+        if (this._compactionRatios.length >= THRASH_WINDOW) {
+            const recentRatios = this._compactionRatios.slice(-THRASH_WINDOW);
+            if (recentRatios.every(r => r < THRASH_MIN_SAVINGS)) {
+                logWarn(`[context] Anti-thrash: ${THRASH_WINDOW} compactions all saved < ${(THRASH_MIN_SAVINGS * 100).toFixed(0)}% -- context cannot be meaningfully shrunk. Stopping loop to avoid infinite compaction cycle.`);
+                post({ type: 'error', text: `**Context compaction stuck** -- the conversation history cannot be meaningfully reduced (${THRASH_WINDOW} attempts all saved < ${(THRASH_MIN_SAVINGS * 100).toFixed(0)}%). Please start a new conversation or use /compact to manually summarize.` });
+                return { shouldBreak: true, messagesRemoved, autoDropped };
+            }
+        }
+
+        return { shouldBreak: false, messagesRemoved, autoDropped };
+    }
+
+    /**
+     * Detect early-compaction stalls: if context fills before any work is done
+     * (turn 0-1, zero edits, zero tool calls), two consecutive such runs means
+     * an unrecoverable "read plan → exhaust context → compact → repeat" loop.
+     * Returns true if the run should stop.
+     */
+    private checkEarlyCompactionStall(turn: number, post: PostFn): boolean {
+        const noToolCallsMade = this._toolCallsThisRun.length === 0;
+        if (turn <= 1 && this._editsThisRun === 0 && noToolCallsMade) {
+            this._earlyCompactionStalls++;
+            logWarn(`[context] Early-compaction stall #${this._earlyCompactionStalls} (turn=${turn}, edits=0, toolCalls=0)`);
+            if (this._earlyCompactionStalls >= 2) {
+                logWarn(`[context] Early-compaction stall limit reached — stopping to break loop`);
+                post({ type: 'streamEnd' });
+                post({
+                    type: 'error',
+                    text: `[warn] The context window fills up before any work can be done (stall #${this._earlyCompactionStalls}). ` +
+                        `This usually means the system prompt + memory + task description alone exceeds the model's context budget. ` +
+                        `Try: switching to a model with a larger context window, clearing session memory, or breaking the task into a smaller first step.`
+                });
+                this._runOutcome = 'error';
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Build a work-in-progress snapshot for context compaction.
+     * Captures session state so the model can resume without repeating work.
+     */
+    private buildWipSnapshot(usagePct: number, historyBeforeCompact: OllamaMessage[]): string[] {
+        const wipLines: string[] = [];
+        wipLines.push(`[WORK IN PROGRESS -- Context was compacted at ${usagePct.toFixed(0)}% usage]`);
+        const sessionTask = this._originalTaskMessage || this._currentTaskMessage;
+        wipLines.push(`Original task: ${sessionTask}`);
+        if (this._currentTaskMessage !== sessionTask) {
+            wipLines.push(`Most recent user message: ${this._currentTaskMessage}`);
+        }
+
+        if (this._filesAutoReadThisRun.size > 0) {
+            wipLines.push(`Files read this session: ${[...this._filesAutoReadThisRun].join(', ')}`);
+        }
+
+        if (this._editsThisRun > 0) {
+            wipLines.push(`Edits made this session: ${this._editsThisRun} edit(s), last file: ${this._lastEditedFilePath || 'unknown'}`);
+        } else if (this._lastAttemptedEditPath) {
+            // edit_file was attempted but all attempts failed — tell the model exactly where it was stuck
+            const failCount = this._failedEditByFile.get(this._lastAttemptedEditPath.replace(/\\/g, '/')) ?? 0;
+            wipLines.push(`No successful edits yet. Was attempting to edit: ${this._lastAttemptedEditPath} (${failCount} failed attempt${failCount !== 1 ? 's' : ''}). IMPORTANT: Do NOT retry edit_file on this file with the same old_string. Use edit_file_at_line with exact line numbers, or use write_file to rewrite the whole file after reading it first.`);
+        } else {
+            wipLines.push(`No file edits made yet this session.`);
+        }
+
+        if (this._activeTask) {
+            if (this._activeTask.stepsCompleted.length) {
+                wipLines.push(`Steps completed: ${this._activeTask.stepsCompleted.join(' | ')}`);
+            }
+            if (this._activeTask.stepsPending.length) {
+                wipLines.push(`Steps still pending: ${this._activeTask.stepsPending.join(' | ')}`);
+            }
+            if (this._activeTask.filesConfirmed.length) {
+                wipLines.push(`Files confirmed correct: ${this._activeTask.filesConfirmed.join(', ')}`);
+            }
+            if (this._activeTask.filesRuledOut.length) {
+                wipLines.push(`Files ruled out (stubs/wrong): ${this._activeTask.filesRuledOut.join(', ')}`);
+            }
+        }
+
+        const lastAssistantMsgs = this.history
+            .filter(m => m.role === 'assistant' && typeof m.content === 'string' && (m.content as string).trim().length > 0)
+            .slice(-3);
+        if (lastAssistantMsgs.length > 0) {
+            const lastMsg = lastAssistantMsgs[lastAssistantMsgs.length - 1];
+            const snippet = (lastMsg.content as string).slice(0, 600).trim();
+            wipLines.push(`Last action / progress before compaction:\n${snippet}`);
+        }
+
+        const toolResults = historyBeforeCompact
+            .filter(m => m.role === 'tool' && typeof m.content === 'string')
+            .filter(m => (m.content as string).startsWith('[TOOL RESULT: run_command]') || (m.content as string).startsWith('[TOOL RESULT: shell_read]'))
+            .slice(-6);
+        if (toolResults.length > 0) {
+            const cmdSummary = toolResults.map(m => {
+                const body = (m.content as string)
+                    .replace(/^\[TOOL RESULT: \w+\]\n/, '')
+                    .replace(/\[SELF-CHECK\][\s\S]*/g, '')
+                    .trim()
+                    .slice(0, 200);
+                return body;
+            }).filter(Boolean).join('\n---\n');
+            if (cmdSummary) {
+                wipLines.push(`Recent command outputs (last ${toolResults.length}):\n${cmdSummary}`);
+            }
+        }
+
+        wipLines.push(`IMPORTANT: Do NOT repeat work already done. Continue from where you left off.`);
+        return wipLines;
     }
 }

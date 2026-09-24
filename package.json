@@ -30,15 +30,15 @@
     "theme": "dark"
   },
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.134.0"
   },
   "main": "dist/main.js",
   "scripts": {
     "vendor": "node scripts/vendor-hljs.js",
     "compile": "npm run vendor && tsc",
     "deploy": "npm run bundle && node scripts/deploy.js && node scripts/verify-deploy.js",
-    "bundle": "npm run vendor && node esbuild.js",
-    "bundle:prod": "npm run vendor && node esbuild.js --production",
+    "bundle": "npm run vendor && node scripts/build-webview.js && node esbuild.js",
+    "bundle:prod": "npm run vendor && node scripts/build-webview.js && node esbuild.js --production",
     "build": "npm run deploy",
     "package": "npm run compile && npx vsce package",
     "vscode:prepublish": "npm run bundle:prod",
@@ -237,6 +237,10 @@
       {
         "command": "ollamaForge.checkStackHealth",
         "title": "Ollama Forge: Check Stack Health"
+      },
+      {
+        "command": "ollamaForge.status",
+        "title": "Ollama Forge: Status"
       }
     ],
     "menus": {

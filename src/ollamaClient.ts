@@ -222,6 +222,7 @@ export function streamChatRequest(
     }
 ): Promise<StreamResult> {
     return new Promise((resolve, reject) => {
+        let destroyed = false; // local flag — survives stopRef.stop being cleared by retry logic
         const { hostname, port } = getEndpoint();
         const cfg = getConfig();
         const payload: Record<string, unknown> = {
@@ -481,7 +482,7 @@ export function streamChatRequest(
                 };
 
                 res.on('data', (chunk: Buffer) => {
-                    if (stopRef.stop) { req.destroy(); return; }
+                    if (stopRef.stop) { destroyed = true; req.destroy(); return; }
                     buf += chunk.toString();
                     const lines = buf.split('\n');
                     buf = lines.pop() ?? '';
@@ -540,7 +541,7 @@ export function streamChatRequest(
                                         const reason = thinkingLoop ? 'repetition loop' : thinkingSpiral ? 'list-continuation spiral' : thinkingPreDraft ? 'pre-drafting file content in thinking' : `thinking exceeded ${MAX_THINKING_CHARS} chars`;
                                         logWarn(`[stream] Thinking block aborted — ${reason} after ${fullThinking.length} chars`);
                                         resolved = true;
-                                        stopRef.stop = true; // suppress req.on('error') ECONNRESET after destroy
+                                        stopRef.stop = true; destroyed = true; // suppress req.on('error') ECONNRESET after destroy
                                         req.destroy();
                                         // Close the thinking block in the webview — without this the THINK_END
                                         // sentinel is never emitted and all recovery content routes to the
@@ -590,7 +591,7 @@ export function streamChatRequest(
                                 if (!resolved && !insideToolBlock && (++_repCheckCounter % REP_CHECK_INTERVAL) === 0 && isRepeating(fullContent)) {
                                     logWarn(`[stream] Repetition loop detected after ${fullContent.length} chars — aborting stream`);
                                     resolved = true;
-                                    stopRef.stop = true;
+                                    stopRef.stop = true; destroyed = true;
                                     req.destroy();
                                     const avgLogprob = logprobCount > 0 ? logprobSum / logprobCount : null;
                                     const trimAt = Math.max(0, fullContent.length - REPETITION_WINDOW);
@@ -608,7 +609,7 @@ export function streamChatRequest(
                                         const whichTag = thinkTagCount >= 8 ? '</think>' : antThinkTagCount >= 8 ? '</antThinking>' : '</function>';
                                         logWarn(`[stream] ${whichTag} tag loop detected — aborting`);
                                         resolved = true;
-                                        stopRef.stop = true;
+                                        stopRef.stop = true; destroyed = true;
                                         req.destroy();
                                         const avgLogprobTT = logprobCount > 0 ? logprobSum / logprobCount : null;
                                         const thinkTagStart = Math.max(
@@ -632,7 +633,7 @@ export function streamChatRequest(
                                     if (oscillations >= 6) {
                                         logWarn(`[stream] Oscillation spiral detected (${oscillations} wait/actually cycles in last 3000 chars) — aborting`);
                                         resolved = true;
-                                        stopRef.stop = true;
+                                        stopRef.stop = true; destroyed = true;
                                         req.destroy();
                                         const avgLogprob2 = logprobCount > 0 ? logprobSum / logprobCount : null;
                                         // Strip the looping think block from output — keep only content before the spiral
@@ -701,17 +702,17 @@ export function streamChatRequest(
                         resolve({ content: fullContent, toolCalls, avgLogprob, thinking: fullThinking });
                     }
                     // Best-effort: check if the model's allocated context is too small
-                    checkContextLength(model);
+                    checkContextLength(model, _contextWarnPostFn);
                 });
                 res.on('error', reject);
             }
         );
         // Expose immediate destroy so callers can abort without waiting for next chunk
-        stopRef.destroy = () => req.destroy();
+        stopRef.destroy = () => { destroyed = true; req.destroy(); };
         req.on('timeout', () => { req.destroy(); reject(new Error('Chat request timed out (600s)')); });
         req.on('error', (err) => {
             // Ignore ECONNRESET caused by our own destroy() on stop
-            if ((err as NodeJS.ErrnoException).code === 'ECONNRESET' && stopRef.stop) { return; }
+            if ((err as NodeJS.ErrnoException).code === 'ECONNRESET' && destroyed) { return; }
             logError(`streamChatRequest: ${err.message}`);
             reject(err);
         });
@@ -720,12 +721,21 @@ export function streamChatRequest(
     });
 }
 
+/** Models we've already warned about this process lifetime — warn once per model, not every response. */
+const _contextWarnedModels = new Set<string>();
+/** Optional UI post function — registered by the agent so warnings appear in chat. */
+let _contextWarnPostFn: ((msg: object) => void) | undefined;
+/** Register a post function so context warnings surface in the chat UI. */
+export function setContextWarnPostFn(fn: (msg: object) => void): void { _contextWarnPostFn = fn; }
+
 /**
  * Best-effort context-length check: query `/api/ps` for the model's allocated
  * context_length and warn if it's below the 64K minimum.
  * Non-fatal — if Ollama is unreachable or the model isn't loaded yet, we skip.
+ * Fires once per model per session (not on every response).
  */
-async function checkContextLength(model: string): Promise<void> {
+async function checkContextLength(model: string, postFn?: ((msg: object) => void) | undefined): Promise<void> {
+    if (_contextWarnedModels.has(model)) { return; }
     try {
         const config = getConfig();
         const { protocol, hostname, port } = parseBaseUrl(config.baseUrl);
@@ -739,7 +749,21 @@ async function checkContextLength(model: string): Promise<void> {
                     const parsed = JSON.parse(data) as { models?: unknown[] };
                     const ctxLen = machineContextLength(parsed.models ?? [], model);
                     if (ctxLen !== undefined && isMachineContextTooSmall(ctxLen)) {
-                        logWarn(`[context] WARNING: model "${model}" has only ${formatContextLength(ctxLen)} context allocated (minimum ${formatContextLength(minimumMachineContextLength)}). Long conversations may be truncated. Increase OLLAMA_CONTEXT_LENGTH or use a smaller model.`);
+                        _contextWarnedModels.add(model);
+                        const fmt = formatContextLength(ctxLen);
+                        const min = formatContextLength(minimumMachineContextLength);
+                        // If the model name encodes its own context limit (e.g. "qwen3:27b-49k"),
+                        // OLLAMA_CONTEXT_LENGTH won't help — the model itself is capped.
+                        const modelCtxSuffix = model.match(/-(\d+)k\b/i);
+                        const isModelCapped = modelCtxSuffix !== null && parseInt(modelCtxSuffix[1], 10) < 64;
+                        const guidance = isModelCapped
+                            ? `The model name "${model}" encodes its context limit (${fmt}) — this cannot be raised with OLLAMA_CONTEXT_LENGTH. Switch to a larger-context variant (e.g. the same model without the -${modelCtxSuffix[1]}k suffix, or a different model with ≥64K context).`
+                            : `Increase context by setting OLLAMA_CONTEXT_LENGTH=131072 in your Ollama environment, then restart Ollama.`;
+                        const warnMsg = `⚠️ **Context too small:** \`${model}\` has only **${fmt}** allocated (minimum ${min}). Long conversations will be truncated early.\n\n${guidance}`;
+                        logWarn(`[context] WARNING: model "${model}" has only ${fmt} context allocated (minimum ${min}). ${guidance}`);
+                        if (postFn) {
+                            postFn({ type: 'info', text: warnMsg });
+                        }
                     }
                 } catch { /* non-JSON response — skip */ }
             });
@@ -883,7 +907,7 @@ export async function generateChatTitle(
  */
 export function keepAliveModel(model: string): void {
     const { hostname, port } = getEndpoint();
-    const keepAlive = getConfig().keepAlive || '10m';
+    const keepAlive = getConfig().keepAlive || '-1';
     const body = JSON.stringify({ model, keep_alive: keepAlive, prompt: '', stream: false });
     try {
         const req = makeRequest(

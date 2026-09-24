@@ -37,6 +37,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     channel.show(true);
     context.subscriptions.push(channel);
 
+    // ── Top-level error handlers (prevent silent extension-host crashes) ─────
+    process.on('unhandledRejection', (reason: unknown) => {
+        const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
+        logError(`[unhandledRejection] ${msg}`);
+    });
+    process.on('uncaughtException', (err: Error) => {
+        logError(`[uncaughtException] ${err.stack || err.message}`);
+    });
+
     // ── Check Git Bash requirement on Windows ─────────────────────────────────
     if (process.platform === 'win32') {
         const shellEnv = detectShellEnvironment();
@@ -1167,6 +1176,54 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     }
                 }
             );
+        }),
+
+        vscode.commands.registerCommand('ollamaForge.status', async () => {
+            const cfg = getConfig();
+            const memCfg = getMemoryConfig();
+            const mcpStatus = getMCPStatus();
+            const memStats = memoryManager ? memoryManager.getStats() : [];
+            const totalEntries = memStats.reduce((sum, t) => sum + t.count, 0);
+            const lines: string[] = [
+                `# Ollama Forge Status`,
+                ``,
+                `**Ollama URL:** ${cfg.baseUrl}`,
+                `**Model:** ${cfg.model}`,
+                ``,
+                `## Memory`,
+                `**Enabled:** ${memCfg.enabled ? 'Yes' : 'No'}`,
+                `**Qdrant:** ${memCfg.qdrantUrl}`,
+                `**Entries:** ${totalEntries}`,
+                ``,
+                `## MCP Servers`,
+                mcpStatus.length === 0 ? `None configured` : mcpStatus.map(s =>
+                    `- **${s.name}:** ${s.connected ? 'connected' : 'disconnected'}${s.toolCount > 0 ? ` (${s.toolCount} tools)` : ''}${s.error ? ` — ${s.error}` : ''}`
+                ).join('\n'),
+                ``,
+                `## Code Index`,
+                codeIndexer ? `**Active:** Yes` : `**Active:** No`,
+                ``,
+                `## Workspace`,
+                `**Root:** ${vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 'None'}`,
+                ``,
+                `## Log`,
+                `**File:** ${vscode.workspace.workspaceFolders?.[0] ? path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, '.ollamaforge', 'agent.log') : 'N/A'}`,
+            ];
+            const md = lines.join('\n');
+            const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (root) {
+                const statusPath = path.join(root, '.ollamaforge', 'status.md');
+                try {
+                    fs.mkdirSync(path.join(root, '.ollamaforge'), { recursive: true });
+                    fs.writeFileSync(statusPath, md, 'utf8');
+                    const doc = await vscode.workspace.openTextDocument(statusPath);
+                    await vscode.window.showTextDocument(doc);
+                    return;
+                } catch { /* fall through */ }
+            }
+            // Fallback: show in output channel
+            channel.appendLine('\n' + md.replace(/[#*`]/g, '') + '\n');
+            channel.show(true);
         }),
 
         vscode.commands.registerCommand('ollamaForge.acceptProposedRules', async () => {

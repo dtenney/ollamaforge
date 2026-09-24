@@ -52,6 +52,40 @@ const BUILTIN_DENY: RegExp[] = [
     /\binit\s+0\b/,                                     // init 0
 ];
 
+/**
+ * Built-in block list with structured reasons — same as deny but returns a
+ * human-readable remediation message instead of a bare "blocked" verdict.
+ * These are checked before BUILTIN_CONFIRM.
+ */
+export interface BlockResult {
+    rule: string;
+    message: string;
+}
+
+export const BUILTIN_BLOCK: Array<{ re: RegExp; rule: string; message: string }> = [
+    {
+        re: /\bapt(?:-get)?\s+(?:full-upgrade|upgrade)\b(?!.*(?:--dry-run|-s\b|--simulate\b))/i,
+        rule: 'apt-upgrade-no-dry-run',
+        message: '[DRY-RUN REQUIRED: apt upgrade]\n\nRunning "apt upgrade" without a preview is too destructive without user review.\n\nFirst run the dry-run:\n  sudo apt upgrade --dry-run\n  (or: sudo apt list --upgradable)\n\nShare the output with the user, then run the real upgrade if they approve.',
+    },
+    {
+        re: /\bssh\b.*\bfind\s+(?:"\/"|'\/'\s|\/\s)/,
+        rule: 'ssh-root-scan',
+        message: '[BLOCKED: SSH root filesystem scan]\n\nScanning the entire remote root with "find /" takes 60-120 seconds and produces unusably large output.\n\nSearch specific directories instead:\n  ssh <host> "find /etc /opt /var -name \'file\' 2>/dev/null"\n  ssh <host> "which cmd || find /usr/local /opt -name \'cmd\' -type f 2>/dev/null | head -10"',
+    },
+];
+
+/** Evaluate built-in block rules. Returns the first match, or null. */
+export function checkBuiltinBlock(cmd: string): BlockResult | null {
+    const trimmed = (cmd ?? '').trim();
+    for (const entry of BUILTIN_BLOCK) {
+        if (entry.re.test(trimmed)) {
+            return { rule: entry.rule, message: entry.message };
+        }
+    }
+    return null;
+}
+
 /** Built-in confirm list — always active. */
 const BUILTIN_CONFIRM: RegExp[] = [
     /\bgit\s+push\s+.*--force\b/i,                       // git push --force

@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { Agent, PostFn } from './agent';
 import { fetchModels, rawGet, streamChatRequest, generateChatTitle } from './ollamaClient';
-import { getConfig } from './config';
+import { getConfig, MODEL_PRESETS } from './config';
 import { getActiveContext, buildContextString } from './context';
 import { logInfo, logWarn, logError, channel, toErrorMessage } from './logger';
 import { ChatStorage, ChatSession, StoredMessage, deriveTitle, relativeTime, PendingResume } from './chatStorage';
@@ -51,6 +51,20 @@ function stripChatUiArtifacts(text: string): string {
         .trim();
 }
 
+/** Fix double-encoded UTF-8 (mojibake) in model output.
+ *  Models sometimes echo back â€" (U+00E2 U+0080 U+0094) instead of — (em dash), etc. */
+function fixMojibake(s: string): string {
+    return s
+        .replace(/\u00e2\u0080\u0094/g, '\u2014')   // â€" → em dash
+        .replace(/\u00e2\u0080\u0093/g, '\u2013')   // â€" → en dash
+        .replace(/\u00e2\u0080\u0099/g, '\u2019')   // â€™ → right single quote
+        .replace(/\u00e2\u0080\u0098/g, '\u2018')   // â€˜ → left single quote
+        .replace(/\u00e2\u0080\u009c/g, '\u201c')   // â€œ → left double quote
+        .replace(/\u00e2\u0080\u009d/g, '\u201d')   // â€  → right double quote
+        .replace(/\u00e2\u0086\u0092/g, '\u2192')   // â†' → right arrow
+        .replace(/\u00e2\u0086\u0090/g, '\u2190');  // â†  → left arrow
+}
+
 function stripToolBlocksFromText(text: string): string {
     let result = text;
     let pos = 0;
@@ -86,7 +100,7 @@ function stripToolBlocksFromText(text: string): string {
 // ── Message shapes (webview → extension) ─────────────────────────────────────
 
 interface MsgGetModels     { command: 'getModels' }
-interface MsgSendMessage   { command: 'sendMessage'; text: string; model: string; trustLevel?: 'normal' | 'trust' | 'yolo'; includeFile: boolean; includeSelection: boolean; mentionedFiles?: string[]; mentionedSymbols?: Array<{ name: string; filePath: string; }>; pinnedFiles?: string[]; }
+interface MsgSendMessage   { command: 'sendMessage'; text: string; model: string; trustLevel?: 'normal' | 'trust' | 'yolo'; includeFile: boolean; includeSelection: boolean; mentionedFiles?: string[]; mentionedSymbols?: Array<{ name: string; filePath: string; }>; pinnedFiles?: string[]; midRun?: boolean; }
 interface MsgNewChat       { command: 'newChat' }
 interface MsgStopGen       { command: 'stopGeneration' }
 interface MsgRetryLast     { command: 'retryLast'; model: string }
@@ -293,7 +307,7 @@ function buildResumeSummary(session: ChatSession): string {
 
 interface TabState {
     id: string;
-    agent: Agent;
+    agent: Agent | null;
     session: ChatSession;
     running: boolean;
     /** Draft text the user had typed but not sent when they switched away from this tab. */
@@ -306,6 +320,10 @@ interface TabState {
      *  Set while the agent is streaming; cleared on streamEnd. Used to
      *  reattach the live bubble when the user switches back to this tab. */
     liveBuffer?: string;
+    /** Monotonic counter incremented on every run start. Used to detect
+     *  stale async continuations (e.g. pauseExplain) that captured a
+     *  generation that has since been superseded. */
+    runGeneration: number;
 }
 
 // ── Provider ──────────────────────────────────────────────────────────────────
@@ -318,6 +336,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
     private _currentWorkspaceRoot?: string;
     /** Mutex to prevent concurrent workspace changes */
     private _workspaceChanging: boolean = false;
+    /** If a workspace change arrives while another is in-flight, remember the latest target */
+    private _pendingWorkspaceRoot?: string;
     /** Shared DiffViewManager for applyCodeBlock (reused, not created per call) */
     private _diffViewManager: DiffViewManager = new DiffViewManager();
     /** Outdated-model warning tracker — warns once per conversation per model. */
@@ -330,7 +350,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
     /** Active tab — always valid after resolveWebviewView */
     private get _tab(): TabState { return this._tabs.get(this._activeTabId)!; }
     /** Convenience proxies so existing code reads naturally */
-    private get _agent(): Agent  { return this._tab.agent; }
+    private get _agent(): Agent | null { return this._tab.agent; }
     private get _running(): boolean { return this._tab.running; }
     private set _running(v: boolean) {
         this._tab.running = v;
@@ -430,6 +450,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
             session: firstSession,
             running: false,
             draft: '',
+            runGeneration: 0,
         });
         this._activeTabId = firstTabId;
         logInfo(`[provider] Loaded session "${firstSession.title}" (${firstSession.messages.length} msgs)`);
@@ -450,39 +471,60 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
         // Listen for workspace folder changes
         this._workspaceListener?.dispose();
         this._workspaceListener = vscode.workspace.onDidChangeWorkspaceFolders(async () => {
-            // Prevent concurrent workspace changes
+            const newRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+            if (newRoot === this._currentWorkspaceRoot) { return; }
+
+            // If a transition is already in-flight, remember the latest target and
+            // let the current one finish — it will pick this up in its finally block.
             if (this._workspaceChanging) {
-                logInfo('[provider] Workspace change already in progress, skipping');
+                this._pendingWorkspaceRoot = newRoot;
+                logInfo(`[provider] Workspace change queued (in-flight): → ${newRoot}`);
                 return;
             }
-            
-            const newRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
-            if (newRoot !== this._currentWorkspaceRoot) {
-                this._workspaceChanging = true;
-                try {
-                    logInfo(`[provider] Workspace changed: ${this._currentWorkspaceRoot} → ${newRoot}`);
-                    this._currentWorkspaceRoot = newRoot;
-                    
-                    // Stop, dispose, and recreate all tab agents for the new root.
-                    // Also reset all sessions so stale workspace context doesn't bleed in.
+
+            this._workspaceChanging = true;
+            try {
+                logInfo(`[provider] Workspace changed: ${this._currentWorkspaceRoot} → ${newRoot}`);
+                this._currentWorkspaceRoot = newRoot;
+
+                // Stop, dispose, and recreate all tab agents for the new root.
+                // Also reset all sessions so stale workspace context doesn't bleed in.
+                const model = getConfig().model;
+                for (const tab of this._tabs.values()) {
+                    tab.agent?.stop();
+                    tab.agent?.dispose();
+                    tab.running = false;
+                    tab.agent = this.makeAgent(newRoot);
+                    tab.session = this.storage.createNew(model);
+                }
+
+                // Clear file index - will be rebuilt on next use
+                this._fileIndex = [];
+
+                const post = (m: object) => this._view?.webview.postMessage(m);
+                post({ type: 'clearChat' });
+                post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
+                logInfo(`[provider] Workspace changed — all tabs reset to new root`);
+            } finally {
+                this._workspaceChanging = false;
+                // If a newer change was queued while we were transitioning, apply it now.
+                if (this._pendingWorkspaceRoot && this._pendingWorkspaceRoot !== this._currentWorkspaceRoot) {
+                    const queued = this._pendingWorkspaceRoot;
+                    this._pendingWorkspaceRoot = undefined;
+                    logInfo(`[provider] Applying queued workspace change: → ${queued}`);
+                    this._currentWorkspaceRoot = queued;
                     const model = getConfig().model;
                     for (const tab of this._tabs.values()) {
                         tab.agent?.stop();
                         tab.agent?.dispose();
                         tab.running = false;
-                        tab.agent = this.makeAgent(newRoot);
+                        tab.agent = this.makeAgent(queued);
                         tab.session = this.storage.createNew(model);
                     }
-
-                    // Clear file index - will be rebuilt on next use
                     this._fileIndex = [];
-
                     const post = (m: object) => this._view?.webview.postMessage(m);
                     post({ type: 'clearChat' });
                     post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
-                    logInfo(`[provider] Workspace changed — all tabs reset to new root`);
-                } finally {
-                    this._workspaceChanging = false;
                 }
             }
         });
@@ -519,22 +561,6 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
         }
 
         webviewView.webview.options = { enableScripts: true };
-
-        // Fix mojibake in token text before sending to webview.
-        // Models sometimes echo back double-encoded UTF-8 from system prompt strings:
-        // â€" (U+00E2 U+0080 U+0094) → — (em dash)
-        // â€™ → ' (right single quote), â€œ → " (left double quote), etc.
-        function fixMojibake(s: string): string {
-            return s
-                .replace(/\u00e2\u0080\u0094/g, '\u2014')   // â€" → em dash
-                .replace(/\u00e2\u0080\u0093/g, '\u2013')   // â€" → en dash
-                .replace(/\u00e2\u0080\u0099/g, '\u2019')   // â€™ → right single quote
-                .replace(/\u00e2\u0080\u0098/g, '\u2018')   // â€˜ → left single quote
-                .replace(/\u00e2\u0080\u009c/g, '\u201c')   // â€œ → left double quote
-                .replace(/\u00e2\u0080\u009d/g, '\u201d')   // â€  → right double quote
-                .replace(/\u00e2\u0086\u0092/g, '\u2192')   // â†' → right arrow
-                .replace(/\u00e2\u0086\u0090/g, '\u2190');  // â†  → left arrow
-        }
 
         const post = (m: object) => {
             // Fix mojibake in all string fields, not just token text.
@@ -596,7 +622,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         // doesn't leave stale approvals from the previous level.
                         const COMMAND_TOOLS_LVL = new Set(['run_command', 'run_command_pip', 'run_command_destructive']);
                         for (const tab of this._tabs.values()) {
-                            tab.agent.clearAutoApprovals();
+                            if (!tab.agent) continue;
+                            tab.agent?.clearAutoApprovals();
                             tab.agent.trustLevel = lvl;
                             // In Normal mode, strip command-execution approvals from persistent set
                             const filteredForLevel = lvl === 'normal'
@@ -620,9 +647,10 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         const qtext = raw.text?.trim() ?? '';
                         // Stop-intent detection: if message starts with a stop word, kill the
                         // current run immediately and queue the remainder as the next prompt.
-                        const isStopIntent = /^(stop|cancel|halt|forget it|never mind|wait)\b/i.test(qtext);
+                        const isStopIntent = /^(stop|cancel|halt|forget it|never mind|wait)[\s.,!]*$/i.test(qtext) || /^(stop|cancel|halt|forget it|never mind)\b/i.test(qtext);
                         if (isStopIntent) {
-                            this._agent!.stop();
+                            if (!this._agent) { break; }
+                            this._agent.stop();
                             this._running = false;
                             post({ type: 'streamEnd' });
                             post({ type: 'agentDone' });
@@ -640,12 +668,17 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             }
                             break;
                         }
-                        // Not a stop — inject as a mid-run note at the next tool boundary,
-                        // and also queue it as a follow-up so it becomes the next prompt.
-                        // If another message is already queued, the newer one wins (last context wins).
+                        // Not a stop — inject as a mid-run note at the next tool boundary.
+                        // If the webview flagged this as a pure mid-run note (midRun: true), don't
+                        // also queue it as pendingMessage — the note is already injected inline and
+                        // replaying it as a new prompt would duplicate it.
+                        // If midRun is not set (legacy path / stop-word redirect), also queue as
+                        // pendingMessage so it becomes the next prompt after the run ends.
                         if (qtext) {
                             this._agent?.setPendingNote(qtext);
-                            this._tab.pendingMessage = { text: qtext, model: raw.model ?? getConfig().model, raw };
+                            if (!raw.midRun) {
+                                this._tab.pendingMessage = { text: qtext, model: raw.model ?? getConfig().model, raw };
+                            }
                             post({ type: 'info', text: '📌 Note queued — agent will see it at next tool boundary.' });
                         }
                         break;
@@ -671,17 +704,19 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             // Full re-seed — same logic as setTrustLevel — so that downgrading
                             // actually clears the trusted-tools set and strips command approvals.
                             const COMMAND_TOOLS_SM = new Set(['run_command', 'run_command_pip', 'run_command_destructive']);
-                            this._tab.agent.clearAutoApprovals();
-                            this._tab.agent.trustLevel = incoming;
-                            const filteredSM = incoming === 'normal'
-                                ? [...this._persistentApprovals].filter(t => !COMMAND_TOOLS_SM.has(t))
-                                : [...this._persistentApprovals];
-                            this._tab.agent.seedPersistentApprovals(filteredSM);
-                            if (incoming === 'trust') {
-                                this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip']);
-                            } else if (incoming === 'yolo') {
-                                // Must match makeAgent() — include outside-workspace read tools
-                                this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip', 'run_command_destructive', 'shell_read_outside', 'read_file_outside']);
+                            if (this._tab.agent) {
+                                this._tab.agent?.clearAutoApprovals();
+                                this._tab.agent.trustLevel = incoming;
+                                const filteredSM = incoming === 'normal'
+                                    ? [...this._persistentApprovals].filter(t => !COMMAND_TOOLS_SM.has(t))
+                                    : [...this._persistentApprovals];
+                                this._tab.agent.seedPersistentApprovals(filteredSM);
+                                if (incoming === 'trust') {
+                                    this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip']);
+                                } else if (incoming === 'yolo') {
+                                    // Must match makeAgent() — include outside-workspace read tools
+                                    this._tab.agent.seedPersistentApprovals(['edit_file', 'write_file', 'edit_file_at_line', 'run_command', 'run_command_pip', 'run_command_destructive', 'shell_read_outside', 'read_file_outside']);
+                                }
                             }
                         } else if (isDowngrade && !allowDowngrade) {
                             // Webview is behind (just loaded) — re-send the correct level
@@ -711,39 +746,54 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     const resumeReason = (isResumeIntent && this.currentSession.pendingContinuation)
                         ? this.currentSession.pendingContinuation.reason
                         : null;
-                    const agentText = (isResumeIntent && this.currentSession.pendingContinuation)
+                    const agentText = this.currentSession.pendingContinuation
                         ? (() => {
-                            logInfo(`[provider] Resume intent detected — injecting continuation context`);
                             const r = this.currentSession.pendingContinuation!;
-                            const lines = [`[Resuming interrupted task]`, `Reason: ${r.reason}`];
-                            if (r.filesRead.length)      { lines.push(`Files already read: ${r.filesRead.join(', ')}`); }
-                            if (r.decisions.length)      { lines.push(`Decisions / progress logged:\n${r.decisions.map(d => `  - ${d}`).join('\n')}`); }
-                            if (r.stepsCompleted.length) { lines.push(`Steps completed:\n${r.stepsCompleted.map(s => `  ✓ ${s}`).join('\n')}`); }
-                            if (r.stepsPending.length)   { lines.push(`Steps still to do:\n${r.stepsPending.map(s => `  • ${s}`).join('\n')}`); }
-                            if (r.skillsUsed?.length)    { lines.push(`Skills/scripts active: ${r.skillsUsed.join(', ')}`); }
-                            // Inject a live workspace file listing so the model can see what was
-                            // already created before the interruption without re-scanning everything.
-                            try {
-                                const wsRoot = this._currentWorkspaceRoot;
-                                if (wsRoot) {
-                                    const walk = (dir: string, depth = 0): string[] => {
-                                        if (depth > 3) { return []; }
-                                        try {
-                                            return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => {
-                                                if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === '__pycache__') { return []; }
-                                                const rel = path.relative(wsRoot, path.join(dir, e.name)).replace(/\\/g, '/');
-                                                return e.isDirectory() ? walk(path.join(dir, e.name), depth + 1) : [rel];
-                                            });
-                                        } catch { return []; }
-                                    };
-                                    const files = walk(wsRoot).slice(0, 60);
-                                    if (files.length > 0) {
-                                        lines.push(`\nFiles currently in workspace:\n${files.map(f => `  ${f}`).join('\n')}`);
+                            if (isResumeIntent) {
+                                // Full resume context: user explicitly asked to continue.
+                                // Inject all saved state + workspace file listing.
+                                logInfo(`[provider] Resume intent detected — injecting full continuation context`);
+                                const lines = [`[Resuming interrupted task]`, `Reason: ${r.reason}`];
+                                if (r.filesRead.length)      { lines.push(`Files already read: ${r.filesRead.join(', ')}`); }
+                                if (r.decisions.length)      { lines.push(`Decisions / progress logged:\n${r.decisions.map(d => `  - ${d}`).join('\n')}`); }
+                                if (r.stepsCompleted.length) { lines.push(`Steps completed:\n${r.stepsCompleted.map(s => `  ✓ ${s}`).join('\n')}`); }
+                                if (r.stepsPending.length)   { lines.push(`Steps still to do:\n${r.stepsPending.map(s => `  • ${s}`).join('\n')}`); }
+                                if (r.skillsUsed?.length)    { lines.push(`Skills/scripts active: ${r.skillsUsed.join(', ')}`); }
+                                // Inject a live workspace file listing so the model can see what was
+                                // already created before the interruption without re-scanning everything.
+                                try {
+                                    const wsRoot = this._currentWorkspaceRoot;
+                                    if (wsRoot) {
+                                        const walk = (dir: string, depth = 0): string[] => {
+                                            if (depth > 3) { return []; }
+                                            try {
+                                                return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => {
+                                                    if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === '__pycache__') { return []; }
+                                                    const rel = path.relative(wsRoot, path.join(dir, e.name)).replace(/\\/g, '/');
+                                                    return e.isDirectory() ? walk(path.join(dir, e.name), depth + 1) : [rel];
+                                                });
+                                            } catch { return []; }
+                                        };
+                                        const files = walk(wsRoot).slice(0, 60);
+                                        if (files.length > 0) {
+                                            lines.push(`\nFiles currently in workspace:\n${files.map(f => `  ${f}`).join('\n')}`);
+                                        }
                                     }
-                                }
-                            } catch { /* skip if fs scan fails */ }
-                            lines.push(`\nIMPORTANT: The workspace file list above shows what already exists. Do NOT re-create files that are already there. Do NOT re-survey the project from scratch. Look at the existing files, determine what is still missing, and continue the task from where it left off.`);
-                            return lines.join('\n');
+                                } catch { /* skip if fs scan fails */ }
+                                lines.push(`\nIMPORTANT: The workspace file list above shows what already exists. Do NOT re-create files that are already there. Do NOT re-survey the project from scratch. Look at the existing files, determine what is still missing, and continue the task from where it left off.`);
+                                return lines.join('\n');
+                            } else {
+                                // User sent a new message (not an explicit resume phrase) but there's
+                                // interrupted work. Inject a lightweight context header so the model
+                                // knows it was mid-task and can continue naturally without greeting
+                                // the user as if starting fresh.
+                                logInfo(`[provider] Non-resume message with pendingContinuation — injecting lightweight task context`);
+                                const lines = [`[Context: was mid-task when session paused — ${r.reason.slice(0, 120)}]`];
+                                if (r.stepsCompleted.length) { lines.push(`Steps completed: ${r.stepsCompleted.join(', ')}`); }
+                                if (r.stepsPending.length)   { lines.push(`Still pending: ${r.stepsPending.join(', ')}`); }
+                                lines.push(`User message: ${displayText}`);
+                                return lines.join('\n');
+                            }
                         })()
                         : displayText;
                     // Clear pendingContinuation in-memory whenever the user sends any message.
@@ -755,9 +805,15 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     const text = agentText;
 
                     this._running = true;
+                    const runGen = ++this._tab.runGeneration;
                     // Capture the tab that owns this run. If the user switches tabs mid-run,
                     // _activeTabId changes but this closure still writes to the correct tab.
                     const runTab = this._tab;
+                    if (!runTab.agent) {
+                        logError('[provider] sendMessage: no agent on tab — aborting');
+                        post({ type: 'error', text: 'No active agent. Reload the window and try again.' });
+                        return;
+                    }
 
                     logInfo(`[user] ${text.slice(0, 120)}${text.length > 120 ? '…' : ''}`);
 
@@ -969,8 +1025,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             inThinking = false;
                             // Sync agent history and task state mid-run so a crash/force-close
                             // doesn't lose the turns already completed in this run.
-                            runTab.session.agentHistory = runTab.agent.conversationHistory;
-                            runTab.session.activeTask   = runTab.agent.activeTask;
+                            runTab.session.agentHistory = runTab.agent!.conversationHistory;
+                            runTab.session.activeTask   = runTab.agent!.activeTask;
                             this.storage.upsert(runTab.session);
                         } else if (pm.type === 'continueTask') {
                             // Agent exhausted its turn budget mid-task.
@@ -983,7 +1039,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 logInfo(`[provider] Trust/YOLO: compacting then auto-continuing: "${continueText}"`);
                                 // Compact in background — don't await so we don't block the event stream.
                                 // The continuation is queued; it will fire after agentDone drains pendingMessage.
-                                runTab.pendingCompact = runTab.agent.compactContext(25).then(() => {
+                                runTab.pendingCompact = runTab.agent!.compactContext(25).then(() => {
                                     logInfo('[provider] Pre-continuation compact done');
                                 }).catch((e) => {
                                     logWarn(`[provider] Pre-continuation compact failed (continuing anyway): ${toErrorMessage(e)}`);
@@ -1003,7 +1059,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             // Agent is pausing for user approval — save rich scratchpad so
                             // resume can inject exactly what was already known/done.
                             const ca = m as { type: string; action: string; detail: string };
-                            const task = runTab.agent.activeTask;
+                            const task = runTab.agent!.activeTask;
                             const wsRoot = this._currentWorkspaceRoot ?? '';
                             runTab.session.pendingContinuation = capPendingResume({
                                 reason:         `Waiting for approval: ${ca.action} — ${ca.detail}`.slice(0, 200),
@@ -1011,7 +1067,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 decisions:      readTaskLogDecisions(wsRoot, task?.taskId),
                                 stepsCompleted: task?.stepsCompleted?.slice() ?? [],
                                 stepsPending:   task?.stepsPending?.slice()   ?? [],
-                                skillsUsed:     extractSkillsFromHistory(runTab.agent.conversationHistory),
+                                skillsUsed:     extractSkillsFromHistory(runTab.agent!.conversationHistory),
                                 pausedAt:       new Date().toISOString(),
                             });
                             this.storage.upsert(runTab.session);
@@ -1020,7 +1076,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             const errText = (m as { type: string; text: string }).text;
                             runTab.session.messages.push({ role: 'error', content: errText, timestamp: Date.now() });
                             // Save rich scratchpad so user can resume after network drop or crash.
-                            const task = runTab.agent.activeTask;
+                            const task = runTab.agent!.activeTask;
                             const wsRoot = this._currentWorkspaceRoot ?? '';
                             // Preserve the existing reason if we already have one — don't wrap
                             // "Interrupted mid-task: [Resuming interrupted task]: ..." recursively.
@@ -1033,7 +1089,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 decisions:      readTaskLogDecisions(wsRoot, task?.taskId),
                                 stepsCompleted: task?.stepsCompleted?.slice() ?? [],
                                 stepsPending:   task?.stepsPending?.slice()   ?? [],
-                                skillsUsed:     extractSkillsFromHistory(runTab.agent.conversationHistory),
+                                skillsUsed:     extractSkillsFromHistory(runTab.agent!.conversationHistory),
                                 pausedAt:       new Date().toISOString(),
                             });
                             this.storage.upsert(runTab.session);
@@ -1061,9 +1117,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
                     // ── Outdated model warning (once per conversation per model) ──
                     if (isOutdatedAgentModel(model)) {
-                        const history = runTab.agent.conversationHistory
+                        const history = runTab.agent!.conversationHistory
                             .map(m => `${m.role}:${m.content.slice(0, 200)}`);
-                        const hasAssistant = runTab.agent.conversationHistory.some(m => m.role === 'assistant');
+                        const hasAssistant = runTab.agent!.conversationHistory.some(m => m.role === 'assistant');
                         const req = this._outdatedTracker.beginRequest(history, hasAssistant);
                         if (!this._outdatedTracker.hasShown(req, model)) {
                             this._outdatedTracker.markShown(req, model);
@@ -1072,13 +1128,13 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     }
 
                     try {
-                        await runTab.agent.run(fullMessageWithPins, model, trackedPost);
+                        await runTab.agent!.run(fullMessageWithPins, model, trackedPost);
                         // Sync agent history and task state into session after run completes.
                         // Only clear pendingContinuation if the run finished WITHOUT an error —
                         // if an error was posted mid-run (e.g. network drop), pendingContinuation
                         // was already set by the error handler and must NOT be cleared here.
-                        runTab.session.agentHistory = runTab.agent.conversationHistory;
-                        runTab.session.activeTask   = runTab.agent.activeTask;
+                        runTab.session.agentHistory = runTab.agent!.conversationHistory;
+                        runTab.session.activeTask   = runTab.agent!.activeTask;
                         const hadError = runTab.session.messages.some(
                             m => m.role === 'error' && Date.now() - m.timestamp < 10_000
                         );
@@ -1087,7 +1143,11 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         }
                         this.storage.upsert(runTab.session);
                     } finally {
-                        const stats = runTab.agent.runStats;
+                        // Guard: if a newer run (e.g. pauseExplain) started on this tab, skip cleanup.
+                        if (runTab.runGeneration !== runGen) {
+                            logInfo('[provider] Normal run: stale continuation — skipping cleanup');
+                        } else {
+                        const stats = runTab.agent!.runStats;
                         if (this._currentWorkspaceRoot) {
                             const sessionEntry = {
                                 ts:           new Date(runStart).toISOString(),
@@ -1135,6 +1195,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 post({ type: 'dispatchQueued', msg: pending.raw });
                             });
                         }
+                        }
                     }
                     break;
                 }
@@ -1150,12 +1211,13 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                 // ── Stop generation ───────────────────────────────────────
                 case 'stopGeneration': {
                     if (!this._running) { break; } // already stopped (e.g. stop-intent fired first)
-                    this._agent!.stop();
+                    this._agent?.stop();
                     this._running = false;
                     // Clear any queued message — a user-initiated stop should not auto-resume.
                     this._tab.pendingMessage = undefined;
                     post({ type: 'streamEnd' });
                     post({ type: 'agentDone' });
+                    post({ type: 'stoppedByUser' });
                     logInfo('[provider] Generation stopped');
                     break;
                 }
@@ -1173,8 +1235,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     this._running = true;
                     const retryTab = this._tab; // capture before any async switch
                     const model   = raw.model ?? getConfig().model;
+                    if (!retryTab.agent) { retryTab.running = false; this._running = false; break; }
                     const lastMsg = retryTab.agent.retryLast();
-                    if (!lastMsg) { retryTab.running = false; break; }
+                    if (!lastMsg) { retryTab.running = false; this._running = false; break; }
                     // Remove the last assistant + error messages from session
                     this.trimSessionToLastUser();
                     post({ type: 'removeLastAssistant' });
@@ -1197,20 +1260,20 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             }
                             assistantBuf2 = '';
                             inThinking2 = false;
-                            retryTab.session.agentHistory = retryTab.agent.conversationHistory;
-                            retryTab.session.activeTask   = retryTab.agent.activeTask;
+                            retryTab.session.agentHistory = retryTab.agent!.conversationHistory;
+                            retryTab.session.activeTask   = retryTab.agent!.activeTask;
                             this.storage.upsert(retryTab.session);
                         }
                     };
 
                     const retryStart = Date.now();
                     try {
-                        await retryTab.agent.run(lastMsg, model, retryPost);
-                        retryTab.session.agentHistory = retryTab.agent.conversationHistory;
-                        retryTab.session.activeTask   = retryTab.agent.activeTask;
+                        await retryTab.agent!.run(lastMsg, model, retryPost);
+                        retryTab.session.agentHistory = retryTab.agent!.conversationHistory;
+                        retryTab.session.activeTask   = retryTab.agent!.activeTask;
                         this.storage.upsert(retryTab.session);
                     } finally {
-                        const retryStats = retryTab.agent.runStats;
+                        const retryStats = retryTab.agent!.runStats;
                         if (this._currentWorkspaceRoot) {
                             const retryEntry = {
                                 ts:           new Date(retryStart).toISOString(),
@@ -1229,6 +1292,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             appendSessionLogMd(this._currentWorkspaceRoot, retryEntry);
                         }
                         retryTab.running = false;
+                        this._running = false;
                         post({ type: 'agentDone' });
 
                         // Drain any pending message queued during the retry run
@@ -1330,6 +1394,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         session: newSession,
                         running: false,
                         draft: '',
+                        runGeneration: 0,
                     });
                     this._activeTabId = newTabId;
                     // Order: clear content first, then update tab bar
@@ -1361,6 +1426,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 session: fallbackSession,
                                 running: false,
                                 draft: '',
+                                runGeneration: 0,
                             });
                             this._activeTabId = fallbackId;
                         } else {
@@ -1542,6 +1608,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     post({ type: 'agentDone' });
                     // Re-run with a read-only "explain your plan" prompt so the session is preserved.
                     const explainModel = getConfig().model;
+                    // Bump generation so the old run's finally block sees a stale guard and skips cleanup.
+                    const explainGen = ++this._tab.runGeneration;
                     this._running = true;
                     (async () => {
                         try {
@@ -1551,6 +1619,11 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 post
                             );
                         } finally {
+                            // Guard: if a newer run started on this tab, skip cleanup.
+                            if (this._tab.runGeneration !== explainGen) {
+                                logInfo('[provider] pauseExplain: stale continuation — skipping cleanup');
+                                return;
+                            }
                             this._running = false;
                             post({ type: 'agentDone' });
                             this.currentSession.agentHistory = this._agent!.conversationHistory;
@@ -1563,6 +1636,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
                 // ── Manual context compaction ─────────────────────────────
                 case 'compactContext': {
+                    if (!this._agent) { break; }
                     if (this._running) {
                         post({ type: 'error', text: 'Cannot compact while a response is in progress.' });
                         break;
@@ -1606,7 +1680,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
                 // ── Undo last tool execution ──────────────────────────────
                 case 'undoLastTool': {
-                    const undoResult = this._agent!.undoLastTool();
+                    if (!this._agent) { break; }
+                    const undoResult = this._agent.undoLastTool();
                     if (undoResult) {
                         post({ type: 'undoResult', success: true, message: undoResult });
                         logInfo(`[provider] ${undoResult}`);
@@ -1637,17 +1712,22 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     break;
                 }
 
-                // ── Batch-approve: accept this AND all future calls to same tool ──
+                // ── Batch-approve: accept this AND all future calls to same tool/command ──
                 case 'confirmResponseAll': {
                     const caMsg = raw as unknown as { command: 'confirmResponseAll'; id: string; toolName: string };
                     this._agent?.resolveConfirmationAll(caMsg.toolName);
-                    // Persist so future sessions don't ask again
-                    this._persistentApprovals.add(caMsg.toolName);
-                    this.context.workspaceState.update(
-                        'ollamaForge.persistentApprovals',
-                        [...this._persistentApprovals]
-                    );
-                    logInfo(`[provider] Persisted approval for "${caMsg.toolName}"`);
+                    // Only persist cross-session for Trust mode (tool-level approvals).
+                    // Normal mode "Accept All" is scoped to the exact command string and is session-only.
+                    if (this._trustLevel !== 'normal') {
+                        this._persistentApprovals.add(caMsg.toolName);
+                        this.context.workspaceState.update(
+                            'ollamaForge.persistentApprovals',
+                            [...this._persistentApprovals]
+                        );
+                        logInfo(`[provider] Persisted approval for "${caMsg.toolName}" (trustLevel=${this._trustLevel})`);
+                    } else {
+                        logInfo(`[provider] Session-only command approval for "${caMsg.toolName.slice(0, 60)}" (Normal mode, not persisted)`);
+                    }
                     break;
                 }
 
@@ -1738,7 +1818,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
             // Restore active preset
             setTimeout(() => {
-                post({ type: 'presetRestored', preset: this._activePreset });
+                post({ type: 'presetRestored', preset: this._activePreset, presets: MODEL_PRESETS });
                 post({ type: 'smartContextRestored', enabled: this._smartContextEnabled });
                 post({ type: 'pinnedFilesRestored', files: this._pinnedFiles.map(f => ({ rel: f })) });
                 post({ type: 'trustLevelRestored', level: this._trustLevel });
@@ -1853,7 +1933,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
         this._persistentApprovals.clear();
         // Also clear from any currently running agent
         for (const tab of this._tabs.values()) {
-            tab.agent.clearAutoApprovals();
+            tab.agent?.clearAutoApprovals();
         }
     }
 

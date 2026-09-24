@@ -78,7 +78,7 @@ export function extractDocVerificationHints(docContent: string): string[] {
     const filePaths = [...docContent.matchAll(/`(app\/[a-zA-Z0-9_\/\.]+\.py)`/g)];
     const uniquePaths = [...new Set(filePaths.map(m => m[1]))].slice(0, 4);
     for (const p of uniquePaths) {
-        hints.push(`- File path "${p}" -- verify it exists: shell_read Get-Item '${p}'`);
+        hints.push(`- File path "${p}" -- verify it exists: shell_read test -f '${p}' && echo exists`);
     }
 
     return hints;

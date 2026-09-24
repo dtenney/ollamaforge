@@ -141,7 +141,7 @@ export function getConfig(): OllamaConfig {
         dreamModel:                c.get<string> ('dreamModel',                     ''),
         summaryModel:              c.get<string> ('summaryModel',                 ''),
         contextFileAutoUpdateDays: c.get<number> ('contextFile.autoUpdateDays',     7),
-        keepAlive:                 c.get<string> ('keepAlive',                      '10m'),
+        keepAlive:                 c.get<string> ('keepAlive',                      '-1'),
         reasoningEffort:           c.get<string> ('reasoningEffort',                 ''),
         commandPolicy:             c.get('commandPolicy') ?? undefined,
         registryCheck:             c.get<boolean>('registryCheck', false),
