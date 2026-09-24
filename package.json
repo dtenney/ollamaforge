@@ -1,7 +1,7 @@
 {
   "name": "ollamaforge",
   "displayName": "Ollama Forge",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Local AI coding agent powered by Ollama — memory, code graph, autonomous agent, MCP support. 100% local, no telemetry, no internet required.",
   "publisher": "dtenney",
   "author": {
@@ -57,7 +57,7 @@
     "@types/vscode": "^1.134.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^2.5.2",
-    "@vscode/vsce": "^2.22.0",
+    "@vscode/vsce": "^2.32.0",
     "better-sqlite3": "^13.0.2",
     "esbuild": "^0.28.2",
     "highlight.js": "^11.11.1",
@@ -492,13 +492,19 @@
         },
         "ollamaForge.allowedExternalReadPaths": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": ["~/.ssh/config"],
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "~/.ssh/config"
+          ],
           "markdownDescription": "File paths outside the workspace that `read_file` may access without prompting for confirmation. Supports `~` for the home directory. Example: `[\"~/.ssh/config\", \"~/.gitconfig\"]`."
         },
         "ollamaForge.safeShellCommands": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "markdownDescription": "Additional shell command prefixes (regex strings) that are safe to run in parallel batches. Each entry is a regex that must match the start of the command. Example: `[\"^rg\\s\", \"^jq\\s\"]` adds ripgrep and jq to the built-in safe list."
         },
@@ -535,7 +541,12 @@
         },
         "ollamaForge.reasoningEffort": {
           "type": "string",
-          "enum": ["", "low", "medium", "high"],
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high"
+          ],
           "enumDescriptions": [
             "Use model default (high — maximum reasoning depth)",
             "Low reasoning effort: faster responses, less thorough reasoning",
