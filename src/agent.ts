@@ -1673,6 +1673,14 @@ export class Agent {
     private lastToolSignature = '';
     private consecutiveRepeats = 0;
     private readonly MAX_CONSECUTIVE_REPEATS = 1;
+
+    /**
+     * Shared completion-language detector — used in two places:
+     *   1. In-loop isLegitimateStop (~line 5795): model declared task done, stop looping.
+     *   2. Post-loop turn-limit check (~line 9186): suppress turn-limit card/auto-continue.
+     * Single source of truth so both sites stay in sync.
+     */
+    static readonly COMPLETION_LANGUAGE_RE = /\b(no (?:further|more|additional) (?:action|work|change|step|changes|edits)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|all (?:three|two|four|five|\d+) (?:change|step|item|fix|update)s? (?:are )?(?:complete|done|applied|finished)|task (?:is )?(?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|awaiting (?:your|hardware|next)|successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed)|(?:correctly|successfully) (?:restored|reverted|applied|updated|changed|fixed|deployed|installed)|(?:verified|confirmed|checked)(?:\s+and)? (?:correct|working|ok|good)|no (?:further|more) (?:changes|edits|work|action)|(?:everything|all) (?:looks|is) (?:correct|good|right|fine|in order)|ready (?:to|for)|let me know (?:when|if)|reach out (?:when|if)|nothing else to (?:act|do|work)|session (?:complete|done|finished|summary)|(?:here|this) (?:concludes|completes|wraps)|you(?:'re| are) welcome|happy to help|glad (?:I could|to help)|anytime[.!]?$|no problem[.!]?|(?:has|have) been (?:regenerated|rebuilt|updated|applied|completed|created|written)|output files?[^.]*(?:regenerated|created|written|saved))\b/i;
     /** Track consecutive calls to the same tool name (even with different args) */
     private lastToolName = '';
     /** Add a file path to _filesReadThisSession, evicting the oldest entry if the cap is reached. */
@@ -5792,8 +5800,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|can i go ahead|shall we|should we)\b.{0,120}\?\s*$/i.test(resp);
 
                 // Completion language: model stated the task is done.
-                const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|awaiting (?:your|hardware|next)|(?:^|\n)done[.!\n]|(?:^|\n)complete[.!\n]|(?:^|\n)finished[.!\n]|(?:successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed))|(?:correctly|successfully) (?:restored|reverted|applied|updated|changed|fixed|deployed|installed)|(?:verified|confirmed|checked)(?:\s+and)? (?:correct|working|ok|good)|task (?:is )?complete|no (?:further|more) (?:changes|edits|work|action)|(?:everything|all) (?:looks|is) (?:correct|good|right|fine|in order)|ready (?:to|for)|let me know (?:when|if)|reach out (?:when|if)|nothing else to (?:act|do|work))\b/i.test(resp)
-                    || /\b(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)[.!\s]*$/i.test(resp);
+                const hasCompletionLanguage = Agent.COMPLETION_LANGUAGE_RE.test(resp)
+                    || /\b(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)[.!\s]*$/i.test(resp)
+                    || /(?:^|\n)(?:done|complete|finished)[.!\n]/i.test(resp);
 
                 // User dismissal: short conversational close ("got it", "thanks", etc.) — always stop.
                 const lastUserMsg = (this.lastUserMessage ?? '').trim().toLowerCase();
@@ -9183,7 +9192,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // or when the agent used zero tools this whole run AND produced a long standalone
             // answer (pure Q&A, not a mid-task status update).
             const usedToolsThisRun = this._toolCallsThisRun.length > 0;
-            const hasCompletionLanguage = /\b(no (?:further|more|additional) (?:action|work|change|step)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|all (?:three|two|four|five|\d+) (?:change|step|item|fix|update)s? (?:are )?(?:complete|done|applied|finished)|task (?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|ready (?:to|for)|awaiting (?:your|hardware|next)|session (?:complete|done|finished|summary)|reach out (?:when|if)|nothing else to (?:act|do|work)|let me know (?:when|if)|(?:here|this) (?:concludes|completes|wraps)|you(?:'re| are) welcome|happy to help|glad (?:I could|to help)|anytime[.!]?$|no problem[.!]?|of course[.!]?|(?:has|have) been (?:regenerated|rebuilt|updated|applied|completed|created|written)|output files?[^.]*(?:regenerated|created|written|saved))\b/i.test(lastAssistantText);
+            const hasCompletionLanguage = Agent.COMPLETION_LANGUAGE_RE.test(lastAssistantText)
+                || /\b(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)[.!\s]*$/i.test(lastAssistantText)
+                || /(?:^|\n)(?:done|complete|finished)[.!\n]/i.test(lastAssistantText)
+                || /\bof course[.!]?\b/i.test(lastAssistantText);
             // If the user's last message was a conversational close/dismissal, treat the session as finished
             // regardless of what tools were used. "just leave them for now. Thanks!" after a memory_tier_write
             // should not auto-continue.
