@@ -2818,7 +2818,6 @@ export class Agent {
         this._projectStopGuardFiredThisRun = false; // Reset project stop guard so it can fire once per user message
         this._planStopGuardFiredThisRun = false;    // Reset plan-file completion guard so it can fire once per user message
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
-        this._velocityNudgeFiredThisRun = false;     // Reset velocity check so it fires once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._editContextInjected = false;     // Reset read-then-act flag
         this._editsThisRun = 0;                // Reset per-turn edit counter (session total in _totalEditsThisSession)
@@ -2833,6 +2832,7 @@ export class Agent {
         // across continuation boundaries to detect the "read → announce → continue → repeat" loop.
         if (!_isAutoContinuation) {
             this._gatherStallCycles = 0;
+            this._velocityNudgeFiredThisRun = false; // Only reset on genuine user messages
         }
         this._lastBatchWasReadOnly = false;    // Reset read-only batch flag
         // Reset loop-detection fingerprints on genuine user messages, but NOT on auto-continuations.
@@ -6576,7 +6576,13 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             } catch { /* continue */ }
                         }
                         batchToolsSucceeded++;
-                        this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
+                        const _pcPath = String(pc.args.path ?? '') || undefined;
+                        this._toolCallsThisRun.push({ name: pc.name, path: _pcPath });
+                        // Per-path re-read tracker (parallel batch — mirrors sequential path)
+                        if ((pc.name === 'read_file' || (pc.name === 'shell_read' && /\bcat\b/.test(String(pc.args.command ?? '')))) && _pcPath && !this._isSweepTask) {
+                            const _pNorm = _pcPath.replace(/\\/g, '/').toLowerCase();
+                            this._pathReadCountsThisRun.set(_pNorm, (this._pathReadCountsThisRun.get(_pNorm) ?? 0) + 1);
+                        }
                         this.history.push({ role: 'tool', content: `[TOOL RESULT: ${pc.name}]\n${toolResult}\n\n[SELF-CHECK] Before stating a cause for any failure or unexpected result above, quote the EXACT error text from this output. If the output does not literally contain a word like "firewall", "blocked", "policy", or "rate limit", do NOT claim that cause. Report only what the output actually says.` });
                         post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: true, preview: toolResult.slice(0, 200) });
                     } else {
@@ -8953,7 +8959,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         if (_readCount >= 4) {
                             logWarn(`[agent] Same-path re-read (text): "${_normPath}" read ${_readCount}x — appending action nudge`);
                             this._pathReadCountsThisRun.set(_normPath, 0); // reset so it fires again after 4 more
-                            toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${tcPath}" ${_readCount} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
+                            toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${_normPath}" ${_readCount} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
                         }
                     }
                     this.history.push({
@@ -9021,7 +9027,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         if (_readCount2 >= 4) {
                             logWarn(`[agent] Same-path re-read (native): "${_normPath2}" read ${_readCount2}x — appending action nudge`);
                             this._pathReadCountsThisRun.set(_normPath2, 0);
-                            toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${tcPath}" ${_readCount2} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
+                            toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${_normPath2}" ${_readCount2} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
                         }
                     }
 
