@@ -8404,11 +8404,15 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                                 nudge = `The move command FAILED. Use shell_read with ls/dir to see the REAL filenames on disk, then retry with the exact names.`;
                             }
                         } else if (hasFailed) {
+                            // Skip circuit breaker for SSH "command not found" -- the taxonomy hint
+                            // already supplies recovery paths; retrying the same command is always futile.
+                            const tmIsNotFoundSsh = /^ssh\s/.test(cmdStr.trim())
+                                && /command not found|No such file or directory/i.test(toolResult);
                             // Track general command failures for circuit breaker
                             const cmdSig = cmdStr.toLowerCase().trim().slice(0, 200);
                             const failCount = (this._failedCommandSignatures.get(cmdSig) ?? 0) + 1;
-                            this._failedCommandSignatures.set(cmdSig, failCount);
-                            if (failCount >= this.MAX_SAME_COMMAND_FAILURES) {
+                            if (!tmIsNotFoundSsh) { this._failedCommandSignatures.set(cmdSig, failCount); }
+                            if (!tmIsNotFoundSsh && failCount >= this.MAX_SAME_COMMAND_FAILURES) {
                                 // Circuit breaker: same failing command tried twice -- escalate to user.
                                 // Show head+tail so the user sees both start of output and the failure reason.
                                 const errFull2 = toolResult;
