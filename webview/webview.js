@@ -347,6 +347,11 @@ trustSelect.addEventListener('change', () => {
     const level = trustSelect.value;
     trustSelect.className = level === 'yolo' ? 'trust-yolo' : level === 'trust' ? 'trust-trust' : '';
     vscode.postMessage({ command: 'setTrustLevel', level });
+    // Update any open confirm cards — "Accept All" is only valid in Normal mode.
+    // Cards rendered at the old trust level may show/hide the button incorrectly.
+    document.querySelectorAll('.confirm-btn.accept-all').forEach(btn => {
+        btn.style.display = level === 'normal' ? '' : 'none';
+    });
 });
 
 /** Find preset name for a given model, or null if custom */
