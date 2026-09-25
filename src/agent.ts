@@ -33,6 +33,7 @@ import { evaluateGate } from './core/consistencyGate';
 import { repairToolJson, fixRawNewlinesInJson, extractEditFileArgs, extractJsonStringValue } from './agentToolJsonRepair';
 import { ShellEnvironment, FilePlan, detectShellEnvironment, buildShellExamples, buildTextModeShellExamples, stripSelectStringPrefixes, extractDocVerificationHints } from './agentShellEnv';
 import { buildSystemPrompt, buildSystemPromptAsync, buildSmallModelSystemPrompt, buildTextModeInstructions, buildSmallModelTextModeInstructions, buildToolBiasNote, snapshotContextFileMtimes, loadHierarchicalContext, buildProjectTypeGuidance, buildProjectTypeGuidanceAsync } from './agentPromptBuilder';
+import { stripXmlArtifacts as _stripXmlArtifacts, normalizeArgVal as _normalizeArgVal, filePathInMsg as _filePathInMsg, filterCompleteLine as _filterCompleteLine, isPlanningLine as _isPlanningLine, escHtml as _escHtml, looksLikePath as _looksLikePath, normalizePath as _normalizePath, requiredParams as _requiredParams, isAbsPath as _isAbsPath, isFilePath as _isFilePath, globToRegex as _globToRegex, globToRegexDeep as _globToRegexDeep, extractKeywords as _extractKeywords, generateBranchSlug as _generateBranchSlug } from './agentLoop';
 
 // â"€â"€ Tool definitions
 
@@ -2648,14 +2649,11 @@ export class Agent {
         // function or file named), inject a scope-first note so the agent searches and
         // reports what already exists before acting. This prevents the agent from using
         // a stale plan file as a standing order.
+        const filePathInMsg = _filePathInMsg;
         const isVagueScope = /\b(add\s+some|add\s+(?:a\s+bit\s+of\s+)?validation|improve|make\s+(?:it\s+)?better|clean\s+up|refactor\s+(?:it|things)|can\s+you\s+add)\b/i.test(userMessage)
             && !/\b(function|method|file|class|def |import )\b/i.test(userMessage)
             && !userMessage.includes('(')   // no specific call-site mentioned
             && !filePathInMsg(userMessage); // no specific file path mentioned
-
-        function filePathInMsg(msg: string): boolean {
-            return /[\w./\\-]+\.\w{2,10}\b/.test(msg);
-        }
 
         let scopeNote = '';
         if (isVagueScope) {
@@ -2950,14 +2948,7 @@ export class Agent {
                     }).trim();
                     if (currentBranch === 'main' || currentBranch === 'master') {
                         // Generate a branch name from the task message
-                        const branchSlug = userMessage
-                            .toLowerCase()
-                            .replace(/[^a-z0-9\s-]/g, '')
-                            .trim()
-                            .split(/\s+/)
-                            .slice(0, 5)
-                            .join('-')
-                            .slice(0, 40);
+                        const branchSlug = _generateBranchSlug(userMessage);
                         const timestamp = new Date().toISOString().slice(0, 10);
                         const newBranch = `agent/${timestamp}-${branchSlug}`;
                         try {
@@ -3087,19 +3078,7 @@ export class Agent {
         const isExplainQuery = /\b(explain|show me how|how does|how do|describe how|walk me through|what does.*do|how is.*implemented)\b/i.test(userMessage)
             && !/\b(import|path|move|rename|reorganize)\b/i.test(userMessage); // skip import-update queries
         if (isExplainQuery && !preProcessedContext) {
-            const stopWords = new Set(['show','me','how','the','a','an','is','are','does','do','what','where','find','explain','describe','works','work','working','this','that','it','in','on','of','for','to','and','or','with','by','from','at','into','walk','through','implemented','tell','when','happens','happen','using','used','get','make','let','run','use','way','ways','give','want','need','have','has','can','will','would','should','could','been']);
-            const kws = userMessage.toLowerCase().split(/\W+/).filter(w => w.length > 2 && !stopWords.has(w));
-            // Stemming: strip common suffixes to improve search hit rate
-            // e.g. "voided" -> "void", "printing" -> "print", "calculated" -> "calculat"
-            const stemmed = kws.map(w => {
-                if (w.endsWith('ed') && w.length > 4) { return w.slice(0, -2); }
-                if (w.endsWith('ing') && w.length > 5) { return w.slice(0, -3); }
-                if (w.endsWith('tion') && w.length > 6) { return w.slice(0, -4); }
-                if (w.endsWith('s') && w.length > 4 && !w.endsWith('ss')) { return w.slice(0, -1); }
-                return w;
-            });
-            // Use stemmed keywords for search but limit to most distinctive terms
-            const uniqueKws = [...new Set(stemmed)].slice(0, 3);
+            const uniqueKws = _extractKeywords(userMessage);
             const query = uniqueKws.join(' ') || userMessage.slice(0, 50);
             if (query.trim()) {
                 // Run one search per keyword so each term gets its own 100-result budget.
@@ -4818,24 +4797,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // Safety threshold: if a line hasn't ended after 400 chars, flush it as-is
                 const MAX_LINE_BUF = 400;
 
-                const stripXmlArtifacts = (s: string): string => s
-                    // NOTE: do NOT strip THINK_START/THINK_END -- webview uses them to switch panels
-                    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
-                    .replace(/<\/?tool_call>/g, '')
-                    .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
-                    .replace(/<\/?function_calls>/g, '')
-                    .replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/g, '')
-                    .replace(/<invoke(?:\s[^>]*)?>/g, '').replace(/<\/invoke>/g, '')
-                    .replace(/<parameter[^>]*>[\s\S]*?<\/parameter>/g, '')
-                    .replace(/<\/parameter>/g, '')
-                    .replace(/<\/?function>/g, '');
+                const stripXmlArtifacts = _stripXmlArtifacts;
 
-                // Only suppress specific single-line artifacts -- never block-suppress multi-line content
-                // as that risks swallowing real answers. The system prompt handles multi-line thought narration.
-                const SUPPRESS_SINGLE_LINE_RE = /^(?:[[emoji]'­[emoji]"[emoji] âœ¨]\s*(?:Thought\s+process|Thinking|Analysis|My\s+analysis|Reasoning)\s*[:\n]?|#{1,3}\s*(?:Thought\s+process|Thinking|Analysis|Summary|My\s+analysis|Reasoning)\s*$|(?:Let me know (?:how it runs|if you need|if there)|Happy to help|Feel free to ask|Hope (?:this|that) helps)[.!]?)\s*$/i;
-
-                const filterCompleteLine = (line: string): string =>
-                    SUPPRESS_SINGLE_LINE_RE.test(line.trim()) ? '' : line;
+                const filterCompleteLine = _filterCompleteLine;
 
                 // Does the current buffer look like the start of a suppressible single-line header?
                 const SUSPECT_PREFIX_RE = /^(?:[[emoji]'­[emoji]"[emoji] âœ¨]|#{1,3}\s*(?:Thought|Think|Analysis|Summary|Reasoning)|Let me know|Happy to help|Feel free to ask|Hope (?:this|that) helps)/i;
@@ -6194,8 +6158,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     const thinkTail = (result.thinking ?? '').trim();
                     const thinkLines = thinkTail.split('\n').map(l => l.trim()).filter(Boolean);
                     // Only promote thinking content that is a genuine conclusion, not planning narration
-                    const isPlanningLine = (l: string) =>
-                        /^(?:i(?:'ll| will| should| need to| am going to)|let me |looking |checking |searching |reading |the user |wait |actually |now i)/i.test(l);
+                    const isPlanningLine = _isPlanningLine;
                     const conclusionLines = thinkLines.filter(l => !isPlanningLine(l) && l.length > 20);
                     const promotedText = conclusionLines.slice(-3).join(' ').trim();
 
@@ -6846,13 +6809,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // spiral that defeated the exact-match detector).
                 // Exclude 'content' from normalization — large content fields differ legitimately
                 // and their length alone distinguishes attempts (we only care about path/command loops).
-                const normalizeArgVal = (v: unknown): unknown => {
-                    if (typeof v !== 'string') { return v; }
-                    let s = v.trim();
-                    if (s.startsWith('\\"') && s.endsWith('\\"')) { s = s.slice(2, -2).trim(); }
-                    if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) { s = s.slice(1, -1).trim(); }
-                    return s;
-                };
+                const normalizeArgVal = _normalizeArgVal;
                 const normArgs: Record<string, unknown> = {};
                 for (const [k, v] of Object.entries(args)) {
                     normArgs[k] = k === 'content' ? (typeof v === 'string' ? `<content:${v.length}c>` : v) : normalizeArgVal(v);
@@ -8639,8 +8596,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         const resultLines = toolResult.trim().split('\n').map(l => l.trim()).filter(Boolean);
                         const contentLines = resultLines.filter(l => !/^-+$/.test(l) && l !== 'FullName' && l !== 'Name' && l !== 'Path');
                         // A line is a file path if it's an absolute path (C:\ or /) or ends with a known extension
-                        const isAbsPath = (l: string) => /^[A-Za-z]:[\\\/]/.test(l) || l.startsWith('/');
-                        const isFilePath = (l: string) => /\.(py|ts|js|json|yaml|yml|md|txt|sh|toml|cfg|ini|html|css|sql|go|rs|java|rb|php|c|cpp|h|pyc)$/i.test(l) || isAbsPath(l);
+                        const isAbsPath = _isAbsPath;
+                        const isFilePath = _isFilePath;
                         // Fire if at least one content line is a path (truncated output may only show 1)
                         // Do NOT fire on shell errors -- the path in the error is the wrong/missing one.
                         // Raise the length limit to 4000 to handle multi-file search results.
@@ -9240,10 +9197,6 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 // Also catch "X, thanks" / "X. thanks" endings — any short message ending with thanks/thank you
                 // is a conversational close regardless of what comes before it.
                 || (lastUserMsg.length < 150 && /[,.]?\s*thanks?[!.]?\s*$/i.test(lastUserMsg));
-            // Pure Q&A detection: zero tools used + response is substantial (>400 chars = real answer, not a status note)
-            // A short text-only turn mid-task ("Checking now...") should still auto-continue.
-            const isPureQA = !usedToolsThisRun && !lastToolCall && lastAssistantText.length > 400;
-            const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession;
             // Track consecutive runs with no meaningful progress to detect infinite auto-continue loops.
             // "Progress" = any tool that changes state or actively investigates (file writes, commands,
             // shell reads, web fetches, memory writes). Only pure no-op turns (zero tools, or only
@@ -9256,6 +9209,20 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 || t.name === 'web_search' || t.name === 'web_fetch'
                 || t.name === 'run_command_pip' || t.name === 'run_command_destructive'
             );
+            // Q&A detection: run used ONLY lookup/read tools (no state changes) — treat as a
+            // complete answer regardless of how many web pages were fetched. This prevents a
+            // "what are the dimensions?" web-research answer from auto-continuing in Trust/YOLO.
+            const onlyLookupToolsUsed = usedToolsThisRun && !this._toolCallsThisRun.some(t =>
+                t.name === 'write_file' || t.name === 'edit_file' || t.name === 'edit_file_at_line'
+                || t.name === 'run_command' || t.name === 'shell_read'
+                || t.name === 'run_command_pip' || t.name === 'run_command_destructive'
+            );
+            // Pure Q&A detection: zero tools OR only lookup/read tools (web_search, web_fetch,
+            // read_file, memory_search) used, AND the response is substantial (>400 chars = real
+            // answer, not a brief mid-task status note). A "what are the dimensions?" question
+            // answered via web search should not auto-continue in Trust/YOLO.
+            const isPureQA = (!usedToolsThisRun || onlyLookupToolsUsed) && lastAssistantText.length > 400;
+            const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession;
             if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
                 this._earlyCompactionStalls = 0; // real progress breaks the stall streak
@@ -10997,9 +10964,7 @@ if errors:
                 }
 
                 // Simple glob -> regex conversion for file extension matching
-                const globToRegex = (g: string) => new RegExp(
-                    '^' + g.replace(/\./g, '\\.').replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*').replace(/\?/g, '.') + '$'
-                );
+                const globToRegex = _globToRegex;
                 const sfGlobRe = globToRegex(sfGlob);
 
                 // Treat **/* and * as match-all (no glob filtering)
@@ -11105,18 +11070,7 @@ if errors:
                 const matches: string[] = [];
 
                 // Convert glob to regex -- support ** (any depth) and * (single segment)
-                const ffGlobToRegex = (g: string) => {
-                    const normalized = g.replace(/\\/g, '/');
-                    // Process ? first (glob single-char wildcard), then ** and * (so replacement
-                    // strings from ** don't contain ? which would be re-processed by the ? rule).
-                    const re = '^' + normalized
-                        .replace(/\./g, '\\.')
-                        .replace(/\?/g, '[^/]')
-                        .replace(/\*\*\//g, '(.+/)?')
-                        .replace(/\*\*/g, '.*')
-                        .replace(/\*/g, '[^/]*') + '$';
-                    return new RegExp(re);
-                };
+                const ffGlobToRegex = _globToRegexDeep;
                 const ffRe = ffGlobToRegex(ffPattern);
 
                 const walkFind = (dir: string) => {
@@ -12926,7 +12880,7 @@ if errors:
                 const rptSample: string[][] = Array.isArray(args.sample) ? args.sample : [];
 
                 const rptDate = new Date().toISOString().replace('T', ' ').slice(0, 19);
-                const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                const escHtml = _escHtml;
                 const statsRows = rptStats.map(s => `<tr><td>${escHtml(String(s.label))}</td><td><strong>${escHtml(String(s.value))}</strong></td></tr>`).join('\n');
                 const sampleHtml = rptSample.length > 1
                     ? `<h2>Sample</h2><table><thead><tr>${rptSample[0].map(h => `<th>${escHtml(h)}</th>`).join('')}</tr></thead><tbody>${rptSample.slice(1).map(row => `<tr>${row.map(c => `<td>${escHtml(c)}</td>`).join('')}</tr>`).join('\n')}</tbody></table>`
@@ -15003,8 +14957,7 @@ ${sampleHtml}
             const pyFnOld2 = oldLines2.match(/def\s+(\w+)\s*\(([^)]*)\)/);
             const pyFnNew2 = newContent.match(/def\s+(\w+)\s*\(([^)]*)\)/);
             if (pyFnOld2 && pyFnNew2 && pyFnOld2[1] === pyFnNew2[1] && pyFnOld2[2] !== pyFnNew2[2]) {
-                const requiredParams2 = (paramStr: string) =>
-                    paramStr.split(',').map(p => p.trim()).filter(p => p && p !== 'self' && !p.includes('=') && !p.startsWith('*') && !p.startsWith('**'));
+                const requiredParams2 = _requiredParams;
                 const oldRequired2 = requiredParams2(pyFnOld2[2]);
                 const newRequired2 = requiredParams2(pyFnNew2[2]);
                 const addedRequired2 = newRequired2.filter(p => !oldRequired2.includes(p));
@@ -15070,7 +15023,7 @@ ${sampleHtml}
                 try {
                     // Build concise fact string: prefer path for workspaces, host/URL for services/machines.
                     // Also check smId itself -- models sometimes use the path as the node id.
-                    const looksLikePath = (s: string) => /^[a-zA-Z]:[\\/]|^[/~]/.test(s);
+                    const looksLikePath = _looksLikePath;
                     const pathFact = smMeta['path'] ?? smMeta['workspace_path']
                         ?? (looksLikePath(smId) ? smId : '');
                     const hostFact = smMeta['host'] ?? smMeta['url'] ?? smMeta['port'] ?? '';
@@ -15141,11 +15094,7 @@ ${sampleHtml}
         const full = path.resolve(root, rel);
         // Normalize slashes + case on Windows — models often pass forward slashes while
         // vscode.workspace.workspaceFolders[0].uri.fsPath returns backslashes.
-        const normalize = (p: string) => {
-            let n = p.replace(/\//g, path.sep);
-            if (process.platform === 'win32') { n = n.toLowerCase(); }
-            return n;
-        };
+        const normalize = _normalizePath;
         const fullNorm = normalize(full);
         const rootNorm = normalize(root);
         const rootNormWithSep = rootNorm.endsWith(path.sep) ? rootNorm : rootNorm + path.sep;
