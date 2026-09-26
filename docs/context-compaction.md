@@ -53,25 +53,31 @@ it auto-resumes the task after compaction.
 - `resolvedLimitsCache` / `pendingResolutions` — module-level caches in
   `contextCalculator.ts`; `pendingResolutions` is always cleaned up in `finally`.
 
-## Known issues (reviewed 2026-09-22)
+## Known issues (reviewed 2026-09-24)
 
-1. **Anti-thrash measures message-count savings, not token savings.**
-   `savingsRatio = messagesRemoved / oldMessageCount`. But `shrinkLargeToolMessages`
-   can save a large number of tokens while removing **zero** messages. In that case
-   `savingsRatio` is 0 and the anti-thrash detector can falsely report "context
-   compaction stuck" even though the token budget was met. Consider measuring token
-   savings (before/after) instead of message count.
+1. **Anti-thrash measures message-count savings, not token savings.** *(reviewed — not a real bug)*
+   `savingsRatio = messagesRemoved / oldMessageCount`. The concern was that
+   `shrinkLargeToolMessages` could save many tokens while removing **zero** messages,
+   driving `savingsRatio` to 0 and falsely tripping the "context compaction stuck"
+   detector. In practice this cannot happen for any realistic history: the
+   **min-remove floor** in `performCoreCompaction` (`src/agent.ts` ~line 17374)
+   forces at least `max(floor(oldMessageCount * 0.4), 4)` messages to be dropped
+   whenever `oldMessageCount > minAutoRemove`. That guarantees `savingsRatio ≥ 0.4`
+   for histories of 10+ messages and `≥ 4/n` (still ≥ 0.10) for 5–9 messages. The
+   thrash detector (fires only when 3 consecutive ratios are < 0.10) can therefore
+   only trigger for histories of ≤ 4 messages — a degenerate case. No change needed.
 
-2. **`performCoreCompaction` executes with heuristic stats.**
-   The compact *decision* is gated on `accurateStats`, but `performCoreCompaction`
-   is passed the original heuristic `contextStats` (~line 4645). Its `targetTokens`
-   budget and the `systemPromptTokens`/`memoryTokens` handed to `compactHistory`
-   therefore use the char/4 estimate, not the accurate counts just computed. The
-   `modelLimit` is identical either way, so this is a minor budget inaccuracy, not a
-   crash — but it is inconsistent with the "verify with accurate counts" intent.
+2. **`performCoreCompaction` executed with heuristic stats.** *(FIXED 2026-09-24)*
+   The compact *decision* was gated on `accurateStats`, but `performCoreCompaction`
+   was passed the original heuristic `contextStats`. Its `targetTokens` budget and
+   the `systemPromptTokens`/`memoryTokens` handed to `compactHistory` therefore used
+   the char/4 estimate, not the accurate counts just computed. **Fix:** the call site
+   (`src/agent.ts` ~line 4711) now passes `accurateStats`, so the action matches the
+   decision. `modelLimit` is identical either way.
 
-3. **Stale-history window during manual compaction.**
+3. **Stale-history window during manual compaction.** *(reviewed — low risk, left as-is)*
    `compactContext` awaits the summary LLM call *before* reassigning
    `this.history` (~line 2344). During that await, `this.history` still holds the
    pre-compaction array. Low risk — the `this._running` guard blocks concurrent
    agent runs — but any code reading `this.history` in that window sees stale data.
+   Left as-is; the guard makes it a non-issue in normal operation.

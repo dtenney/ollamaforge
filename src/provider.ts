@@ -1642,9 +1642,21 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         break;
                     }
                     post({ type: 'compactingStarted' });
-                    const result = await this._agent!.compactContext(25, (token) => {
-                        post({ type: 'compactSummaryToken', token });
-                    });
+                    // Hold the running guard across the whole compaction window — the
+                    // await below includes a multi-second LLM summary call. Without this,
+                    // a concurrent sendMessage would pass its own `if (this._running)`
+                    // guard (still false) and start a run mid-compaction.
+                    this._running = true;
+                    let result;
+                    try {
+                        result = await this._agent!.compactContext(25, (token) => {
+                            post({ type: 'compactSummaryToken', token });
+                        });
+                    } catch (err) {
+                        this._running = false;
+                        post({ type: 'error', text: `Compaction failed: ${err instanceof Error ? err.message : String(err)}` });
+                        break;
+                    }
                     post({
                         type: 'contextCompacted',
                         messagesRemoved: result.removed,
@@ -1659,7 +1671,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     if (this._trustLevel !== 'normal' && this._agent!.conversationHistory.length > 0) {
                         logInfo(`[provider] ${this._trustLevel} mode: auto-resuming after manual compact`);
                         const resumeModel = getConfig().model;
-                        this._running = true;
+                        // _running is already true — the run below owns it and clears it in its finally.
                         (async () => {
                             try {
                                 await this._agent!.run(
@@ -1674,6 +1686,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 this.persistSession();
                             }
                         })();
+                    } else {
+                        this._running = false;
                     }
                     break;
                 }
