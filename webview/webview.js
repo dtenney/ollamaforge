@@ -507,7 +507,6 @@ function renderMarkdown(text) {
     });
 
     // 9b. Linkify bare file paths in prose (e.g. "docs/foo.md", "src/agent.ts")
-    // Match relative paths that contain a slash and a file extension.
     // Must come after inline-code restore so we don't double-wrap.
     // Guard: extract existing <a class="file-link"> tags first so we don't re-wrap paths already linked.
     /** @type {string[]} */
@@ -517,6 +516,12 @@ function renderMarkdown(text) {
         existingLinks.push(m);
         return id;
     });
+    // Absolute Windows paths: c:\Users\...\file.ext (spaces allowed in folder names)
+    text = text.replace(
+        /(?<![">])([a-zA-Z]:\\(?:[^\\<>\n"]+\\)*[^\\<>\n"]+\.[a-zA-Z]{1,6})/g,
+        (match) => `<a class="file-link" data-file="${escHtml(match)}" href="#" title="Open in VS Code">${escHtml(match)}</a>`
+    );
+    // Relative paths without spaces (e.g. "docs/foo.md", "src/agent.ts")
     text = text.replace(
         /(?<![">\/\\])(\b(?:[a-zA-Z0-9_\-]+\/)+[a-zA-Z0-9_\-]+\.[a-zA-Z]{1,6}\b)/g,
         (match) => `<a class="file-link" data-file="${escHtml(match)}" href="#" title="Open in VS Code">${escHtml(match)}</a>`

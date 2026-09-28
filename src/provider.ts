@@ -1562,11 +1562,15 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                 case 'openFile': {
                     const rawPath = String(raw.path ?? '').trim();
                     if (!rawPath) { break; }
-                    // Resolve relative to the first workspace folder
+                    // Absolute paths (Windows c:\ or Unix /) open directly; relative paths
+                    // are resolved against the first workspace folder.
+                    const isAbsolute = /^[a-zA-Z]:[\\\/]/.test(rawPath) || rawPath.startsWith('/');
                     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
-                    const fileUri = wsRoot
-                        ? vscode.Uri.joinPath(wsRoot, rawPath)
-                        : vscode.Uri.file(rawPath);
+                    const fileUri = isAbsolute
+                        ? vscode.Uri.file(rawPath)
+                        : wsRoot
+                            ? vscode.Uri.joinPath(wsRoot, rawPath)
+                            : vscode.Uri.file(rawPath);
                     try {
                         await vscode.window.showTextDocument(fileUri, { preview: false });
                     } catch {
