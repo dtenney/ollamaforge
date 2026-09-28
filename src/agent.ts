@@ -7248,14 +7248,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         }
                     }
 
-                    // â"€â"€ Destructive command guard â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-                    // Commands that delete, overwrite, or truncate files require
-                    // explicit user confirmation before execution -- regardless of
-                    // merge mode or auto-approval. The user must see what will be
-                    // deleted and consciously approve it.
-                    // Read-only commands that can never be destructive — exempt before regex
-                    // matching to prevent false positives (e.g. "du -sh ... 2>/dev/null" was
-                    // triggering the redirect-to-data-file heuristic).
+                    // ── Destructive redirect guard ──────────────────────────────────────────
+                    // Catches `> file.db` overwrite-redirect patterns. rm/rmdir/Remove-Item etc.
+                    // are handled by BUILTIN_CONFIRM (policy.verdict==='confirm') above.
+                    // Read-only commands are exempted to avoid false positives on 2>/dev/null.
                     // ── Command policy engine (Wave 1, plan 1.2) ──────────────
                     // Config-driven deny/confirm/allow + egress allowlist.
                     // deny is ALWAYS enforced (even YOLO); confirm always prompts.
@@ -7335,15 +7331,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     const isReadOnlyCmd = /^\s*(du|df|ls|ll|dir|cat|head|tail|grep|find|stat|file|wc|diff|echo|pwd|id|who|uptime|uname|hostname|ps|top|lsof|netstat|ss|ifconfig|ping)\b/i.test(cmdStr0)
                         || /\bssh\b[^"]*"\s*(du|df|ls|cat|head|tail|grep|find|stat|wc|diff|echo|ps|lsof|netstat|ss|ifconfig)\b/i.test(cmdStr0);
 
-                    const isDestructiveCmd = !isReadOnlyCmd && (
-                        /(?:^|[;&|])\s*rm\s+(?!-[a-z]*r[a-z]*\s+\/(?!home|Users|tmp)\b)|\brm\s+-[a-z]*f\b|\brmdir\b|\btruncate\b|\bshred\b|\bdel\s+\/[fqs]/i.test(cmdStr0)
-                        || /\bRemove-Item\b|\bClear-Content\b/i.test(cmdStr0)
-                        || /(?<![0-9])>\s*[\w\\/:.]+\.(db|sqlite|sqlite3|json|csv|log|conf|cfg|env)\b/.test(cmdStr0) // overwrite redirect, not 2>/dev/null
-                    );
-                    // Skip destructive guard if commandPolicy already confirmed this command
-                    // (policy.verdict === 'confirm' was already approved above — don't ask twice).
-                    const policyAlreadyConfirmed = policy.verdict === 'confirm';
-                    if (isDestructiveCmd && !policyAlreadyConfirmed && !this._isToolApproved('run_command_destructive')) {
+                    // Destructive redirect guard: catches `> file.db` overwrite patterns not covered
+                    // by BUILTIN_CONFIRM. rm/rmdir/Remove-Item/truncate etc. are already in BUILTIN_CONFIRM
+                    // (policy.verdict==='confirm') and are NOT repeated here to avoid double-prompting.
+                    const isDestructiveCmd = !isReadOnlyCmd
+                        && /(?<![0-9])>\s*[\w\\/:.]+\.(db|sqlite|sqlite3|json|csv|log|conf|cfg|env)\b/.test(cmdStr0);
+                    if (isDestructiveCmd && !this._isToolApproved('run_command_destructive')) {
                         logInfo(`[destructive-guard] Destructive command requires confirmation: ${cmdStr0.slice(0, 80)}`);
                         // Destructive ops always ask per-occurrence — no Accept All button.
                         const confirmed = await this.requestConfirmation(
