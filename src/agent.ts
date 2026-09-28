@@ -9214,7 +9214,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // read_file, memory_search) used, AND the response is substantial (>400 chars = real
             // answer, not a brief mid-task status note). A "what are the dimensions?" question
             // answered via web search should not auto-continue in Trust/YOLO.
-            const isPureQA = (!usedToolsThisRun || onlyLookupToolsUsed) && lastAssistantText.length > 400;
+            // Guard: only treat as pure Q&A if the run was short (≤6 turns). A long read-only
+            // run (7+ turns reading many files) is a mid-task research gather — it should
+            // auto-continue so the agent can proceed to write/act on what it found.
+            const isPureQA = (!usedToolsThisRun || onlyLookupToolsUsed)
+                && lastAssistantText.length > 400
+                && this._runTurnCount <= 6;
             const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession;
             if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
