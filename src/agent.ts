@@ -34,6 +34,8 @@ import { repairToolJson, fixRawNewlinesInJson, extractEditFileArgs, extractJsonS
 import { ShellEnvironment, FilePlan, detectShellEnvironment, buildShellExamples, buildTextModeShellExamples, stripSelectStringPrefixes, extractDocVerificationHints } from './agentShellEnv';
 import { buildSystemPrompt, buildSystemPromptAsync, buildSmallModelSystemPrompt, buildTextModeInstructions, buildSmallModelTextModeInstructions, buildToolBiasNote, snapshotContextFileMtimes, loadHierarchicalContext, buildProjectTypeGuidance, buildProjectTypeGuidanceAsync } from './agentPromptBuilder';
 import { stripXmlArtifacts as _stripXmlArtifacts, normalizeArgVal as _normalizeArgVal, filePathInMsg as _filePathInMsg, filterCompleteLine as _filterCompleteLine, isPlanningLine as _isPlanningLine, escHtml as _escHtml, looksLikePath as _looksLikePath, normalizePath as _normalizePath, requiredParams as _requiredParams, isAbsPath as _isAbsPath, isFilePath as _isFilePath, globToRegex as _globToRegex, globToRegexDeep as _globToRegexDeep, extractKeywords as _extractKeywords, generateBranchSlug as _generateBranchSlug } from './agentLoop';
+import { safePath as _safePath, resolvePathWithPolicy as _resolvePathWithPolicy, isOsProtectedPath as _isOsProtectedPath } from './pathPolicy';
+import { writePlanFile as _writePlanFile, updatePlanFile as _updatePlanFile, closePlanFile as _closePlanFile } from './planFile';
 
 // â"€â"€ Tool definitions
 
@@ -4654,81 +4656,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             // for thinking models (qwen3, gemma4) which consume tokens fast during reasoning.
             // Before compacting, get an accurate token count to avoid false-overflow
             // from the char/4 heuristic drifting 20-30% on large-vocabulary models.
-            if (contextStats.usagePercentage >= 80) {
-                if (cfg.autoCompactContext) {
-                    const accurateStats = await calculateContextStatsAccurate(this.history, systemContent, memoryContext, model);
-                    // If accurate count is below 70%, the heuristic over-estimated significantly -- skip compaction
-                    if (accurateStats.usagePercentage < 70) {
-                        logInfo(`[context] Heuristic said ${contextStats.usagePercentage.toFixed(1)}% but accurate count is ${accurateStats.usagePercentage.toFixed(1)}% -- skipping auto-compact`);
-                    } else {
-                    logWarn(`[context] Auto-compacting at ${accurateStats.usagePercentage.toFixed(1)}% (accurate)`);
-
-                    // === EARLY-COMPACTION STALL DETECTION ===
-                    // Early-compaction stall detection: if context fills before any work is done,
-                    // two consecutive such runs means an unrecoverable loop.
-                    if (this.checkEarlyCompactionStall(turn, post)) { return; }
-
-                    // Signal the webview that compaction is starting so it can show a card.
-                    post({ type: 'compactingStarted' });
-
-                    // Capture history snapshot BEFORE any compaction or modification.
-                    // Used both for the WIP snapshot (tool results) and post-compact diff.
-                    const historyBeforeCompact = this.history.slice();
-
-                    // === SYNCHRONOUS WORK-IN-PROGRESS SNAPSHOT ===
-                    const wipLines = this.buildWipSnapshot(contextStats.usagePercentage, historyBeforeCompact);
-                    const wipSnapshot = wipLines.join('\n');
-
-                    // === SYNCHRONOUS TIER 2 SAVE ===
-                    if (this.memory) {
-                        const syncMemNote = wipLines
-                            .filter(l => !l.startsWith('[WORK IN PROGRESS') && !l.startsWith('IMPORTANT:'))
-                            .join('\n');
-                        this.memory.addEntry(2, syncMemNote, ['auto-compact', 'session', 'wip-sync']).catch((e) => logWarn(`[memory] background write failed: ${toErrorMessage(e)}`));
-                        logInfo(`[context] Synchronous WIP snapshot saved to Tier 2 (${wipLines.length} lines)`);
-                    }
-
-                    // Core compaction: shrink + compact + anti-thrash.
-                    // Pass accurateStats (not the heuristic contextStats) so the
-                    // target-token budget and the system/memory token counts handed
-                    // to compactHistory match the accurate counts we just used to
-                    // decide to compact. modelLimit is identical either way.
-                    const compactOutcome = this.performCoreCompaction(accurateStats, post);
-                    if (compactOutcome.shouldBreak) { break; }
-                    const { messagesRemoved, autoDropped } = compactOutcome;
-
-                    // Save structured facts from dropped messages to Tier 2 memory (async, fire-and-forget)
-                    if (messagesRemoved > 0) {
-                        this.saveDroppedToMemory(autoDropped);
-                    }
-
-
-                    // After compaction, inject WIP snapshot + recent Tier 2 memory at the front of history.
-                    const injectedCompactNote = this.injectPostCompactContext(wipSnapshot, wipLines);
-
-                    this.lastContextLevel = 'safe';
-
-                    // Build a human-readable summary of what we remember, shown in chat
-                    const compactSummary = this.buildCompactSummary(messagesRemoved);
-
-                    post({
-                        type: 'contextCompacted',
-                        messagesRemoved,
-                        newPercentage: 50,
-                        summary: compactSummary
-                    });
-                    } // end else (accurateStats.usagePercentage >= 90)
-                } else {
-                    // Alert user that compaction is needed but disabled
-                    post({
-                        type: 'contextOverflow',
-                        percentage: contextStats.usagePercentage,
-                        totalTokens: contextStats.totalTokens,
-                        modelLimit: contextStats.modelLimit
-                    });
-                    logError(`[context] Context at ${contextStats.usagePercentage.toFixed(1)}% but auto-compact is disabled`);
-                }
-            }
+            const compactDecision = await this.handleAutoCompact(contextStats, cfg, systemContent, memoryContext, model, turn, post);
+            if (compactDecision === 'stop') { return; }
+            if (compactDecision === 'break') { break; }
             
             // Merge built-in tools with MCP tools
             // Small models in edit mode get a restricted set (edit_file + run_command only)
@@ -5773,6 +5703,13 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 const endsWithPermissionQuestion = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
                     && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|can i go ahead|shall we|should we)\b.{0,120}\?\s*$/i.test(resp);
 
+                // Phase-handoff phrases: "say the word and I'll start Phase 3", "let me know when
+                // you're ready", "is a separate effort — say the word" etc.  The model uses these
+                // to hand back control even though it hasn't asked a question. In Trust/YOLO mode
+                // we intercept them the same way we intercept permission questions.
+                const endsWithPhaseHandoff = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
+                    && /\b(say the word|let me know when(?: you(?:'re| are)? ready)?|when you(?:'re| are)? ready|just say (?:the word|go|next|yes)|give me the go.?ahead|say ['"]?next['"]?|is a separate effort)\b/i.test(resp);
+
                 // Completion language: model stated the task is done.
                 const hasCompletionLanguage = Agent.COMPLETION_LANGUAGE_RE.test(resp)
                     || /\b(?:is |are |now |'s )(?:deployed|live|running|complete|working|fixed|done|set up|installed|ready)[.!\s]*$/i.test(resp)
@@ -5801,12 +5738,16 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
 
                 // ── Trust/yolo permission-seeking intercept ────────────────────────────
                 // In trust/yolo mode, if the agent ended its response with a permission-seeking
-                // question ("want me to take X next?", "shall I proceed with Y?"), intercept
-                // and force it to continue — even when tools were called this turn.
-                if (endsWithPermissionQuestion) {
+                // question ("want me to take X next?", "shall I proceed with Y?") OR a
+                // phase-handoff phrase ("say the word and I'll start Phase 3"), intercept
+                // and force it to continue to the next phase immediately.
+                if (endsWithPermissionQuestion || endsWithPhaseHandoff) {
                     const toolCallHint2 = isTextMode ? ' Output only a <tool> block.' : ' Call the next tool now.';
+                    const nudge = endsWithPhaseHandoff
+                        ? `[SYSTEM: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT wait for the user to say "the word" or give permission — proceed immediately to the next phase/step now.${toolCallHint2}]`
+                        : `[SYSTEM: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission or offer a choice — pick the next logical action and do it immediately.${toolCallHint2}]`;
                     this.history.pop();
-                    this.history.push({ role: 'user', content: `[SYSTEM: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission or offer a choice — pick the next logical action and do it immediately.${toolCallHint2}]` });
+                    this.history.push({ role: 'user', content: nudge });
                     post({ type: 'removeLastAssistant' });
                     continue;
                 }
@@ -5928,7 +5869,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // actual file content so it has what it needs and has no reason to re-read.
                 const readSpiralThresholdEarly =
                     this._taskPhase === 'acting'    ? 3 :
-                    this._taskPhase === 'verifying' ? 4 : 6; // research: was 10→6; verifying: was 5→4
+                    this._taskPhase === 'verifying' ? 5 : 8; // research: 10→6→8 (64K); verifying: 5→4→5 (64K)
                 if (this._readOnlyTurnsSinceLastEdit >= readSpiralThresholdEarly
                     && this.autoRetryCount < this.effectiveMaxRetries
                     && !isLegitimateStop) {
@@ -5943,7 +5884,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                                 : path.join(this.workspaceRoot, this._lastReadFilePath);
                             const raw = fs.readFileSync(absPath, 'utf8');
                             const lines = raw.split('\n');
-                            const MAX_INJECT = 120;
+                            const MAX_INJECT = 200;
                             const numbered = lines.slice(0, MAX_INJECT).map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
                             const rel = path.relative(this.workspaceRoot, absPath).replace(/\\/g, '/');
                             const truncNote = lines.length > MAX_INJECT ? `\n... (${lines.length - MAX_INJECT} more lines)` : '';
@@ -6447,6 +6388,17 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 logInfo(`[agent] Text-mode: model emitted ${toolCalls.length} tool calls, executing first (${toolCalls[0].function.name}), deferring ${deferredCalls.length} remaining`);
             }
             let breakAfterBatch = false;
+            // ── Answer-already-given guard ─────────────────────────────────────────────
+            // Model produced a complete answer (>400 chars, completion language) in the same
+            // turn as a read-only tool call. Execute the tool (can't be suppressed mid-stream),
+            // but append a note so the model knows it already answered and should stop rather
+            // than doing another verification pass on the result.
+            const _answerAlreadyGiven = toolCalls.length > 0
+                && toolCalls.every(tc => READ_ONLY_TOOLS.has(tc.function.name))
+                && Agent.COMPLETION_LANGUAGE_RE.test(result.content)
+                && result.content.trim().length > 400
+                && !this._isSweepTask;
+
             // History-poisoning recovery: snapshot history length before the batch.
             // If every tool in the batch hard-fails, we revert to this snapshot and
             // inject a single corrective message rather than leaving a trail of error
@@ -6537,43 +6489,9 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 );
                 this._lastReadFilePath = savedLastReadPath;
                 // Phase 3: process results sequentially (history order matters)
-                for (let i = 0; i < settled.length; i++) {
-                    const pc = parallelCalls[i];
-                    const s = settled[i];
-                    batchToolsAttempted++;
-                    if (pc.aborted) {
-                        this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
-                        this.history.push({ role: 'tool', content: `[TOOL ABORTED: ${pc.name}]\n(aborted by middleware)` });
-                        post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: '(aborted by middleware)' });
-                        continue;
-                    }
-                    if (s.status === 'fulfilled') {
-                        let toolResult = s.value;
-                        // Post-hook middleware
-                        for (const mw of [...Agent._middlewares].reverse()) {
-                            if (!mw.postHook) { continue; }
-                            try {
-                                const t = mw.postHook(pc.name, pc.args, toolResult);
-                                if (t !== undefined) { toolResult = t; }
-                            } catch { /* continue */ }
-                        }
-                        batchToolsSucceeded++;
-                        const _pcPath = String(pc.args.path ?? '') || undefined;
-                        this._toolCallsThisRun.push({ name: pc.name, path: _pcPath });
-                        // Per-path re-read tracker (parallel batch — mirrors sequential path)
-                        if ((pc.name === 'read_file' || (pc.name === 'shell_read' && /\bcat\b/.test(String(pc.args.command ?? '')))) && _pcPath && !this._isSweepTask) {
-                            const _pNorm = _pcPath.replace(/\\/g, '/').toLowerCase();
-                            this._pathReadCountsThisRun.set(_pNorm, (this._pathReadCountsThisRun.get(_pNorm) ?? 0) + 1);
-                        }
-                        this.history.push({ role: 'tool', content: `[TOOL RESULT: ${pc.name}]\n${toolResult}\n\n[SELF-CHECK] Before stating a cause for any failure or unexpected result above, quote the EXACT error text from this output. If the output does not literally contain a word like "firewall", "blocked", "policy", or "rate limit", do NOT claim that cause. Report only what the output actually says.` });
-                        post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: true, preview: toolResult.slice(0, 200) });
-                    } else {
-                        const errMsg = toErrorMessage(s.reason);
-                        this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
-                        this.history.push({ role: 'tool', content: `[TOOL ERROR: ${pc.name}]\n${errMsg}\n\n[SELF-CHECK] The error text above is the ONLY source of truth for what went wrong. Quote it exactly when explaining the failure. Do NOT add causes (firewall, policy, rate limit, etc.) that are not literally present in the text.` });
-                        post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: errMsg.slice(0, 200) });
-                    }
-                }
+                const batchCounts = this.processParallelBatchResults(parallelCalls, settled, post);
+                batchToolsAttempted += batchCounts.attempted;
+                batchToolsSucceeded += batchCounts.succeeded;
                 continue;
                 } // end else (allShellSafe)
             } // end if (allReadOnly && callsToExecute.length > 1 && !this.stopRef.stop)
@@ -7525,8 +7443,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 // ── End consistency gate ─────────────────────────────────────
 
                 // ── No-progress detector (steal from row-bot agent_budget.py) ──
-                // Block a tool call if it is the 4th+ consecutive identical
-                // (name+args) call. The model is stuck in a retry spiral.
+                // Tiered thresholds:
+                //   1–3: allow (legitimate retries)
+                //   4:   block with structured error (skip call, inject redirect)
+                //   5+:  hard-stop — break out of the tool loop entirely
                 {
                     const digest = toolCallDigest(name, args);
                     if (digest === this._lastToolDigest) {
@@ -7535,7 +7455,16 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         this._lastToolDigest = digest;
                         this._repeatToolCount = 1;
                     }
+                    if (this._repeatToolCount >= 5) {
+                        // Tier 3: hard-stop — the model is in an unrecoverable loop.
+                        logWarn(`[no-progress] HARD-STOP ${name}: identical call repeated ${this._repeatToolCount}x in a row — breaking tool loop`);
+                        const hardStopMsg = `[no-progress] HARD STOP: Tool "${name}" has been called ${this._repeatToolCount} times in a row with identical arguments. This is an unrecoverable loop. I am stopping the tool loop now. Please rephrase your request or provide additional context so I can take a different approach.`;
+                        this.history.push({ role: 'user', content: hardStopMsg });
+                        post({ type: 'toolResult', id: toolId, name, success: false, preview: `(hard-stop: ${name} repeated ${this._repeatToolCount}x)` });
+                        break;
+                    }
                     if (this._repeatToolCount >= 4) {
+                        // Tier 2: block with structured error
                         logWarn(`[no-progress] BLOCKED ${name}: identical call repeated ${this._repeatToolCount}x in a row`);
                         this.history.push({
                             role: 'user',
@@ -7842,7 +7771,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         // Also skip if the output shows partial success (the command did something useful
                         // even though it exited non-zero) — repeated partial-success runs are not stuck loops.
                         const cbIsTimeout = toolResult.includes('timed out after');
-                        const cbIsPartialSuccess = /\b(CLEANED|DONE|OK|SUCCESS|installed|created|started|stopped|deployed|wrote|updated)\b/i.test(toolResult.slice(-300));
+                        const cbIsPartialSuccess = /\b(CLEANED|DONE|OK|SUCCESS|installed|created|started|stopped|deployed|wrote|updated)\b/i.test(toolResult.slice(-300))
+                            || /-> \d+ items?\b/i.test(toolResult);
                         // Skip circuit breaker for not-found errors on SSH commands — the taxonomy hint
                         // already gives the agent 3 specific recovery paths. Retrying the exact same
                         // command makes no sense (it will always fail), so counting failures is noise.
@@ -8331,9 +8261,14 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         // Require exit code evidence OR error-only output (no substantial content before the error).
                         const hasExitFailure = /\bexit [1-9]\b/.test(toolResult) && !toolResult.includes('file(s) moved');
                         const hasErrorPrefix = /^(bash|sh|cmd|powershell|python).*error/im.test(toolResult.slice(0, 300));
-                        const hasFailed = hasExitFailure || hasErrorPrefix
-                            || toolResult.slice(0, 200).toLowerCase().includes('cannot find')
-                            || toolResult.slice(0, 200).toLowerCase().includes('not found');
+                        // "not found" guard: only treat as failure when it's a shell-level path/command
+                        // not-found (e.g. "bash: foo: command not found"), NOT an HTTP 404 response body
+                        // that contains "Not Found" as part of probe output that also has successful results.
+                        const hasShellNotFound = /\b(command not found|No such file or directory|cannot find the path)\b/i.test(toolResult.slice(0, 200));
+                        // Partial success: output contains success markers alongside failures — not a stuck loop.
+                        const tmIsPartialSuccess = /\b(OK|SUCCESS|DONE|CLEANED|installed|created|started|stopped|deployed|wrote|updated)\b/i.test(toolResult)
+                            || /-> \d+ items?\b/i.test(toolResult);
+                        const hasFailed = !tmIsPartialSuccess && (hasExitFailure || hasErrorPrefix || hasShellNotFound);
                         if (userWantsPathUpdate && (isMoveCmd || isMkdirCmd)) {
                             nudge = 'STOP -- the user wants you to UPDATE CODE REFERENCES (import statements, paths in code), NOT move files. Use shell_read with grep/findstr to find where the OLD import paths are used, then use edit_file to update them.';
                         } else if (toolResult.includes('already exists')) {
@@ -8950,15 +8885,18 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     if (tcPath && !this._isSweepTask) {
                         const _normPath = tcPath.replace(/\\/g, '/').toLowerCase();
                         const _readCount = this._pathReadCountsThisRun.get(_normPath) ?? 0;
-                        if (_readCount >= 4) {
+                        if (_readCount >= 5) {
                             logWarn(`[agent] Same-path re-read (text): "${_normPath}" read ${_readCount}x — appending action nudge`);
                             this._pathReadCountsThisRun.set(_normPath, 0); // reset so it fires again after 4 more
                             toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${_normPath}" ${_readCount} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
                         }
                     }
+                    const _answerSuffix = _answerAlreadyGiven
+                        ? '\n\n[ANSWER COMPLETE: You already provided a full answer to the user before this tool call. Do NOT continue investigating — only respond further if this tool result reveals an error in what you said. Otherwise, stop now.]'
+                        : '';
                     this.history.push({
                         role: 'user',
-                        content: `Tool ${name} returned:\n${toolResultForHistory}\n---\n${nudge}${deferredReminder}${this.buildOrientationAnchor(name)}`,
+                        content: `Tool ${name} returned:\n${toolResultForHistory}\n---\n${nudge}${deferredReminder}${this.buildOrientationAnchor(name)}${_answerSuffix}`,
                     });
                 } else {
                     // Track large read results (native tool mode — same logic as text-mode path above)
@@ -9018,13 +8956,16 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     if (tcPath && !this._isSweepTask) {
                         const _normPath2 = tcPath.replace(/\\/g, '/').toLowerCase();
                         const _readCount2 = this._pathReadCountsThisRun.get(_normPath2) ?? 0;
-                        if (_readCount2 >= 4) {
+                        if (_readCount2 >= 5) {
                             logWarn(`[agent] Same-path re-read (native): "${_normPath2}" read ${_readCount2}x — appending action nudge`);
                             this._pathReadCountsThisRun.set(_normPath2, 0);
                             toolResultForHistory += `\n\n[LOOP DETECTED: You have read "${_normPath2}" ${_readCount2} times this run without writing to it. Stop reading. You have the content — call write_file or edit_file to make your change now.]`;
                         }
                     }
 
+                    if (_answerAlreadyGiven) {
+                        toolResultForHistory += '\n\n[ANSWER COMPLETE: You already provided a full answer to the user before this tool call. Do NOT continue investigating — only respond further if this tool result reveals an error in what you said. Otherwise, stop now.]';
+                    }
                     this.history.push({ role: 'tool', content: toolResultForHistory });
                 }
             }
@@ -9214,12 +9155,13 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // read_file, memory_search) used, AND the response is substantial (>400 chars = real
             // answer, not a brief mid-task status note). A "what are the dimensions?" question
             // answered via web search should not auto-continue in Trust/YOLO.
-            // Guard: only treat as pure Q&A if the run was short (≤6 turns). A long read-only
-            // run (7+ turns reading many files) is a mid-task research gather — it should
+            // Guard: only treat as pure Q&A if the run was short (≤8 turns). A long read-only
+            // run (9+ turns reading many files) is a mid-task research gather — it should
             // auto-continue so the agent can proceed to write/act on what it found.
+            // Raised from 6→8 with 64K context window (more headroom for multi-step research).
             const isPureQA = (!usedToolsThisRun || onlyLookupToolsUsed)
                 && lastAssistantText.length > 400
-                && this._runTurnCount <= 6;
+                && this._runTurnCount <= 8;
             const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession;
             if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
@@ -14745,17 +14687,7 @@ ${sampleHtml}
     /** Returns true if the path points to an OS-protected location that should never be readable by the agent.
      *  These are hard-blocked regardless of user approval. */
     private static isOsProtectedPath(full: string): boolean {
-        const norm = full.replace(/\\/g, '/').toLowerCase();
-        const BLOCKED = [
-            // Unix system dirs
-            '/etc/', '/proc/', '/sys/', '/dev/',
-            '/private/etc/', '/private/var/',        // macOS
-            '/boot/', '/lib/', '/lib64/', '/usr/lib/',
-            // Windows system dirs
-            '/windows/system32/', '/windows/syswow64/',
-            '/windows/winsxs/', '/windows/servicing/',
-        ];
-        return BLOCKED.some(b => norm.startsWith(b) || norm === b.slice(0, -1));
+        return _isOsProtectedPath(full);
     }
 
     /** Resolve a raw path against the workspace with the full outside-workspace policy:
@@ -15058,64 +14990,11 @@ ${sampleHtml}
         }
     }
     private async resolvePathWithPolicy(rawPath: string, toolName: string): Promise<{ path: string } | { blocked: string }> {
-        try {
-            return { path: this.safePath(this.workspaceRoot, rawPath) };
-        } catch {
-            const absolute = path.resolve(this.workspaceRoot, rawPath);
-            if (Agent.isOsProtectedPath(absolute)) {
-                return { blocked: `[${toolName}] Access denied: "${rawPath}" is in an OS-protected directory and cannot be read.` };
-            }
-            const allowedExternalPaths = vscode.workspace.getConfiguration('ollamaForge')
-                .get<string[]>('allowedExternalReadPaths', ['~/.ssh/config']);
-            const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-            const isAllowed = allowedExternalPaths.some(allowed => {
-                const expanded = allowed.startsWith('~') ? path.join(homeDir, allowed.slice(1)) : allowed;
-                return path.resolve(expanded).toLowerCase() === absolute.toLowerCase();
-            });
-            // SSH paths and remote URIs are not local paths — skip the prompt.
-            const isRemote = /^[a-z][a-z0-9+\-.]*:\/\//i.test(rawPath);
-            if (!isRemote && !isAllowed) {
-                const approved = await this.requestConfirmation(
-                    'read_outside_workspace',
-                    `Read file outside workspace: \`${absolute}\`\n\nThis file is not inside the workspace root. Allow?`,
-                    'read_file_outside'
-                );
-                if (!approved) {
-                    return { blocked: `[${toolName}] Access denied: user did not allow reading "${rawPath}" (outside workspace).` };
-                }
-            }
-            return { path: absolute };
-        }
+        return _resolvePathWithPolicy(rawPath, toolName, this.workspaceRoot, (action, message, label) => this.requestConfirmation(action, message, label));
     }
 
     private safePath(root: string, rel: string): string {
-        const full = path.resolve(root, rel);
-        // Normalize slashes + case on Windows — models often pass forward slashes while
-        // vscode.workspace.workspaceFolders[0].uri.fsPath returns backslashes.
-        const normalize = _normalizePath;
-        const fullNorm = normalize(full);
-        const rootNorm = normalize(root);
-        const rootNormWithSep = rootNorm.endsWith(path.sep) ? rootNorm : rootNorm + path.sep;
-        if (fullNorm !== rootNorm && !fullNorm.startsWith(rootNormWithSep)) {
-            throw new Error(`Path "${rel}" is outside the workspace`);
-        }
-        // Resolve symlinks to prevent escaping workspace via symlink
-        try {
-            const real = fs.realpathSync(full);
-            const realNorm = process.platform === 'win32' ? real.toLowerCase() : real;
-            const rootReal = fs.realpathSync(root);
-            const rootRealNorm = process.platform === 'win32' ? rootReal.toLowerCase() : rootReal;
-            const rootRealNormWithSep = rootRealNorm.endsWith(path.sep) ? rootRealNorm : rootRealNorm + path.sep;
-            if (realNorm !== rootRealNorm && !realNorm.startsWith(rootRealNormWithSep)) {
-                throw new Error(`Path "${rel}" resolves outside the workspace via symlink`);
-            }
-        } catch (err) {
-            // realpathSync throws if file doesn't exist yet -- that's OK
-            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-                throw err;
-            }
-        }
-        return full;
+        return _safePath(root, rel);
     }
 
     // â"€â"€ Auto-extract facts from conversation for memory â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -17307,10 +17186,156 @@ ${sampleHtml}
     }
 
     /**
+     * Process the results of a parallel read-only tool batch sequentially
+     * (history order matters). Applies post-hook middleware, updates the
+     * per-path re-read tracker, and pushes tool-result messages to history + UI.
+     * Returns { attempted, succeeded } so the caller can fold them into its
+     * batch counters.
+     */
+    private processParallelBatchResults(
+        parallelCalls: Array<{ name: string; args: Record<string, unknown>; toolId: string; aborted: boolean }>,
+        settled: PromiseSettledResult<string>[],
+        post: PostFn
+    ): { attempted: number; succeeded: number } {
+        let attempted = 0;
+        let succeeded = 0;
+        for (let i = 0; i < settled.length; i++) {
+            const pc = parallelCalls[i];
+            const s = settled[i];
+            attempted++;
+            if (pc.aborted) {
+                this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
+                this.history.push({ role: 'tool', content: `[TOOL ABORTED: ${pc.name}]\n(aborted by middleware)` });
+                post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: '(aborted by middleware)' });
+                continue;
+            }
+            if (s.status === 'fulfilled') {
+                let toolResult = s.value;
+                // Post-hook middleware
+                for (const mw of [...Agent._middlewares].reverse()) {
+                    if (!mw.postHook) { continue; }
+                    try {
+                        const t = mw.postHook(pc.name, pc.args, toolResult);
+                        if (t !== undefined) { toolResult = t; }
+                    } catch { /* continue */ }
+                }
+                succeeded++;
+                const _pcPath = String(pc.args.path ?? '') || undefined;
+                this._toolCallsThisRun.push({ name: pc.name, path: _pcPath });
+                // Per-path re-read tracker (parallel batch — mirrors sequential path)
+                if ((pc.name === 'read_file' || (pc.name === 'shell_read' && /\bcat\b/.test(String(pc.args.command ?? '')))) && _pcPath && !this._isSweepTask) {
+                    const _pNorm = _pcPath.replace(/\\/g, '/').toLowerCase();
+                    this._pathReadCountsThisRun.set(_pNorm, (this._pathReadCountsThisRun.get(_pNorm) ?? 0) + 1);
+                }
+                this.history.push({ role: 'tool', content: `[TOOL RESULT: ${pc.name}]\n${toolResult}\n\n[SELF-CHECK] Before stating a cause for any failure or unexpected result above, quote the EXACT error text from this output. If the output does not literally contain a word like "firewall", "blocked", "policy", or "rate limit", do NOT claim that cause. Report only what the output actually says.` });
+                post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: true, preview: toolResult.slice(0, 200) });
+            } else {
+                const errMsg = toErrorMessage(s.reason);
+                this._toolCallsThisRun.push({ name: pc.name, path: String(pc.args.path ?? '') || undefined });
+                this.history.push({ role: 'tool', content: `[TOOL ERROR: ${pc.name}]\n${errMsg}\n\n[SELF-CHECK] The error text above is the ONLY source of truth for what went wrong. Quote it exactly when explaining the failure. Do NOT add causes (firewall, policy, rate limit, etc.) that are not literally present in the text.` });
+                post({ type: 'toolResult', id: pc.toolId, name: pc.name, success: false, preview: errMsg.slice(0, 200) });
+            }
+        }
+        return { attempted, succeeded };
+    }
+
+    /**
      * Core auto-compaction: shrink large tool messages, score-based compaction,
      * min-remove floor, and anti-thrash detection.
      * Returns shouldBreak=true if the anti-thrash limit is hit (caller should break the turn loop).
      */
+    /**
+     * Handle the auto-compact decision at >= 80% context usage.
+     * Returns 'stop' if the run should end (early-compaction stall),
+     * 'break' if the loop should break (anti-thrash), or 'continue' otherwise.
+     */
+    private async handleAutoCompact(
+        contextStats: ContextStats,
+        cfg: ReturnType<typeof getConfig>,
+        systemContent: string,
+        memoryContext: string,
+        model: string,
+        turn: number,
+        post: PostFn
+    ): Promise<'continue' | 'stop' | 'break'> {
+        if (contextStats.usagePercentage < 80) { return 'continue'; }
+        if (!cfg.autoCompactContext) {
+            // Alert user that compaction is needed but disabled
+            post({
+                type: 'contextOverflow',
+                percentage: contextStats.usagePercentage,
+                totalTokens: contextStats.totalTokens,
+                modelLimit: contextStats.modelLimit
+            });
+            logError(`[context] Context at ${contextStats.usagePercentage.toFixed(1)}% but auto-compact is disabled`);
+            return 'continue';
+        }
+
+        const accurateStats = await calculateContextStatsAccurate(this.history, systemContent, memoryContext, model);
+        // If accurate count is below 70%, the heuristic over-estimated significantly -- skip compaction
+        if (accurateStats.usagePercentage < 70) {
+            logInfo(`[context] Heuristic said ${contextStats.usagePercentage.toFixed(1)}% but accurate count is ${accurateStats.usagePercentage.toFixed(1)}% -- skipping auto-compact`);
+            return 'continue';
+        }
+
+        logWarn(`[context] Auto-compacting at ${accurateStats.usagePercentage.toFixed(1)}% (accurate)`);
+
+        // === EARLY-COMPACTION STALL DETECTION ===
+        // Early-compaction stall detection: if context fills before any work is done,
+        // two consecutive such runs means an unrecoverable loop.
+        if (this.checkEarlyCompactionStall(turn, post)) { return 'stop'; }
+
+        // Signal the webview that compaction is starting so it can show a card.
+        post({ type: 'compactingStarted' });
+
+        // Capture history snapshot BEFORE any compaction or modification.
+        // Used both for the WIP snapshot (tool results) and post-compact diff.
+        const historyBeforeCompact = this.history.slice();
+
+        // === SYNCHRONOUS WORK-IN-PROGRESS SNAPSHOT ===
+        const wipLines = this.buildWipSnapshot(contextStats.usagePercentage, historyBeforeCompact);
+        const wipSnapshot = wipLines.join('\n');
+
+        // === SYNCHRONOUS TIER 2 SAVE ===
+        if (this.memory) {
+            const syncMemNote = wipLines
+                .filter(l => !l.startsWith('[WORK IN PROGRESS') && !l.startsWith('IMPORTANT:'))
+                .join('\n');
+            this.memory.addEntry(2, syncMemNote, ['auto-compact', 'session', 'wip-sync']).catch((e) => logWarn(`[memory] background write failed: ${toErrorMessage(e)}`));
+            logInfo(`[context] Synchronous WIP snapshot saved to Tier 2 (${wipLines.length} lines)`);
+        }
+
+        // Core compaction: shrink + compact + anti-thrash.
+        // Pass accurateStats (not the heuristic contextStats) so the
+        // target-token budget and the system/memory token counts handed
+        // to compactHistory match the accurate counts we just used to
+        // decide to compact. modelLimit is identical either way.
+        const compactOutcome = this.performCoreCompaction(accurateStats, post);
+        if (compactOutcome.shouldBreak) { return 'break'; }
+        const { messagesRemoved, autoDropped } = compactOutcome;
+
+        // Save structured facts from dropped messages to Tier 2 memory (async, fire-and-forget)
+        if (messagesRemoved > 0) {
+            this.saveDroppedToMemory(autoDropped);
+        }
+
+        // After compaction, inject WIP snapshot + recent Tier 2 memory at the front of history.
+        this.injectPostCompactContext(wipSnapshot, wipLines);
+
+        this.lastContextLevel = 'safe';
+
+        // Build a human-readable summary of what we remember, shown in chat
+        const compactSummary = this.buildCompactSummary(messagesRemoved);
+
+        post({
+            type: 'contextCompacted',
+            messagesRemoved,
+            newPercentage: 50,
+            summary: compactSummary
+        });
+        return 'continue';
+    }
+
     private performCoreCompaction(
         contextStats: ContextStats,
         post: PostFn

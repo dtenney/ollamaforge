@@ -5,6 +5,8 @@ All notable changes to Ollama Forge are documented here.
 ## [Unreleased]
 
 ### Added
+- **Release Automation** — `.github/workflows/release.yml` builds, tests, packages, and publishes on tag push (`v*`) or manual dispatch. Creates a GitHub Release with the VSIX artifact and (when `VSCODE_PAT` is set) publishes to the VS Code Marketplace.
+- **Marketplace Metadata** — `package.json` now declares `license` (MIT), `qna` (issue tracker), `extensionKind` (workspace), and a pinned `engines.node` (`>=20.0.0`) for a complete VS Code Marketplace listing.
 - **Deep Research Mode** — `src/deepResearch.ts` orchestrates fan-out web search, page fetch, claim extraction, cross-referencing, and cited synthesis. Exposed as the `deepResearch` agent tool. New `researchModel` config field lets you route research to a dedicated model.
 - **Thinking Summary Headline** — after a thinking block completes, a fast model generates a one-line headline rendered as a collapsible header above the thinking block in the chat UI. New `summaryModel` config field (defaults to `fastModel`).
 - **Skill Library** — `src/skillLibrary.ts` loads, validates, and resolves skill manifests from `.ollamaforge/skills/*.json`. Each skill bundles a prompt fragment, a tool allowlist, and an optional model override. The agent's new `use_skill` tool activates/deactivates skills at runtime; active skills restrict the available tool set and inject their prompt into the system message. Example skill: `code-review`.

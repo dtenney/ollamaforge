@@ -131,8 +131,8 @@ export class TieredMemoryManager {
             // Clear Qdrant collection
             if (this.qdrantClient) {
                 try {
-                    await this.qdrantClient.deleteCollection();
-                    await this.qdrantClient.initialize();
+                    await this.withTimeout(this.qdrantClient.deleteCollection(), 10_000, 'qdrant deleteCollection');
+                    await this.withTimeout(this.qdrantClient.initialize(), 10_000, 'qdrant initialize');
                     logInfo('[memory] Qdrant collection cleared and recreated');
                 } catch (err) {
                     logError(`[memory] Failed to clear Qdrant: ${toErrorMessage(err)}`);
@@ -309,7 +309,7 @@ export class TieredMemoryManager {
             // Additionally store in Qdrant for Tiers 4-5 (if available)
             if ((tier === 4 || tier === 5) && this.qdrantClient && this.embeddingService) {
                 try {
-                    const embedding = await this.embeddingService.generateEmbedding(trimmed);
+                    const embedding = await this.withTimeout(this.embeddingService.generateEmbedding(trimmed), 15_000, 'generateEmbedding');
                     const workspaceName = vscode.workspace.name || 'default';
                     
                     const point: QdrantPoint = {
@@ -330,7 +330,7 @@ export class TieredMemoryManager {
                         }
                     };
                     
-                    await this.qdrantClient.upsertPoint(point);
+                    await this.withTimeout(this.qdrantClient.upsertPoint(point), 10_000, 'qdrant upsertPoint');
                     logInfo(`[memory] Added to Tier ${tier} (local + Qdrant): "${trimmed.slice(0, 60)}..."`);
                 } catch (error) {
                     logError(`[memory] Failed to store in Qdrant (local saved): ${toErrorMessage(error)}`);
@@ -356,9 +356,9 @@ export class TieredMemoryManager {
                     // Update in Qdrant if Tier 4-5
                     if ((entry.tier === 4 || entry.tier === 5) && this.qdrantClient && this.embeddingService) {
                         try {
-                            const embedding = await this.embeddingService.generateEmbedding(trimmed);
+                            const embedding = await this.withTimeout(this.embeddingService.generateEmbedding(trimmed), 15_000, 'generateEmbedding');
                             const workspaceName = vscode.workspace.name || 'default';
-                            await this.qdrantClient.upsertPoint({
+                            await this.withTimeout(this.qdrantClient.upsertPoint({
                                 id: entry.id,
                                 vector: embedding,
                                 payload: {
@@ -371,7 +371,7 @@ export class TieredMemoryManager {
                                     createdAt: entry.createdAt,
                                     accessCount: entry.accessCount
                                 }
-                            });
+                            }), 10_000, 'qdrant upsertPoint');
                         } catch (error) {
                             logError(`[memory] Failed to update in Qdrant: ${toErrorMessage(error)}`);
                         }
@@ -399,7 +399,7 @@ export class TieredMemoryManager {
                     // Delete from Qdrant if Tier 4-5
                     if ((entry.tier === 4 || entry.tier === 5) && this.qdrantClient) {
                         try {
-                            await this.qdrantClient.deletePoint(id);
+                            await this.withTimeout(this.qdrantClient.deletePoint(id), 10_000, 'qdrant deletePoint');
                         } catch (error) {
                             logError(`[memory] Failed to delete from Qdrant: ${toErrorMessage(error)}`);
                         }
@@ -1139,7 +1139,12 @@ export class TieredMemoryManager {
 
     // ── Concurrency Control ───────────────────────────────────────────────────
 
-    /** Execute operation with exclusive lock to prevent race conditions */
+    /** Execute operation with exclusive lock to prevent race conditions.
+     *  Awaits the previous lock unconditionally — the timeout-bypass that
+     *  previously existed here caused lost-update races (two operations
+     *  mutating the same core snapshot concurrently). Slow network calls
+     *  (embedding, Qdrant) are individually bounded via withTimeout so the
+     *  lock is never held indefinitely. */
     private async withLock<T>(operation: () => Promise<T>): Promise<T> {
         const previousLock = this.operationLock;
         let releaseLock: () => void;
@@ -1149,20 +1154,26 @@ export class TieredMemoryManager {
         });
 
         try {
-            // Wait for previous lock with a 10s timeout so a hung background
-            // save (e.g. embedding request that never returns) can't block the UI forever.
-            let timedOut = false;
-            await Promise.race([
-                previousLock,
-                new Promise<void>(resolve => setTimeout(() => { timedOut = true; resolve(); }, 10_000))
-            ]);
-            if (timedOut) {
-                logWarn('[memory] withLock: previous operation timed out after 10s — proceeding anyway');
-            }
+            await previousLock;
             return await operation();
         } finally {
             releaseLock!();
         }
+    }
+
+    /** Wrap a promise with a timeout. Rejects with a descriptive error if
+     *  the operation exceeds `ms` milliseconds. Used to bound slow network
+     *  calls (embedding, Qdrant) so the withLock lock is never held forever. */
+    private withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(new Error(`${label} timed out after ${ms}ms`));
+            }, ms);
+            promise.then(
+                (val) => { clearTimeout(timer); resolve(val); },
+                (err) => { clearTimeout(timer); reject(err); }
+            );
+        });
     }
 
     /** Internal promote without lock (for use within locked operations) */
@@ -1215,13 +1226,13 @@ export class TieredMemoryManager {
         try {
             if (oldInQdrant && !newInQdrant) {
                 // Moving from Qdrant to local storage - delete from Qdrant
-                await this.qdrantClient.deletePoint(entry.id);
+                await this.withTimeout(this.qdrantClient.deletePoint(entry.id), 10_000, 'qdrant deletePoint');
                 logInfo(`[memory] Removed ${entry.id} from Qdrant (Tier ${oldTier} → ${newTier})`);
             } else if (!oldInQdrant && newInQdrant) {
                 // Moving from local storage to Qdrant - add to Qdrant
-                const embedding = await this.embeddingService.generateEmbedding(entry.content);
+                const embedding = await this.withTimeout(this.embeddingService.generateEmbedding(entry.content), 15_000, 'generateEmbedding');
                 const workspaceName = vscode.workspace.name || 'default';
-                await this.qdrantClient.upsertPoint({
+                await this.withTimeout(this.qdrantClient.upsertPoint({
                     id: entry.id,
                     vector: embedding,
                     payload: {
@@ -1234,13 +1245,13 @@ export class TieredMemoryManager {
                         createdAt: entry.createdAt,
                         accessCount: entry.accessCount
                     }
-                });
+                }), 10_000, 'qdrant upsertPoint');
                 logInfo(`[memory] Added ${entry.id} to Qdrant (Tier ${oldTier} → ${newTier})`);
             } else if (oldInQdrant && newInQdrant) {
                 // Moving within Qdrant tiers - update tier in payload
-                const embedding = await this.embeddingService.generateEmbedding(entry.content);
+                const embedding = await this.withTimeout(this.embeddingService.generateEmbedding(entry.content), 15_000, 'generateEmbedding');
                 const workspaceName = vscode.workspace.name || 'default';
-                await this.qdrantClient.upsertPoint({
+                await this.withTimeout(this.qdrantClient.upsertPoint({
                     id: entry.id,
                     vector: embedding,
                     payload: {
@@ -1253,7 +1264,7 @@ export class TieredMemoryManager {
                         createdAt: entry.createdAt,
                         accessCount: entry.accessCount
                     }
-                });
+                }), 10_000, 'qdrant upsertPoint');
             }
         } catch (error) {
             logError(`[memory] Failed to handle tier transition: ${toErrorMessage(error)}`);

@@ -27,8 +27,10 @@
  *
  * Known limitations:
  *   - DriftReport.moved is always empty; move/rename detection is not yet implemented.
- *   - Edge indexing (who calls whom) is schema-ready but insertEdge is not called during
- *     indexFile — one-hop neighbor expansion in buildScopeContext returns no neighbors.
+ *   - Edge indexing (calls, contains) is derived heuristically from symbol
+ *     names and body text. Same-file edges are built in indexFile; cross-file
+ *     call edges are built in _buildCrossFileEdges after all files are indexed.
+ *     Import edges are not yet resolved (would need import-statement parsing).
  *   - murmur32 is a simplified hash (not spec-compliant MurmurHash2); adequate for
  *     MinHash shingle similarity but not cryptographic or interoperability use.
  */
@@ -472,6 +474,40 @@ export class CodeGraph {
                 const fingerprint = JSON.stringify(minhash(r.body || r.name));
                 this.insertNode.run({ ...r, startLine: r.startLine, endLine: r.endLine, fingerprint });
             }
+
+            // ── Derive edges from the symbol list ──────────────────────────
+            // contains: class → its methods (method name = "ClassName.methodName")
+            for (const r of rows) {
+                if (r.kind === 'method' && r.name.includes('.')) {
+                    const className = r.name.split('.')[0];
+                    const classNode = rows.find(c => c.kind === 'class' && c.name === className && c.file === r.file);
+                    if (classNode) {
+                        this.insertEdge.run({ src: classNode.id, dst: r.id, kind: 'contains' });
+                    }
+                }
+            }
+
+            // calls: scan function/method bodies for identifier( patterns,
+            // match against same-file callable symbols (first match wins per name).
+            const callableIds = new Map<string, string>();
+            for (const r of rows) {
+                if (r.kind === 'function' || r.kind === 'method') {
+                    const baseName = r.name.includes('.') ? r.name.split('.').pop()! : r.name;
+                    if (!callableIds.has(baseName)) callableIds.set(baseName, r.id);
+                }
+            }
+            for (const r of rows) {
+                if (r.kind !== 'function' && r.kind !== 'method') continue;
+                const body = r.body || '';
+                const calledIds = new Set<string>();
+                for (const m of body.matchAll(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g)) {
+                    const calleeId = callableIds.get(m[1]);
+                    if (calleeId && calleeId !== r.id) calledIds.add(calleeId);
+                }
+                for (const dst of calledIds) {
+                    this.insertEdge.run({ src: r.id, dst, kind: 'calls' });
+                }
+            }
         });
 
         replaceFile(symbols);
@@ -508,8 +544,153 @@ export class CodeGraph {
         this.db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES ('indexed_at', ?)`)
             .run(Date.now().toString());
 
-        logInfo(`[CodeGraph] Indexed ${totalSymbols} symbols across ${totalFiles} files`);
+        // Build cross-file call edges (needs all files indexed first)
+        const crossEdges = this._buildCrossFileEdges();
+        const importEdges = this._buildImportEdges();
+
+        logInfo(`[CodeGraph] Indexed ${totalSymbols} symbols across ${totalFiles} files, ${crossEdges} cross-file edges, ${importEdges} import edges`);
         return totalSymbols;
+    }
+
+    /**
+     * Build cross-file call edges by matching function-body identifiers
+     * against the global symbol map. Only inserts edges where src and dst
+     * are in different files (same-file edges are handled in indexFile).
+     * Uses INSERT OR IGNORE so it is safe to call repeatedly.
+     * Returns the number of edges inserted.
+     */
+    private _buildCrossFileEdges(): number {
+        if (!this.ready || !this.insertEdge) return 0;
+
+        const callables = this.db.prepare(`
+            SELECT id, name, file, body
+            FROM nodes
+            WHERE kind IN ('function', 'method') AND body IS NOT NULL AND body != ''
+        `).all() as any[];
+
+        if (callables.length === 0) return 0;
+
+        // Global baseName → nodeId map (first match wins)
+        const globalMap = new Map<string, string>();
+        for (const c of callables) {
+            const baseName = c.name.includes('.') ? c.name.split('.').pop()! : c.name;
+            if (!globalMap.has(baseName)) globalMap.set(baseName, c.id);
+        }
+
+        // id → file map for O(1) cross-file checks (avoids O(n²) find() per edge)
+        const fileById = new Map<string, string>();
+        for (const c of callables) fileById.set(c.id, c.file);
+
+        let inserted = 0;
+        const insertEdge = this.insertEdge;
+
+        for (const node of callables) {
+            const body = node.body as string;
+            const calledIds = new Set<string>();
+            for (const m of body.matchAll(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g)) {
+                const calleeId = globalMap.get(m[1]);
+                if (calleeId && calleeId !== node.id) calledIds.add(calleeId);
+            }
+            for (const dst of calledIds) {
+                // Only cross-file edges (same-file already handled in indexFile)
+                const dstFile = fileById.get(dst);
+                if (dstFile && dstFile !== node.file) {
+                    // .changes counts only rows actually inserted (INSERT OR IGNORE)
+                    inserted += insertEdge.run({ src: node.id, dst, kind: 'calls' }).changes;
+                }
+            }
+        }
+        return inserted;
+    }
+
+    /**
+     * Build import edges by parsing relative import statements in each file
+     * and linking symbols across files. For each import (fileA → fileB),
+     * creates edges from up to 10 top-level symbols in fileA to up to 10
+     * top-level symbols in fileB. Uses INSERT OR IGNORE (idempotent).
+     * Returns the number of edges inserted.
+     */
+    private _buildImportEdges(): number {
+        if (!this.ready || !this.insertEdge) return 0;
+
+        // Get all indexed files
+        const files = this.db.prepare(`SELECT DISTINCT file FROM nodes`).all() as any[];
+        if (files.length === 0) return 0;
+
+        const fileSet = new Set(files.map((f: any) => f.file));
+        let inserted = 0;
+
+        for (const { file: srcFile } of files) {
+            let content: string;
+            try {
+                content = fs.readFileSync(srcFile, 'utf-8');
+            } catch { continue; }
+
+            // Extract relative import paths (TS/JS + Python)
+            const importPaths = new Set<string>();
+
+            // TS/JS: import ... from './x' | import ... from "../x/y" | require('./x')
+            for (const m of content.matchAll(/(?:from\s+|require\s*\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g)) {
+                importPaths.add(m[1]);
+            }
+            // Python: from .x import | from ..y.z import
+            for (const m of content.matchAll(/from\s+((?:\.\.?)+[.\w]*)\s+import/g)) {
+                importPaths.add(m[1]);
+            }
+
+            if (importPaths.size === 0) continue;
+
+            // Resolve each import path to a workspace file
+            const srcDir = path.dirname(srcFile);
+            const resolvedTargets = new Set<string>();
+            for (const imp of importPaths) {
+                if (!imp.startsWith('.')) continue; // skip non-relative (node_modules, etc.)
+
+                // Normalize: strip leading ./ or ../, split into segments
+                const segments = imp.split(/[\\/]/).filter(s => s && s !== '.' && s !== '..');
+                const dots = (imp.match(/^\.{1,2}/) || [''])[0];
+                const upLevels = dots === '..' ? 1 : 0;
+
+                let base = srcDir;
+                for (let i = 0; i < upLevels; i++) base = path.dirname(base);
+                const resolved = path.join(base, ...segments);
+
+                const candidates = [
+                    resolved,
+                    resolved + '.ts', resolved + '.tsx', resolved + '.js', resolved + '.jsx', resolved + '.py',
+                    path.join(resolved, 'index.ts'), path.join(resolved, 'index.js'), path.join(resolved, '__init__.py')
+                ];
+                for (const c of candidates) {
+                    if (fileSet.has(c)) { resolvedTargets.add(c); break; }
+                }
+            }
+
+            if (resolvedTargets.size === 0) continue;
+
+            // Get top-level symbols in src file (up to 10)
+            const srcSymbols = this.db.prepare(`
+                SELECT id FROM nodes WHERE file = ? AND kind IN ('function','class','method')
+                ORDER BY start_line LIMIT 10
+            `).all(srcFile) as any[];
+
+            if (srcSymbols.length === 0) continue;
+
+            for (const dstFile of resolvedTargets) {
+                // Get top-level symbols in target file (up to 10)
+                const dstSymbols = this.db.prepare(`
+                    SELECT id FROM nodes WHERE file = ? AND kind IN ('function','class','method')
+                    ORDER BY start_line LIMIT 10
+                `).all(dstFile) as any[];
+
+                for (const s of srcSymbols) {
+                    for (const d of dstSymbols) {
+                        // .changes counts only rows actually inserted (INSERT OR IGNORE)
+                        inserted += this.insertEdge.run({ src: s.id, dst: d.id, kind: 'imports' }).changes;
+                    }
+                }
+            }
+        }
+        return inserted;
     }
 
     /**
@@ -528,6 +709,8 @@ export class CodeGraph {
         const timer = setTimeout(() => {
             this.saveDebounces.delete(filePath);
             this.indexFile(filePath);
+            this._buildCrossFileEdges();
+            this._buildImportEdges();
             logInfo(`[CodeGraph] Incremental update: ${path.basename(filePath)}`);
         }, 2000);
         this.saveDebounces.set(filePath, timer);

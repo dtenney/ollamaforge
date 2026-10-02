@@ -31,6 +31,8 @@ Break the 17,140-line `src/agent.ts` into focused modules. No single file > 2,00
 - Static `private static readonly` fields used by a cluster move into the module as exported consts.
 
 ## Recent completions
+- 2026-09-28: Extracted the parallel read-only batch result-processing loop (~50 lines) from run() into private method `processParallelBatchResults(parallelCalls, settled, post): { attempted, succeeded }`. Applies post-hook middleware, updates the per-path re-read tracker, pushes tool-result messages to history + UI; caller folds returned counts into `batchToolsAttempted`/`batchToolsSucceeded`. `tsc --noEmit` clean.
+- 2026-09-28: Extracted the auto-compact block (~79 lines) from run() into private method `handleAutoCompact(contextStats, cfg, systemContent, memoryContext, model, turn, post): Promise<'continue'|'stop'|'break'>`. Maps the inline `return`→`'stop'` and `break`→`'break'` exit paths. `tsc --noEmit` clean.
 - 2026-09-26: Extracted 5 pure helpers from run() into `src/agentLoop.ts`: `stripXmlArtifacts`, `normalizeArgVal`, `filePathInMsg`, `extractKeywords`, `generateBranchSlug`. Also hardened `provider.ts` compactContext guard (`_running` held across LLM await, Trust/Yolo auto-resume). Committed as 606f8ee. `tsc --noEmit` clean.
 - 2026-09-22: Extracted `checkEarlyCompactionStall()` (~22 lines) from run() body into private method. `agent.ts` now 17,327 lines. `tsc --noEmit` clean.
 - 2026-09-19: Extracted 3 large case blocks into private methods:
@@ -52,4 +54,12 @@ for exact line numbers and prerequisites.
 ## Next action (item 11 — agentLoop.ts)
 **Done so far (2026-09-26):** 5 pure string/keyword helpers now live in `agentLoop.ts` (`stripXmlArtifacts`, `normalizeArgVal`, `filePathInMsg`, `extractKeywords`, `generateBranchSlug`). The full loop-body → `executeTurn()` extraction (~4,900 lines, HIGH risk) is still outstanding and needs a fresh session with full context budget (~100k+ tokens). Prerequisites: `TurnContext` type (~15 locals), `LoopResult` discriminated union, all `break`→`return {kind:'stop'}`, all `continue`→`return {kind:'continue'}`. See `plans/run-decomposition.md` for details.
 
-**Recommended next step (smaller, single-session):** Extract the next self-contained I/O-heavy block from within the loop body one at a time — the auto-compact section (~lines 4620–4720), then the tool-result processing section, then the stream-filter section. Each is 50–200 lines; verify with `tsc --noEmit` after each.
+**Recommended next step (smaller, single-session):** Continue extracting self-contained I/O-heavy blocks from within the loop body one at a time. Done so far: auto-compact section (`handleAutoCompact`) and the parallel read-only batch result-processing loop (`processParallelBatchResults`). Next: the stream-filter section, then the sequential tool-dispatch result handling. Each is 50–200 lines; verify with `tsc --noEmit` after each.
+
+**2026-10-02 — Pre-beta readiness review (completed):**
+- No personal data (IPs, paths, usernames) in `src/` — all `192.168.1.100` hits are placeholder examples in docs/config.
+- No TODO/FIXME/debug artifacts in production code.
+- LICENSE (MIT) present. `.gitignore` excludes `.ollamaforge/`, `.claude/`, `plans/`.
+- Security layer verified: `commandPolicy.ts` (non-bypassable deny list), `secretRedaction.ts` (credential scrubbing), `pathPolicy.ts`, `webviewMsgGuard.ts`.
+- 39 test files, 664+ unit tests, CI gates (audit, coverage, tsc, self-check).
+- **Verdict: cleared for supervised beta.** One recommendation: gate YOLO mode behind an explicit acknowledgment before broad sharing.

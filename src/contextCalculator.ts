@@ -50,6 +50,7 @@ const MODEL_CONTEXT_LIMITS: Record<string, number> = {
     'qwen3.8': 32768,
     'qwen3.8:27b': 32768,
     'qwen3.8:27b-49k': 49152,
+    'qwen3.8:27b-64k': 65536,
     'qwen3.8:27b-128k': 131072,
     
     // Phi models

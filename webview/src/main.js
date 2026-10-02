@@ -136,13 +136,30 @@ function addStoredAssistantMessage(content, timestamp) {
     const ts = timestamp || Date.now();
     const absTime = new Date(ts).toLocaleString();
     const timeStr = relativeTimeStr(ts);
-    const cleanContent = stripToolBlocksClient(content);
+
+    // Strip tool blocks and thinking content before rendering.
+    // Stored messages may contain raw <think>...</think> tags that were streamed
+    // by the model and saved verbatim — they must not appear in the chat bubble.
+    let cleanContent = stripToolBlocksClient(content);
+    // Extract and discard thinking blocks
+    let storedThinking = '';
+    cleanContent = cleanContent.replace(/<think>([\s\S]*?)<\/think>/gi, (_, t) => { storedThinking += t; return ''; });
+    cleanContent = cleanContent.replace(/<scratch_pad>([\s\S]*?)<\/scratch_pad>/gi, (_, t) => { storedThinking += t; return ''; });
+    cleanContent = cleanContent.replace(/<antThinking>([\s\S]*?)<\/antThinking>/gi, (_, t) => { storedThinking += t; return ''; });
+    // Strip THINK sentinels (already processed server-side)
+    cleanContent = cleanContent.replace(/\x01THINK_START\x01[\s\S]*?\x01THINK_END\x01/g, '');
+    cleanContent = cleanContent.replace(/\x01THINK_(?:START|END|HEADLINE)\x01[^\n]*/g, '');
+    // Strip any unclosed <think> tail
+    cleanContent = cleanContent.replace(/<think>[\s\S]*/i, '').replace(/<\/think>/gi, '');
+    cleanContent = cleanContent.trim();
+
     div.innerHTML =
         `<div class="msg-header">` +
             `<span class="msg-role">Agent</span>` +
             `<time class="msg-time" data-ts="${ts}" title="${absTime}">${timeStr}</time>` +
             `<div class="msg-actions"><button class="msg-action-btn retry-btn" title="Retry">↺ Retry</button></div>` +
         `</div>` +
+        (storedThinking.trim() ? `<details class="thinking-block"><summary>💭 Thought process</summary><pre class="thinking-content" style="font-size:0.78em;opacity:0.6;white-space:pre-wrap;margin:4px 0 0;">${escHtml(storedThinking.trim())}</pre></details>` : '') +
         `<div class="msg-content">${renderMarkdown(cleanContent)}</div>`;
     messagesEl.insertBefore(div, scrollBtn);
     assignMsgId(div);

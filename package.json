@@ -29,8 +29,14 @@
     "color": "#0D1117",
     "theme": "dark"
   },
+  "license": "MIT",
+  "qna": "https://github.com/dtenney/ollamaforge/issues",
+  "extensionKind": [
+    "workspace"
+  ],
   "engines": {
-    "vscode": "^1.134.0"
+    "vscode": "^1.134.0",
+    "node": ">=20.0.0"
   },
   "main": "dist/main.js",
   "scripts": {

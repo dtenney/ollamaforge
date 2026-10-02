@@ -570,7 +570,19 @@ function appendToken(token) {
             && display.split('\n').filter(l => l.trim()).length > 0
             // Only suppress if the MAJORITY of lines are self-talk (not a real answer with some hedging)
             && selfTalkLines.length / Math.max(1, display.split('\n').filter(l => l.trim()).length) > 0.5;
-        if (isOscillating) {
+
+        // Early self-talk suppression: if the stream STARTS with internal-dialog preamble
+        // and no substantive content (headings, code blocks, long paragraphs) has arrived yet,
+        // hide it immediately rather than waiting for the 4-line threshold above.
+        // This prevents the brief "flash" of internal monologue before isOscillating fires.
+        const SELF_TALK_START_RE = /^(?:(?:ok(?:ay)?[,.]?\s+)?(?:let me|i(?:'ll| will| need to| should| can)|let's|first[,.]?\s+i|so[,.]?\s+(?:i|let me)|alright[,.]?\s+(?:i|let me)))/i;
+        const hasSubstantiveContent = display.includes('```') || /^#{1,3}\s/m.test(display) || display.split('\n').some(l => l.trim().length > 120);
+        const isEarlySelfTalk = SELF_TALK_START_RE.test(display.trim())
+            && !hasSubstantiveContent
+            && selfTalkLines.length >= 2
+            && selfTalkLines.length / Math.max(1, display.split('\n').filter(l => l.trim()).length) > 0.6;
+
+        if (isOscillating || isEarlySelfTalk) {
             // Route self-talk into the thinking block so it's not lost
             let thinkEl = currentMsgEl.querySelector('.thinking-block');
             if (!thinkEl) {
@@ -1069,6 +1081,8 @@ function finalizeMessage() {
 
     currentMsgEl = null;
     currentRaw = '';
+    inThinkingBlock = false;
+    thinkingBuf = '';
     scrollBottom();
 }
 

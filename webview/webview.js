@@ -935,7 +935,19 @@ function appendToken(token) {
             && display.split('\n').filter(l => l.trim()).length > 0
             // Only suppress if the MAJORITY of lines are self-talk (not a real answer with some hedging)
             && selfTalkLines.length / Math.max(1, display.split('\n').filter(l => l.trim()).length) > 0.5;
-        if (isOscillating) {
+
+        // Early self-talk suppression: if the stream STARTS with internal-dialog preamble
+        // and no substantive content (headings, code blocks, long paragraphs) has arrived yet,
+        // hide it immediately rather than waiting for the 4-line threshold above.
+        // This prevents the brief "flash" of internal monologue before isOscillating fires.
+        const SELF_TALK_START_RE = /^(?:(?:ok(?:ay)?[,.]?\s+)?(?:let me|i(?:'ll| will| need to| should| can)|let's|first[,.]?\s+i|so[,.]?\s+(?:i|let me)|alright[,.]?\s+(?:i|let me)))/i;
+        const hasSubstantiveContent = display.includes('```') || /^#{1,3}\s/m.test(display) || display.split('\n').some(l => l.trim().length > 120);
+        const isEarlySelfTalk = SELF_TALK_START_RE.test(display.trim())
+            && !hasSubstantiveContent
+            && selfTalkLines.length >= 2
+            && selfTalkLines.length / Math.max(1, display.split('\n').filter(l => l.trim()).length) > 0.6;
+
+        if (isOscillating || isEarlySelfTalk) {
             // Route self-talk into the thinking block so it's not lost
             let thinkEl = currentMsgEl.querySelector('.thinking-block');
             if (!thinkEl) {
@@ -1434,6 +1446,8 @@ function finalizeMessage() {
 
     currentMsgEl = null;
     currentRaw = '';
+    inThinkingBlock = false;
+    thinkingBuf = '';
     scrollBottom();
 }
 
@@ -3650,13 +3664,17 @@ const msgHandlers = {
             // live output that was suppressed while this tab was in the background.
             // Subsequent 'token' events append to currentRaw and re-render.
             if (msg.liveBuffer && msg.liveBuffer.trim()) {
-                startAssistantMessage();
+                startAssistantMessage(); // also resets inThinkingBlock, thinkingBuf
                 currentRaw = msg.liveBuffer;
                 const content = currentMsgEl?.querySelector('.msg-content');
                 if (content) {
                     let display = stripToolBlocksClient(msg.liveBuffer);
                     display = display.replace(/\btool>\s*/gi, '').replace(/<\/tool(?:_call)?>/gi, '').replace(/<\/?(?:parameter|function)>/gi, '');
-                    content.innerHTML = renderMarkdown(display);
+                    // Strip THINK sentinel blocks from the restored buffer — they've already
+                    // been processed server-side and would render as garbage if left in.
+                    display = display.replace(/\x01THINK_START\x01[\s\S]*?\x01THINK_END\x01/g, '');
+                    display = display.replace(/\x01THINK_(?:START|END|HEADLINE)\x01[^\n]*/g, '');
+                    content.innerHTML = renderMarkdown(display.trim());
                 }
                 scrollBottom();
             }
@@ -4013,13 +4031,30 @@ function addStoredAssistantMessage(content, timestamp) {
     const ts = timestamp || Date.now();
     const absTime = new Date(ts).toLocaleString();
     const timeStr = relativeTimeStr(ts);
-    const cleanContent = stripToolBlocksClient(content);
+
+    // Strip tool blocks and thinking content before rendering.
+    // Stored messages may contain raw <think>...</think> tags that were streamed
+    // by the model and saved verbatim — they must not appear in the chat bubble.
+    let cleanContent = stripToolBlocksClient(content);
+    // Extract and discard thinking blocks
+    let storedThinking = '';
+    cleanContent = cleanContent.replace(/<think>([\s\S]*?)<\/think>/gi, (_, t) => { storedThinking += t; return ''; });
+    cleanContent = cleanContent.replace(/<scratch_pad>([\s\S]*?)<\/scratch_pad>/gi, (_, t) => { storedThinking += t; return ''; });
+    cleanContent = cleanContent.replace(/<antThinking>([\s\S]*?)<\/antThinking>/gi, (_, t) => { storedThinking += t; return ''; });
+    // Strip THINK sentinels (already processed server-side)
+    cleanContent = cleanContent.replace(/\x01THINK_START\x01[\s\S]*?\x01THINK_END\x01/g, '');
+    cleanContent = cleanContent.replace(/\x01THINK_(?:START|END|HEADLINE)\x01[^\n]*/g, '');
+    // Strip any unclosed <think> tail
+    cleanContent = cleanContent.replace(/<think>[\s\S]*/i, '').replace(/<\/think>/gi, '');
+    cleanContent = cleanContent.trim();
+
     div.innerHTML =
         `<div class="msg-header">` +
             `<span class="msg-role">Agent</span>` +
             `<time class="msg-time" data-ts="${ts}" title="${absTime}">${timeStr}</time>` +
             `<div class="msg-actions"><button class="msg-action-btn retry-btn" title="Retry">↺ Retry</button></div>` +
         `</div>` +
+        (storedThinking.trim() ? `<details class="thinking-block"><summary>💭 Thought process</summary><pre class="thinking-content" style="font-size:0.78em;opacity:0.6;white-space:pre-wrap;margin:4px 0 0;">${escHtml(storedThinking.trim())}</pre></details>` : '') +
         `<div class="msg-content">${renderMarkdown(cleanContent)}</div>`;
     messagesEl.insertBefore(div, scrollBtn);
     assignMsgId(div);

@@ -256,13 +256,17 @@ const msgHandlers = {
             // live output that was suppressed while this tab was in the background.
             // Subsequent 'token' events append to currentRaw and re-render.
             if (msg.liveBuffer && msg.liveBuffer.trim()) {
-                startAssistantMessage();
+                startAssistantMessage(); // also resets inThinkingBlock, thinkingBuf
                 currentRaw = msg.liveBuffer;
                 const content = currentMsgEl?.querySelector('.msg-content');
                 if (content) {
                     let display = stripToolBlocksClient(msg.liveBuffer);
                     display = display.replace(/\btool>\s*/gi, '').replace(/<\/tool(?:_call)?>/gi, '').replace(/<\/?(?:parameter|function)>/gi, '');
-                    content.innerHTML = renderMarkdown(display);
+                    // Strip THINK sentinel blocks from the restored buffer — they've already
+                    // been processed server-side and would render as garbage if left in.
+                    display = display.replace(/\x01THINK_START\x01[\s\S]*?\x01THINK_END\x01/g, '');
+                    display = display.replace(/\x01THINK_(?:START|END|HEADLINE)\x01[^\n]*/g, '');
+                    content.innerHTML = renderMarkdown(display.trim());
                 }
                 scrollBottom();
             }

@@ -56,6 +56,34 @@ The extension version is in `package.json` → `"version"`. The deploy target di
 %USERPROFILE%/.vscode/extensions/dtenney.ollamaforge-<version>/
 ```
 
+## Release (Marketplace / GitHub)
+
+Local `npm run deploy` is for development. For a distributable release, use the
+GitHub Actions workflow `.github/workflows/release.yml`. It runs the full
+test + type-check + audit gate, packages the VSIX, uploads it as a 90-day
+artifact, and creates a GitHub Release with the `.vsix` attached.
+
+**Trigger options:**
+- **Tag push** — `git tag v1.0.8 && git push origin v1.0.8` (any tag starting with `v`).
+- **Manual** — GitHub → Actions → *Release* → *Run workflow* (optionally pass a tag).
+
+**Publish to the VS Code Marketplace (optional):**
+1. Create a Personal Access Token with the `vscode` scope (GitHub → Settings → Developer settings → Tokens).
+2. Add it as a repository secret: `VSCODE_PAT`.
+3. Ensure the publisher `dtenney` is registered on the marketplace (one-time: `npx vsce publish` locally, or the first CI run with the secret set).
+
+With `VSCODE_PAT` set, the workflow publishes automatically after the release is created. Without it, the workflow still produces the GitHub Release + VSIX artifact — it just skips the marketplace step.
+
+**Bump the version before tagging:**
+```bash
+# e.g. 1.0.7 -> 1.0.8
+node -e "const p=require('./package.json'); p.version='1.0.8'; require('fs').writeFileSync('package.json', JSON.stringify(p,null,2)+'\n')"
+git add package.json CHANGELOG.md
+git commit -m "chore: bump to 1.0.8"
+git tag v1.0.8
+git push origin main --tags
+```
+
 ## Common Failures on Windows
 
 | Symptom | Cause | Fix |
