@@ -33,7 +33,7 @@ import { evaluateGate } from './core/consistencyGate';
 import { repairToolJson, fixRawNewlinesInJson, extractEditFileArgs, extractJsonStringValue } from './agentToolJsonRepair';
 import { ShellEnvironment, FilePlan, detectShellEnvironment, buildShellExamples, buildTextModeShellExamples, stripSelectStringPrefixes, extractDocVerificationHints } from './agentShellEnv';
 import { buildSystemPrompt, buildSystemPromptAsync, buildSmallModelSystemPrompt, buildTextModeInstructions, buildSmallModelTextModeInstructions, buildToolBiasNote, snapshotContextFileMtimes, loadHierarchicalContext, buildProjectTypeGuidance, buildProjectTypeGuidanceAsync } from './agentPromptBuilder';
-import { stripXmlArtifacts as _stripXmlArtifacts, normalizeArgVal as _normalizeArgVal, filePathInMsg as _filePathInMsg, filterCompleteLine as _filterCompleteLine, isPlanningLine as _isPlanningLine, escHtml as _escHtml, looksLikePath as _looksLikePath, normalizePath as _normalizePath, requiredParams as _requiredParams, isAbsPath as _isAbsPath, isFilePath as _isFilePath, globToRegex as _globToRegex, globToRegexDeep as _globToRegexDeep, extractKeywords as _extractKeywords, generateBranchSlug as _generateBranchSlug } from './agentLoop';
+import { stripXmlArtifacts as _stripXmlArtifacts, normalizeArgVal as _normalizeArgVal, filePathInMsg as _filePathInMsg, filterCompleteLine as _filterCompleteLine, isPlanningLine as _isPlanningLine, escHtml as _escHtml, looksLikePath as _looksLikePath, normalizePath as _normalizePath, requiredParams as _requiredParams, isAbsPath as _isAbsPath, isFilePath as _isFilePath, globToRegex as _globToRegex, globToRegexDeep as _globToRegexDeep, extractKeywords as _extractKeywords, generateBranchSlug as _generateBranchSlug, levenshtein} from './agentLoop';
 import { safePath as _safePath, resolvePathWithPolicy as _resolvePathWithPolicy, isOsProtectedPath as _isOsProtectedPath } from './pathPolicy';
 import { writePlanFile as _writePlanFile, updatePlanFile as _updatePlanFile, closePlanFile as _closePlanFile } from './planFile';
 
@@ -7621,36 +7621,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         && !isReviewTask
                         && !isPlanTask
                         && !isCreativeTask) {
-                        const interceptCmd = String(args.command ?? '');
-                        const interceptPathMatch = interceptCmd.match(/['"](.*?)['"]/);
-                        const interceptPath = interceptPathMatch?.[1] ?? '';
-                        if (interceptPath) {
-                            const absInterceptPath = path.isAbsolute(interceptPath)
-                                ? interceptPath
-                                : path.join(this.workspaceRoot, interceptPath.replace(/\//g, path.sep));
-                            const interceptKw = this._currentTaskMessage
-                                .toLowerCase()
-                                .match(/\b(fail|timeout|retry|auth|login|upload|download|connect|validat)\w*\b/g)
-                                ?.slice(0, 3)
-                                .join('|');
-                            const interceptPattern = interceptKw
-                                ? `except|raise|\\.error\\(|\\.critical\\(|${interceptKw}`
-                                : 'except|raise|\\.error\\(|\\.critical\\(';
-                            const focusCmd = `grep -n -A 3 -B 3 -E "${interceptPattern}" "${absInterceptPath}" | head -200`;
-                            logInfo(`[agent] Intercepting large file read (${toolResult.length} chars) -> focused grep: ${focusCmd}`);
-                            try {
-                                const focusResult = await this.runShellRead(focusCmd, this.workspaceRoot, toolId + '_focus');
-                                if (focusResult && focusResult.trim().length > 50) {
-                                    const relI = path.relative(this.workspaceRoot, absInterceptPath).replace(/\\/g, '/');
-                                    // Strip PowerShell "> " prefixes and cap at 2000 chars
-                                    const focusClean = stripSelectStringPrefixes(focusResult);
-                                    const focusTrunc = focusClean.length > 2000 ? focusClean.slice(0, 2000) + '\n...(truncated)' : focusClean;
-                                    toolResult = `[FOCUSED READ of ${relI} -- exception/error blocks only]\n${focusTrunc}\n\n(Use EXACT strings from above in edit_file. If the change is ALREADY present, say so and stop.)`;
-                                    logInfo(`[agent] Focused grep returned ${focusResult.length} chars -- replaced large read`);
-                                    this._focusedGrepInjectedThisTurn = true;
-                                }
-                            } catch { /* keep original if grep fails */ }
-                        }
+                        const intercepted = await this.interceptLargeFileRead(args, toolResult, toolId);
+                        if (intercepted) { toolResult = intercepted; }
                     }
                     // Detect soft failures: run_command/shell_read that returned non-zero exit code.
                     // Our runners only append "(exited with code N)" when there is no output at all.
@@ -7662,75 +7634,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             || /^(?:bash|sh|zsh|cmd|python\d?):[^\n]*(?:command not found|No such file|Permission denied|not found)/m.test(toolResult))
                         && !toolResult.includes('file(s) moved');
                     if (isSoftFailure) {
-                        // 4.2 Failure taxonomy: classify the error and attach a targeted recovery hint.
-                        const _failText = toolResult.slice(0, 600);
-                        let _failClass = 'unknown';
-                        let _failHint = '';
-                        if (/command not found|No such file|not found|ENOENT/i.test(_failText)) {
-                            _failClass = 'not-found';
-                            // SSH non-interactive shells don't source .bashrc/.profile, so tools
-                            // installed in ~/.local/bin, venv/bin, or via pipx won't be on PATH.
-                            // Detect this by checking if the failing command was run via SSH.
-                            const _cmdStr = String(args.command ?? '');
-                            const _isSshCmd = /^ssh\s/.test(_cmdStr.trim());
-                            const _cmdNotFoundMatch = _failText.match(/(?:bash|sh|zsh): line \d+: (\S+): command not found/);
-                            const _missingCmd = _cmdNotFoundMatch?.[1] ?? '';
-                            if (_isSshCmd && _missingCmd) {
-                                const _dbClients: Record<string, string> = {
-                                    mysql: 'apt-get install -y mysql-client  # or: mariadb-client',
-                                    mysqldump: 'apt-get install -y mysql-client',
-                                    psql: 'apt-get install -y postgresql-client',
-                                    pg_dump: 'apt-get install -y postgresql-client',
-                                    'redis-cli': 'apt-get install -y redis-tools',
-                                    mongo: 'apt-get install -y mongodb-clients',
-                                    mongodump: 'apt-get install -y mongodb-clients',
-                                };
-                                const _dbInstall = _dbClients[_missingCmd];
-                                if (_dbInstall) {
-                                    _failHint = `"${_missingCmd}" client is not installed on the remote host (this is separate from the server package). Options:\n` +
-                                        `1. Install it: ssh ... "sudo ${_dbInstall}"\n` +
-                                        `2. Verify server-side access instead: ssh ... "sudo systemctl status ${_missingCmd.replace(/-cli$|-dump$/, '')} 2>/dev/null || sudo journalctl -u ${_missingCmd.replace(/-cli$|-dump$/, '')} -n 20"\n` +
-                                        `3. Find any existing client binary: ssh ... "which ${_missingCmd} || find /usr/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null"`;
-                                } else {
-                                    _failHint = `SSH non-interactive shells do not source ~/.bashrc or ~/.profile, so "${_missingCmd}" is not on PATH even if it works interactively. Fix by one of:\n` +
-                                        `1. Find the full path: ssh ... "which ${_missingCmd} || find ~/.local/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null | head -5"\n` +
-                                        `2. Source the profile: ssh ... "source ~/.bashrc && ${_missingCmd} ..."\n` +
-                                        `3. Use the full path directly once found (e.g. ~/.local/bin/${_missingCmd})`;
-                                }
-                            } else {
-                                _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
-                            }
-                        } else if (/Operation not permitted|Permission denied|EACCES|EPERM/i.test(_failText)) {
-                            _failClass = 'permission';
-                            // Distinguish root-owned file vs general permission vs SSH sudo
-                            const _permCmdStr = String(args.command ?? '');
-                            const _isSshPerm = /^ssh\s/.test(_permCmdStr.trim());
-                            const _isRmFail = /rm:.*Operation not permitted|rm:.*Permission denied/i.test(_failText);
-                            if (_isRmFail && _isSshPerm) {
-                                _failHint = 'Cannot remove file — it is owned by root or another user. Options:\n' +
-                                    '1. Use sudo: ssh ... "sudo rm -f /tmp/file"\n' +
-                                    '2. Skip cleanup — /tmp files are ephemeral and will be purged on reboot\n' +
-                                    '3. Overwrite instead: ssh ... "sudo tee /tmp/file < /dev/null"\n' +
-                                    'Do NOT retry the same rm command without sudo.';
-                            } else {
-                                _failHint = 'Permission denied. Check file ownership (ls -la) or try with sudo/elevated privileges. Do NOT retry the same command.';
-                            }
-                        } else if (/timed out|timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|socket hang up/i.test(_failText)) {
-                            _failClass = 'network';
-                            _failHint = 'Network/timeout error. Wait a moment and retry once. If it fails again, check connectivity (ping/curl) before retrying.';
-                        } else if (/SyntaxError|Syntax error|parse error|unexpected token|TS\d{4}/i.test(_failText)) {
-                            _failClass = 'syntax';
-                            _failHint = 'Syntax/parse error. Read the exact line number from the error, open that file with read_file, and fix the specific syntax issue. Do NOT re-run the same command without fixing the code.';
-                        } else if (/Module not found|Cannot find module|ImportError|No module named/i.test(_failText)) {
-                            _failClass = 'missing-dep';
-                            _failHint = 'Missing dependency. Install it (pip install / npm install) or check the import path. Do NOT retry the same command without installing.';
-                        } else if (/EADDRINUSE|address already in use|port.*in use/i.test(_failText)) {
-                            _failClass = 'port-conflict';
-                            _failHint = 'Port already in use. Find the process (lsof -i :PORT or netstat) and stop it, or use a different port.';
-                        } else if (/ENOENT|no such directory/i.test(_failText)) {
-                            _failClass = 'not-found';
-                            _failHint = 'Directory does not exist. Create it first (mkdir -p) or check the path.';
-                        }
+                        const { failClass: _failClass, failHint: _failHint } = this.classifySoftFailure(args, toolResult);
                         if (_failClass !== 'unknown') {
                             toolResult += `\n\n[FAILURE TAXONOMY: ${_failClass}] ${_failHint}`;
                             logInfo(`[agent] 4.2 failure classified as ${_failClass} for ${name}`);
@@ -7857,79 +7761,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             logWarn(`[agent] PowerShell cmdlet "${badCmd}" used in Git Bash -- injected bash correction`);
                         }
 
-                        // File-not-found handler: when a path doesn't exist, help the agent find the real one
-                        // rather than letting it hallucinate a filename or spiral into a planning loop.
-                        if (/No such file or directory/i.test(toolResult)) {
-                            // Extract the path the agent tried
-                            const cmdStr = String(args.command ?? args.path ?? '');
-                            const attemptedPath = cmdStr.match(/['"](.*?)['"]|(\S+\.\w+)\s*$/)
-                                ?.[1] ?? cmdStr.match(/\S+\.\w+/)?.[0] ?? '';
-
-                            if (attemptedPath) {
-                                // 1. Collect any paths the user already provided in recent messages
-                                const userPaths: string[] = [];
-                                for (let hi = this.history.length - 1; hi >= Math.max(0, this.history.length - 10); hi--) {
-                                    const msg = this.history[hi];
-                                    if (msg.role !== 'user') { continue; }
-                                    const content = typeof msg.content === 'string' ? msg.content : '';
-                                    const found = content.match(/[A-Za-z]:\\[^\s'">\n]+|\/[^\s'">\n]{4,}|[\w./-]+\/[\w.-]+\.(?:md|py|ts|js|yaml|yml|json|sh|txt)/g) ?? [];
-                                    userPaths.push(...found);
-                                }
-                                const suggestions = userPaths.filter(p => p !== attemptedPath && p.length > 4);
-
-                                // 2. Find the directory the agent was looking in and list its contents
-                                let dirListing = '';
-                                try {
-                                    const attemptedAbs = path.isAbsolute(attemptedPath)
-                                        ? attemptedPath
-                                        : path.join(this.workspaceRoot, attemptedPath);
-                                    const searchDir = path.dirname(attemptedAbs);
-                                    if (fs.existsSync(searchDir)) {
-                                        const entries = fs.readdirSync(searchDir).slice(0, 30);
-                                        dirListing = `\nActual contents of ${path.relative(this.workspaceRoot, searchDir).replace(/\\/g, '/') || '.'}:\n${entries.map(e => `  ${e}`).join('\n')}`;
-                                    }
-                                } catch { /* ignore */ }
-
-                                // 3. If bare filename (no dir component), also do a recursive search across all workspace roots
-                                let recursiveHits = '';
-                                if (!attemptedPath.includes('/') && !attemptedPath.includes('\\') && attemptedPath.includes('.')) {
-                                    try {
-                                        const baseName = path.basename(attemptedPath, path.extname(attemptedPath));
-                                        const ext = path.extname(attemptedPath);
-                                        const roots = [this.workspaceRoot, ...((this as any)._extraRoots ?? [])];
-                                        const hits: string[] = [];
-                                        const walkDir = (dir: string, depth: number) => {
-                                            if (depth > 5 || hits.length >= 10) { return; }
-                                            try {
-                                                for (const entry of fs.readdirSync(dir)) {
-                                                    if (entry.startsWith('.') || entry === 'node_modules' || entry === '__pycache__') { continue; }
-                                                    const full2 = path.join(dir, entry);
-                                                    if (fs.statSync(full2).isDirectory()) { walkDir(full2, depth + 1); }
-                                                    else if (entry.endsWith(ext) && entry.toLowerCase().includes(baseName.toLowerCase().slice(0, 6))) { hits.push(full2); }
-                                                }
-                                            } catch { /* ignore */ }
-                                        };
-                                        for (const root of roots) { walkDir(root, 0); }
-                                        if (hits.length > 0) {
-                                            recursiveHits = `\nFiles with similar names found in workspace:\n${hits.map(h => `  ${h}`).join('\n')}`;
-                                        }
-                                    } catch { /* ignore */ }
-                                }
-
-                                const userPathBlock = suggestions.length > 0
-                                    ? `\nThe user already provided these paths -- prefer these over guessing:\n${suggestions.map(p => `  ${p}`).join('\n')}`
-                                    : '';
-
-                                const hint = `[SYSTEM] "${attemptedPath}" does not exist. Do NOT invent a filename.${userPathBlock}${dirListing}${recursiveHits}\n\nNext steps (in order):\n1. If similar files are listed above, use that exact full path.\n2. If the user gave a path above, use that exact path.\n3. If still uncertain, run: find . -name "*${path.basename(attemptedPath, path.extname(attemptedPath))}*" to locate it.\nNever fabricate a path -- only use paths you have confirmed exist.`;
-
-                                if (isTextMode) {
-                                    this.history.push({ role: 'user', content: hint });
-                                } else {
-                                    this.history.push({ role: 'tool', content: hint });
-                                }
-                                logInfo(`[agent] File-not-found: tried "${attemptedPath}"${suggestions.length ? `, user paths: ${suggestions.join(', ')}` : ''}${dirListing ? ', injected dir listing' : ''}`);
-                            }
-                        }
+                        this.handleFileNotFound(args, toolResult, isTextMode);
 
                         // SyntaxError detection: if output contains a Python SyntaxError pointing at a .py file,
                         // inject a direct instruction to use write_file instead of attempting edit_file.
@@ -7988,128 +7820,13 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     }
 
                     // Missing required argument: inject a corrective hint so the model retries correctly.
-                    // This catches cases like edit_file_at_line called without `path`, or run_command/shell_read
-                    // called without `command` (model emits an empty tool call mid-spiral).
-                    // Do NOT count missing-arg errors as consecutive failures -- they are formatting errors,
-                    // not execution failures. Reset the counter so the circuit-breaker doesn't trip.
                     if (/\b(path|command) is required\b|\bmissing required (arg|argument|param|parameter)\b/i.test(toolResult)) {
-                        this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1); // undo the increment above
-                        // Re-approve this specific tool so the model can retry without waiting for user confirmation
-                        this._autoApprovedTools.add(name);
-                        const missingArg = toolResult.match(/\b(path|command)\b/i)?.[1] ?? 'required argument';
-                        const toolHints: Record<string, string> = {
-                            'edit_file': '"path", "old_string", "new_string"',
-                            'edit_file_at_line': '"path", "start_line", "end_line", "new_content"',
-                            'run_command': '"command" (the shell command to execute, e.g. "python3 script.py")',
-                            'shell_read': '"command" (the shell command to read output from, e.g. "git status" or "find . -name \'*.py\'")',
-                            'read_file': '"path" (the file path to read, e.g. "app/main.py" or "requirements.txt")',
-                            'write_file': '"path" (destination file path) and "content" (the full file content to write)',
-                        };
-                        const argList = toolHints[name] ?? 'all required arguments';
-
-                        // Path auto-recovery for read_file: when the model omits the path argument,
-                        // scan its narration text for a file path it mentioned (e.g. "Let me read X")
-                        // and auto-supply the missing path so the tool succeeds without a retry loop.
-                        let autoRecoveredPath = '';
-                        if (name === 'read_file' && missingArg === 'path') {
-                            const lastEntry = this.history[this.history.length - 1];
-                            const narration = typeof lastEntry?.content === 'string' ? lastEntry.content : '';
-                            // Scan narration for file paths: quoted paths, backtick paths, or bare relative paths
-                            const pathPat = /(?:`([^`]+\.[a-z]{1,6})`|["']([^"'\n]+\.[a-z]{1,6})["']|(?:read|open|check|inspect|look at|examine)\s+([A-Za-z][\w./\\-]+\.[a-z]{1,6}))/gi;
-                            let pm: RegExpExecArray | null;
-                            while ((pm = pathPat.exec(narration)) !== null) {
-                                const candidate = (pm[1] ?? pm[2] ?? pm[3] ?? '').trim().replace(/^\/+/, '');
-                                if (candidate && !candidate.includes(' ') && candidate.includes('.')) {
-                                    const abs = path.isAbsolute(candidate) ? candidate : path.join(this.workspaceRoot, candidate);
-                                    if (fs.existsSync(abs)) {
-                                        autoRecoveredPath = candidate;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if (autoRecoveredPath) {
-                            // Auto-execute read_file with the recovered path instead of looping
-                            logWarn(`[agent] Missing-path on "read_file" -- auto-recovering with "${autoRecoveredPath}"`);
-                            try {
-                                const recoveredResult = await this.executeTool('read_file', { path: autoRecoveredPath }, `${toolId}_recovered`);
-                                toolResult = recoveredResult;
-                                // Replace the failed error result with the recovered file content
-                                const recoveredMsg = `[Auto-recovered read_file for "${autoRecoveredPath}"]\n${recoveredResult}`;
-                                this.history[this.history.length - 1] = isTextMode
-                                    ? { role: 'user', content: `Tool read_file returned:\n${recoveredMsg}` }
-                                    : { role: 'tool', content: recoveredMsg };
-                                post({ type: 'toolResult', id: toolId, name: 'read_file', success: true, preview: `(auto-recovered: ${autoRecoveredPath})` });
-                                this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1);
-                            } catch {
-                                const missingHint = `[SYSTEM: Your "read_file" tool call was missing the "path" argument. Include "path" with the file path to read. Example: <tool>{"name":"read_file","arguments":{"path":"${autoRecoveredPath}"}}</tool>]`;
-                                this.history[this.history.length - 1] = isTextMode
-                                    ? { role: 'user', content: missingHint }
-                                    : { role: 'tool', content: missingHint };
-                            }
-                        } else {
-                            const missingHint = `[SYSTEM: Your "${name}" tool call was missing the "${missingArg}" argument and did not execute. You must include ${argList}. Retry NOW with a complete, non-empty tool call. Example: <tool>{"name":"${name}","arguments":{"${missingArg}":"<value>"}}</tool>]`;
-                            this.history[this.history.length - 1] = isTextMode
-                                ? { role: 'user', content: missingHint }
-                                : { role: 'tool', content: missingHint };
-                        }
-                        logWarn(`[agent] Missing-arg on "${name}" (${missingArg}) -- consecutiveFailures rolled back, hint injected`);
+                        toolResult = await this.handleMissingArg(name, toolResult, toolId, args, isTextMode, post);
                     }
 
                     // Track edit_file failures per (path, old_string) to catch repeated identical failures.
                     if (name === 'edit_file') {
-                        // Always record the attempted path so WIP snapshot can report it even if all edits failed
-                        if (args.path) { this._lastAttemptedEditPath = String(args.path); }
-                        // Normalize whitespace before hashing so whitespace-variant retries still count
-                        const rawOldStr = String(args.old_string ?? '');
-                        const normalizedOld = rawOldStr.split('\n').map(l => l.trim()).join('\n').slice(0, 240);
-                        const editSig = `${String(args.path ?? '')}::${normalizedOld}`;
-                        const editFailCount = (this._failedEditSignatures.get(editSig) ?? 0) + 1;
-                        if (this._failedEditSignatures.size >= this.MAX_EDIT_SIGNATURE_CACHE) {
-                            const oldest = this._failedEditSignatures.keys().next().value;
-                            if (oldest !== undefined) { this._failedEditSignatures.delete(oldest); }
-                        }
-                        this._failedEditSignatures.set(editSig, editFailCount);
-
-                        // Also track per-file regardless of old_string variation -- catches agents that
-                        // evade the signature counter by slightly varying old_string each attempt.
-                        // Normalize slashes so Windows backslash paths match forward-slash keys.
-                        const filePath = String(args.path ?? '').replace(/\\/g, '/');
-                        const fileFailCount = (this._failedEditByFile.get(filePath) ?? 0) + 1;
-                        this._failedEditByFile.set(filePath, fileFailCount);
-                        // After repeated failures on the same file, hard-block edit_file and steer toward write_file.
-                        // The proactive file-content injection in the edit_file recovery below gives the model
-                        // ground truth on first failure -- so we only escalate after genuine repeated failure.
-                        const shouldEscalate = editFailCount >= this.MAX_SAME_EDIT_FAILURES || fileFailCount >= this.MAX_FILE_EDIT_FAILURES;
-                        if (shouldEscalate) {
-                            const sweepHint = this._isSweepTask
-                                ? ` This is a sweep task -- some blocks may ALREADY have been updated. Use shell_read with grep to find lines that are STILL missing the change, rather than retrying blocks you may have already edited.`
-                                : '';
-                            const reason = fileFailCount >= this.MAX_FILE_EDIT_FAILURES
-                                ? `You have made ${fileFailCount} failed edit_file attempts on "${args.path}" with different old_string values.`
-                                : `You have tried to edit "${args.path}" with the same old_string ${editFailCount} times and it keeps failing.`;
-                            // Proactively inject the current file content so the model can write_file
-                            // without another read round-trip — this is the main cause of post-compaction loops.
-                            let fileContentBlock = '';
-                            try {
-                                const absEscPath = path.isAbsolute(filePath) ? filePath : path.join(this.workspaceRoot, filePath.replace(/\//g, path.sep));
-                                const fileLines = fs.readFileSync(absEscPath, 'utf8').split('\n');
-                                const numbered = fileLines.map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
-                                const truncated = numbered.length > 12000 ? numbered.slice(0, 12000) + '\n...(file truncated at 12000 chars)' : numbered;
-                                fileContentBlock = `\n\n[CURRENT FILE CONTENT: ${filePath}]\n${truncated}\n\nUse write_file with path="${filePath}" and the full corrected content. Line numbers above (NNNN:) are for reference only — do NOT include them in write_file content.`;
-                            } catch { /* non-fatal */ }
-                            const editHint = `${reason}\n\nSTOP using edit_file on this file. Switch to write_file: read the current content shown below, apply your change, and call write_file with the complete corrected file. DO NOT use a Python script.${sweepHint}${fileContentBlock}`;
-                            logWarn(`[agent] edit_file failure threshold reached (${editFailCount}x same-sig, ${fileFailCount}x file) on "${args.path}" -- hard-blocking, injecting file content`);
-                            this._editFileHardBlocked.add(filePath);
-                            if (isTextMode) {
-                                this.history.push({ role: 'user', content: `Tool ${name} returned:\n${toolResult}\n---\n[SYSTEM: ${editHint}]` });
-                            } else {
-                                this.history.push({ role: 'tool', content: `${toolResult}\n\n${editHint}` });
-                            }
-                            this.consecutiveFailures = 0;
-                            continue;
-                        }
+                        if (this.trackEditFileFailures(args, toolResult, isTextMode)) { continue; }
                     }
 
                     // On edit_file "old_string not found" failure: read the exact line range reported
@@ -8119,30 +7836,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     // In merge mode, "matches N locations" means the old_string is ambiguous -- skip grep recovery
                     // and immediately inject the file tail so the model can append unambiguously.
                     if (name === 'edit_file' && this._mergeMode && /matches \d+ locations/i.test(toolResult)) {
-                        const failedPath = String(args.path ?? '');
-                        const absFailPath = path.isAbsolute(failedPath) ? failedPath : path.join(this.workspaceRoot, failedPath.replace(/\//g, path.sep));
-                        let tailNote = '';
-                        try {
-                            const tailCmd = `awk 'END{s=NR-20; if(s<1)s=1} NR>=s{printf "%04d: %s\\n", NR, $0}' "${absFailPath}"`;
-                            const tailContent = await this.runShellRead(tailCmd, this.workspaceRoot, `t_tail_ambig_${Date.now()}`);
-                            if (tailContent.trim()) {
-                                tailNote = `\n\n[LAST 20 LINES OF FILE]\n${tailContent}\nThe NNNN: prefix is NOT part of the file. Use the last non-blank line as old_string and append your new methods after it.`;
-                            }
-                        } catch { /* ignore */ }
-                        const absFailPathFwd = absFailPath.replace(/\\/g, '/');
-                        const ambigMsg = `[BLOCKED] Your old_string matches multiple locations -- edit_file cannot be used here.\n\nTo append to the END of the file:\n` +
-                            `Use write_file to rewrite the merged file, or use edit_file_at_line with the exact line number from the tail shown below. Do NOT use Add-Content, Get-Content, or any PowerShell cmdlet -- the shell is Git Bash.` +
-                            tailNote;
-                        if (isTextMode) {
-                            this.history.push({ role: 'user', content: `Tool ${name} returned:\n${toolResult}\n---\n[SYSTEM: ${ambigMsg}]` });
-                        } else {
-                            this.history.push({ role: 'tool', content: `${toolResult}\n\n${ambigMsg}` });
-                        }
-                        this._mergeConsecutiveEditFailures = (this._mergeConsecutiveEditFailures ?? 0) + 1;
-                        this.consecutiveFailures = 0;
-                        continue;
+                        if (await this.handleMergeAmbiguousEdit(args, toolResult, isTextMode)) { continue; }
                     }
-
                     if (name === 'edit_file' && /old_string not found|matches \d+ locations/i.test(toolResult)
                         && !String(args.path ?? '').endsWith('.ollamaforge-plan.md')) {
                         const failedPath = String(args.path ?? '');
@@ -10242,16 +9937,7 @@ If the code looks correct, respond with exactly: OK`;
                         const newName = path.basename(full);
                         try {
                             const siblings = fs.readdirSync(dir).filter(f => f !== newName && path.extname(f) === path.extname(newName));
-                            const levenshtein = (a: string, b: string): number => {
-                                const dp: number[][] = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
-                                for (let j = 0; j <= b.length; j++) { dp[0][j] = j; }
-                                for (let i = 1; i <= a.length; i++) {
-                                    for (let j = 1; j <= b.length; j++) {
-                                        dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
-                                    }
-                                }
-                                return dp[a.length][b.length];
-                            };
+                            
                             const closeMatch = siblings.find(s => levenshtein(newName, s) <= 2 && Math.abs(newName.length - s.length) <= 2);
                             if (closeMatch) {
                                 return `WRITE REJECTED -- "${rel}" looks like a typo of the existing file "${path.join(path.dirname(rel), closeMatch).replace(/\\/g, '/')}".\n\nDid you mean to write to "${path.join(path.dirname(rel), closeMatch).replace(/\\/g, '/')}"? If you intended to create a genuinely new file with a different name, use a clearly distinct filename. If this was a typo, re-call write_file with the correct path.`;
@@ -11637,14 +11323,7 @@ if errors:
                     const priorPaths = recentSshCmds.match(/\/[a-zA-Z0-9_.\-/]+/g) ?? [];
                     // Simple segment-level mismatch: a path segment in cmd doesn't appear in any prior path,
                     // but a very similar segment (edit distance â‰¤ 2) does -- likely a typo.
-                    const levenshtein = (a: string, b: string): number => {
-                        const m = a.length, n = b.length;
-                        const dp: number[][] = Array.from({length: m + 1}, (_, i) => Array(n + 1).fill(0).map((_, j) => i === 0 ? j : j === 0 ? i : 0));
-                        for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) {
-                            dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
-                        }
-                        return dp[m][n];
-                    };
+                    
                     const priorSegments = new Set(priorPaths.flatMap(p => p.split('/').filter(s => s.length > 4)));
                     for (const p of pathsInCmd) {
                         for (const seg of p.split('/').filter(s => s.length > 4)) {
@@ -17418,6 +17097,379 @@ ${sampleHtml}
      * Build a work-in-progress snapshot for context compaction.
      * Captures session state so the model can resume without repeating work.
      */
+    /**
+     * File-not-found handler: when a path doesn't exist, help the agent find
+     * the real one rather than letting it hallucinate a filename or spiral
+     * into a planning loop. Pushes a hint into history and logs.
+     */
+    private handleFileNotFound(args: Record<string, unknown>, toolResult: string, isTextMode: boolean): void {
+    if (/No such file or directory/i.test(toolResult)) {
+        // Extract the path the agent tried
+        const cmdStr = String(args.command ?? args.path ?? '');
+        const attemptedPath = cmdStr.match(/['"](.*?)['"]|(\S+\.\w+)\s*$/)
+            ?.[1] ?? cmdStr.match(/\S+\.\w+/)?.[0] ?? '';
+
+        if (attemptedPath) {
+            // 1. Collect any paths the user already provided in recent messages
+            const userPaths: string[] = [];
+            for (let hi = this.history.length - 1; hi >= Math.max(0, this.history.length - 10); hi--) {
+                const msg = this.history[hi];
+                if (msg.role !== 'user') { continue; }
+                const content = typeof msg.content === 'string' ? msg.content : '';
+                const found = content.match(/[A-Za-z]:\\[^\s'">\n]+|\/[^\s'">\n]{4,}|[\w./-]+\/[\w.-]+\.(?:md|py|ts|js|yaml|yml|json|sh|txt)/g) ?? [];
+                userPaths.push(...found);
+            }
+            const suggestions = userPaths.filter(p => p !== attemptedPath && p.length > 4);
+
+            // 2. Find the directory the agent was looking in and list its contents
+            let dirListing = '';
+            try {
+                const attemptedAbs = path.isAbsolute(attemptedPath)
+                    ? attemptedPath
+                    : path.join(this.workspaceRoot, attemptedPath);
+                const searchDir = path.dirname(attemptedAbs);
+                if (fs.existsSync(searchDir)) {
+                    const entries = fs.readdirSync(searchDir).slice(0, 30);
+                    dirListing = `\nActual contents of ${path.relative(this.workspaceRoot, searchDir).replace(/\\/g, '/') || '.'}:\n${entries.map(e => `  ${e}`).join('\n')}`;
+                }
+            } catch { /* ignore */ }
+
+            // 3. If bare filename (no dir component), also do a recursive search across all workspace roots
+            let recursiveHits = '';
+            if (!attemptedPath.includes('/') && !attemptedPath.includes('\\') && attemptedPath.includes('.')) {
+                try {
+                    const baseName = path.basename(attemptedPath, path.extname(attemptedPath));
+                    const ext = path.extname(attemptedPath);
+                    const roots = [this.workspaceRoot, ...((this as any)._extraRoots ?? [])];
+                    const hits: string[] = [];
+                    const walkDir = (dir: string, depth: number) => {
+                        if (depth > 5 || hits.length >= 10) { return; }
+                        try {
+                            for (const entry of fs.readdirSync(dir)) {
+                                if (entry.startsWith('.') || entry === 'node_modules' || entry === '__pycache__') { continue; }
+                                const full2 = path.join(dir, entry);
+                                if (fs.statSync(full2).isDirectory()) { walkDir(full2, depth + 1); }
+                                else if (entry.endsWith(ext) && entry.toLowerCase().includes(baseName.toLowerCase().slice(0, 6))) { hits.push(full2); }
+                            }
+                        } catch { /* ignore */ }
+                    };
+                    for (const root of roots) { walkDir(root, 0); }
+                    if (hits.length > 0) {
+                        recursiveHits = `\nFiles with similar names found in workspace:\n${hits.map(h => `  ${h}`).join('\n')}`;
+                    }
+                } catch { /* ignore */ }
+            }
+
+            const userPathBlock = suggestions.length > 0
+                ? `\nThe user already provided these paths -- prefer these over guessing:\n${suggestions.map(p => `  ${p}`).join('\n')}`
+                : '';
+
+            const hint = `[SYSTEM] "${attemptedPath}" does not exist. Do NOT invent a filename.${userPathBlock}${dirListing}${recursiveHits}\n\nNext steps (in order):\n1. If similar files are listed above, use that exact full path.\n2. If the user gave a path above, use that exact path.\n3. If still uncertain, run: find . -name "*${path.basename(attemptedPath, path.extname(attemptedPath))}*" to locate it.\nNever fabricate a path -- only use paths you have confirmed exist.`;
+
+            if (isTextMode) {
+                this.history.push({ role: 'user', content: hint });
+            } else {
+                this.history.push({ role: 'tool', content: hint });
+            }
+            logInfo(`[agent] File-not-found: tried "${attemptedPath}"${suggestions.length ? `, user paths: ${suggestions.join(', ')}` : ''}${dirListing ? ', injected dir listing' : ''}`);
+        }
+    }
+    }
+    /**
+     * Intercept a large shell_read result and replace it with a focused grep
+     * of exception/error blocks. Returns the new toolResult string, or null
+     * if no interception was performed.
+     */
+    private async interceptLargeFileRead(
+        args: Record<string, unknown>,
+        toolResult: string,
+        toolId: string,
+    ): Promise<string | null> {
+        const interceptCmd = String(args.command ?? '');
+        const interceptPathMatch = interceptCmd.match(/['"](.*)?['"]/);
+        const interceptPath = interceptPathMatch?.[1] ?? '';
+        if (!interceptPath) { return null; }
+        const absInterceptPath = path.isAbsolute(interceptPath)
+            ? interceptPath
+            : path.join(this.workspaceRoot, interceptPath.replace(/\//g, path.sep));
+        const interceptKw = this._currentTaskMessage
+            .toLowerCase()
+            .match(/\b(fail|timeout|retry|auth|login|upload|download|connect|validat)\w*\b/g)
+            ?.slice(0, 3)
+            .join('|');
+        const interceptPattern = interceptKw
+            ? `except|raise|\.error\(|\.critical\(|${interceptKw}`
+            : 'except|raise|\.error\(|\.critical\(';
+        const focusCmd = `grep -n -A 3 -B 3 -E "${interceptPattern}" "${absInterceptPath}" | head -200`;
+        logInfo(`[agent] Intercepting large file read (${toolResult.length} chars) -> focused grep: ${focusCmd}`);
+        try {
+            const focusResult = await this.runShellRead(focusCmd, this.workspaceRoot, toolId + '_focus');
+            if (focusResult && focusResult.trim().length > 50) {
+                const relI = path.relative(this.workspaceRoot, absInterceptPath).replace(/\\/g, '/');
+                const focusClean = stripSelectStringPrefixes(focusResult);
+                const focusTrunc = focusClean.length > 2000 ? focusClean.slice(0, 2000) + '\n...(truncated)' : focusClean;
+                this._focusedGrepInjectedThisTurn = true;
+                return `[FOCUSED READ of ${relI} -- exception/error blocks only]\n${focusTrunc}\n\n(Use EXACT strings from above in edit_file. If the change is ALREADY present, say so and stop.)`;
+            }
+        } catch { /* keep original if grep fails */ }
+        return null;
+    }
+
+    /**
+     * Classify a soft-failure tool result into a category and recovery hint.
+     * Returns { failClass, failHint } for appending to the tool result.
+     */
+    private classifySoftFailure(
+        args: Record<string, unknown>,
+        toolResult: string,
+    ): { failClass: string; failHint: string } {
+const _failText = toolResult.slice(0, 600);
+let _failClass = 'unknown';
+let _failHint = '';
+if (/command not found|No such file|not found|ENOENT/i.test(_failText)) {
+    _failClass = 'not-found';
+    // SSH non-interactive shells don't source .bashrc/.profile, so tools
+    // installed in ~/.local/bin, venv/bin, or via pipx won't be on PATH.
+    // Detect this by checking if the failing command was run via SSH.
+    const _cmdStr = String(args.command ?? '');
+    const _isSshCmd = /^ssh\s/.test(_cmdStr.trim());
+    const _cmdNotFoundMatch = _failText.match(/(?:bash|sh|zsh): line \d+: (\S+): command not found/);
+    const _missingCmd = _cmdNotFoundMatch?.[1] ?? '';
+    if (_isSshCmd && _missingCmd) {
+        const _dbClients: Record<string, string> = {
+            mysql: 'apt-get install -y mysql-client  # or: mariadb-client',
+            mysqldump: 'apt-get install -y mysql-client',
+            psql: 'apt-get install -y postgresql-client',
+            pg_dump: 'apt-get install -y postgresql-client',
+            'redis-cli': 'apt-get install -y redis-tools',
+            mongo: 'apt-get install -y mongodb-clients',
+            mongodump: 'apt-get install -y mongodb-clients',
+        };
+        const _dbInstall = _dbClients[_missingCmd];
+        if (_dbInstall) {
+            _failHint = `"${_missingCmd}" client is not installed on the remote host (this is separate from the server package). Options:\n` +
+                `1. Install it: ssh ... "sudo ${_dbInstall}"\n` +
+                `2. Verify server-side access instead: ssh ... "sudo systemctl status ${_missingCmd.replace(/-cli$|-dump$/, '')} 2>/dev/null || sudo journalctl -u ${_missingCmd.replace(/-cli$|-dump$/, '')} -n 20"\n` +
+                `3. Find any existing client binary: ssh ... "which ${_missingCmd} || find /usr/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null"`;
+        } else {
+            _failHint = `SSH non-interactive shells do not source ~/.bashrc or ~/.profile, so "${_missingCmd}" is not on PATH even if it works interactively. Fix by one of:\n` +
+                `1. Find the full path: ssh ... "which ${_missingCmd} || find ~/.local/bin /usr/local/bin -name ${_missingCmd} 2>/dev/null | head -5"\n` +
+                `2. Source the profile: ssh ... "source ~/.bashrc && ${_missingCmd} ..."\n` +
+                `3. Use the full path directly once found (e.g. ~/.local/bin/${_missingCmd})`;
+        }
+    } else {
+        _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
+    }
+} else if (/Operation not permitted|Permission denied|EACCES|EPERM/i.test(_failText)) {
+    _failClass = 'permission';
+    // Distinguish root-owned file vs general permission vs SSH sudo
+    const _permCmdStr = String(args.command ?? '');
+    const _isSshPerm = /^ssh\s/.test(_permCmdStr.trim());
+    const _isRmFail = /rm:.*Operation not permitted|rm:.*Permission denied/i.test(_failText);
+    if (_isRmFail && _isSshPerm) {
+        _failHint = 'Cannot remove file — it is owned by root or another user. Options:\n' +
+            '1. Use sudo: ssh ... "sudo rm -f /tmp/file"\n' +
+            '2. Skip cleanup — /tmp files are ephemeral and will be purged on reboot\n' +
+            '3. Overwrite instead: ssh ... "sudo tee /tmp/file < /dev/null"\n' +
+            'Do NOT retry the same rm command without sudo.';
+    } else {
+        _failHint = 'Permission denied. Check file ownership (ls -la) or try with sudo/elevated privileges. Do NOT retry the same command.';
+    }
+} else if (/timed out|timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|socket hang up/i.test(_failText)) {
+    _failClass = 'network';
+    _failHint = 'Network/timeout error. Wait a moment and retry once. If it fails again, check connectivity (ping/curl) before retrying.';
+} else if (/SyntaxError|Syntax error|parse error|unexpected token|TS\d{4}/i.test(_failText)) {
+    _failClass = 'syntax';
+    _failHint = 'Syntax/parse error. Read the exact line number from the error, open that file with read_file, and fix the specific syntax issue. Do NOT re-run the same command without fixing the code.';
+} else if (/Module not found|Cannot find module|ImportError|No module named/i.test(_failText)) {
+    _failClass = 'missing-dep';
+    _failHint = 'Missing dependency. Install it (pip install / npm install) or check the import path. Do NOT retry the same command without installing.';
+} else if (/EADDRINUSE|address already in use|port.*in use/i.test(_failText)) {
+    _failClass = 'port-conflict';
+    _failHint = 'Port already in use. Find the process (lsof -i :PORT or netstat) and stop it, or use a different port.';
+} else if (/ENOENT|no such directory/i.test(_failText)) {
+    _failClass = 'not-found';
+    _failHint = 'Directory does not exist. Create it first (mkdir -p) or check the path.';
+}
+return { failClass: _failClass, failHint: _failHint };
+    }
+
+    /**
+     * Handle a missing-required-argument tool error: roll back consecutiveFailures,
+     * re-approve the tool, attempt path auto-recovery for read_file, and inject
+     * a corrective hint into history so the model retries with complete args.
+     * Returns the (possibly recovered) toolResult.
+     */
+    private async handleMissingArg(
+        name: string,
+        toolResult: string,
+        toolId: string,
+        args: Record<string, unknown>,
+        isTextMode: boolean,
+        post: (msg: Record<string, unknown>) => void,
+    ): Promise<string> {
+        this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1); // undo the increment above
+    // Re-approve this specific tool so the model can retry without waiting for user confirmation
+    this._autoApprovedTools.add(name);
+    const missingArg = toolResult.match(/\b(path|command)\b/i)?.[1] ?? 'required argument';
+    const toolHints: Record<string, string> = {
+        'edit_file': '"path", "old_string", "new_string"',
+        'edit_file_at_line': '"path", "start_line", "end_line", "new_content"',
+        'run_command': '"command" (the shell command to execute, e.g. "python3 script.py")',
+        'shell_read': '"command" (the shell command to read output from, e.g. "git status" or "find . -name \'*.py\'")',
+        'read_file': '"path" (the file path to read, e.g. "app/main.py" or "requirements.txt")',
+        'write_file': '"path" (destination file path) and "content" (the full file content to write)',
+    };
+    const argList = toolHints[name] ?? 'all required arguments';
+
+    // Path auto-recovery for read_file: when the model omits the path argument,
+    // scan its narration text for a file path it mentioned (e.g. "Let me read X")
+    // and auto-supply the missing path so the tool succeeds without a retry loop.
+    let autoRecoveredPath = '';
+    if (name === 'read_file' && missingArg === 'path') {
+        const lastEntry = this.history[this.history.length - 1];
+        const narration = typeof lastEntry?.content === 'string' ? lastEntry.content : '';
+        // Scan narration for file paths: quoted paths, backtick paths, or bare relative paths
+        const pathPat = /(?:`([^`]+\.[a-z]{1,6})`|["']([^"'\n]+\.[a-z]{1,6})["']|(?:read|open|check|inspect|look at|examine)\s+([A-Za-z][\w./\\-]+\.[a-z]{1,6}))/gi;
+        let pm: RegExpExecArray | null;
+        while ((pm = pathPat.exec(narration)) !== null) {
+            const candidate = (pm[1] ?? pm[2] ?? pm[3] ?? '').trim().replace(/^\/+/, '');
+            if (candidate && !candidate.includes(' ') && candidate.includes('.')) {
+                const abs = path.isAbsolute(candidate) ? candidate : path.join(this.workspaceRoot, candidate);
+                if (fs.existsSync(abs)) {
+                    autoRecoveredPath = candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (autoRecoveredPath) {
+        // Auto-execute read_file with the recovered path instead of looping
+        logWarn(`[agent] Missing-path on "read_file" -- auto-recovering with "${autoRecoveredPath}"`);
+        try {
+            const recoveredResult = await this.executeTool('read_file', { path: autoRecoveredPath }, `${toolId}_recovered`);
+            toolResult = recoveredResult;
+            // Replace the failed error result with the recovered file content
+            const recoveredMsg = `[Auto-recovered read_file for "${autoRecoveredPath}"]\n${recoveredResult}`;
+            this.history[this.history.length - 1] = isTextMode
+                ? { role: 'user', content: `Tool read_file returned:\n${recoveredMsg}` }
+                : { role: 'tool', content: recoveredMsg };
+            post({ type: 'toolResult', id: toolId, name: 'read_file', success: true, preview: `(auto-recovered: ${autoRecoveredPath})` });
+            this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1);
+        } catch {
+            const missingHint = `[SYSTEM: Your "read_file" tool call was missing the "path" argument. Include "path" with the file path to read. Example: <tool>{"name":"read_file","arguments":{"path":"${autoRecoveredPath}"}}</tool>]`;
+            this.history[this.history.length - 1] = isTextMode
+                ? { role: 'user', content: missingHint }
+                : { role: 'tool', content: missingHint };
+        }
+    } else {
+        const missingHint = `[SYSTEM: Your "${name}" tool call was missing the "${missingArg}" argument and did not execute. You must include ${argList}. Retry NOW with a complete, non-empty tool call. Example: <tool>{"name":"${name}","arguments":{"${missingArg}":"<value>"}}</tool>]`;
+        this.history[this.history.length - 1] = isTextMode
+            ? { role: 'user', content: missingHint }
+            : { role: 'tool', content: missingHint };
+    }
+        logWarn(`[agent] Missing-arg on "${name}" (${missingArg}) -- consecutiveFailures rolled back, hint injected`);
+        return toolResult;
+    }
+
+    /**
+     * Track edit_file failures per (path, old_string) and per-file. When the
+     * failure threshold is reached, inject the current file content, hard-block
+     * edit_file, and steer the model toward write_file.
+     * Returns true if the caller should `continue` (skip to next iteration).
+     */
+    /**
+     * In merge mode, when edit_file old_string matches multiple locations,
+     * inject the file tail and block edit_file. Returns true if caller should `continue`.
+     */
+    private async handleMergeAmbiguousEdit(
+        args: Record<string, unknown>,
+        toolResult: string,
+        isTextMode: boolean,
+    ): Promise<boolean> {
+        const failedPath = String(args.path ?? '');
+        const absFailPath = path.isAbsolute(failedPath) ? failedPath : path.join(this.workspaceRoot, failedPath.replace(/\//g, path.sep));
+        let tailNote = '';
+        try {
+            const tailCmd = `awk 'END{s=NR-20; if(s<1)s=1} NR>=s{printf "%04d: %s\\n", NR, $0}' "${absFailPath}"`;
+            const tailContent = await this.runShellRead(tailCmd, this.workspaceRoot, `t_tail_ambig_${Date.now()}`);
+            if (tailContent.trim()) {
+                tailNote = `\n\n[LAST 20 LINES OF FILE]\n${tailContent}\nThe NNNN: prefix is NOT part of the file. Use the last non-blank line as old_string and append your new methods after it.`;
+            }
+        } catch { /* ignore */ }
+        const ambigMsg = `[BLOCKED] Your old_string matches multiple locations -- edit_file cannot be used here.\n\nTo append to the END of the file:\n` +
+            `Use write_file to rewrite the merged file, or use edit_file_at_line with the exact line number from the tail shown below. Do NOT use Add-Content, Get-Content, or any PowerShell cmdlet -- the shell is Git Bash.` +
+            tailNote;
+        if (isTextMode) {
+            this.history.push({ role: 'user', content: `Tool edit_file returned:\n${toolResult}\n---\n[system: ${ambigMsg}]` });
+        } else {
+            this.history.push({ role: 'tool', content: `${toolResult}\n\n${ambigMsg}` });
+        }
+        this._mergeConsecutiveEditFailures = (this._mergeConsecutiveEditFailures ?? 0) + 1;
+        this.consecutiveFailures = 0;
+        return true;
+    }
+
+    private trackEditFileFailures(
+        args: Record<string, unknown>,
+        toolResult: string,
+        isTextMode: boolean,
+    ): boolean {
+        // Always record the attempted path
+    if (args.path) { this._lastAttemptedEditPath = String(args.path); }
+    // Normalize whitespace before hashing so whitespace-variant retries still count
+    const rawOldStr = String(args.old_string ?? '');
+    const normalizedOld = rawOldStr.split('\n').map(l => l.trim()).join('\n').slice(0, 240);
+    const editSig = `${String(args.path ?? '')}::${normalizedOld}`;
+    const editFailCount = (this._failedEditSignatures.get(editSig) ?? 0) + 1;
+    if (this._failedEditSignatures.size >= this.MAX_EDIT_SIGNATURE_CACHE) {
+        const oldest = this._failedEditSignatures.keys().next().value;
+        if (oldest !== undefined) { this._failedEditSignatures.delete(oldest); }
+    }
+    this._failedEditSignatures.set(editSig, editFailCount);
+
+    // Also track per-file regardless of old_string variation -- catches agents that
+    // evade the signature counter by slightly varying old_string each attempt.
+    // Normalize slashes so Windows backslash paths match forward-slash keys.
+    const filePath = String(args.path ?? '').replace(/\\/g, '/');
+    const fileFailCount = (this._failedEditByFile.get(filePath) ?? 0) + 1;
+    this._failedEditByFile.set(filePath, fileFailCount);
+    // After repeated failures on the same file, hard-block edit_file and steer toward write_file.
+    // The proactive file-content injection in the edit_file recovery below gives the model
+    // ground truth on first failure -- so we only escalate after genuine repeated failure.
+    const shouldEscalate = editFailCount >= this.MAX_SAME_EDIT_FAILURES || fileFailCount >= this.MAX_FILE_EDIT_FAILURES;
+    if (shouldEscalate) {
+        const sweepHint = this._isSweepTask
+            ? ` This is a sweep task -- some blocks may ALREADY have been updated. Use shell_read with grep to find lines that are STILL missing the change, rather than retrying blocks you may have already edited.`
+            : '';
+        const reason = fileFailCount >= this.MAX_FILE_EDIT_FAILURES
+            ? `You have made ${fileFailCount} failed edit_file attempts on "${args.path}" with different old_string values.`
+            : `You have tried to edit "${args.path}" with the same old_string ${editFailCount} times and it keeps failing.`;
+        // Proactively inject the current file content so the model can write_file
+        // without another read round-trip — this is the main cause of post-compaction loops.
+        let fileContentBlock = '';
+        try {
+            const absEscPath = path.isAbsolute(filePath) ? filePath : path.join(this.workspaceRoot, filePath.replace(/\//g, path.sep));
+            const fileLines = fs.readFileSync(absEscPath, 'utf8').split('\n');
+            const numbered = fileLines.map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
+            const truncated = numbered.length > 12000 ? numbered.slice(0, 12000) + '\n...(file truncated at 12000 chars)' : numbered;
+            fileContentBlock = `\n\n[CURRENT FILE CONTENT: ${filePath}]\n${truncated}\n\nUse write_file with path="${filePath}" and the full corrected content. Line numbers above (NNNN:) are for reference only — do NOT include them in write_file content.`;
+        } catch { /* non-fatal */ }
+        const editHint = `${reason}\n\nSTOP using edit_file on this file. Switch to write_file: read the current content shown below, apply your change, and call write_file with the complete corrected file. DO NOT use a Python script.${sweepHint}${fileContentBlock}`;
+        logWarn(`[agent] edit_file failure threshold reached (${editFailCount}x same-sig, ${fileFailCount}x file) on "${args.path}" -- hard-blocking, injecting file content`);
+        this._editFileHardBlocked.add(filePath);
+        if (isTextMode) {
+            this.history.push({ role: 'user', content: `Tool ${name} returned:\n${toolResult}\n---\n[SYSTEM: ${editHint}]` });
+        } else {
+            this.history.push({ role: 'tool', content: `${toolResult}\n\n${editHint}` });
+        }
+        this.consecutiveFailures = 0;
+        return true;
+        }
+        return false;
+    }
+
     private buildWipSnapshot(usagePct: number, historyBeforeCompact: OllamaMessage[]): string[] {
         const wipLines: string[] = [];
         wipLines.push(`[WORK IN PROGRESS -- Context was compacted at ${usagePct.toFixed(0)}% usage]`);

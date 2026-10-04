@@ -57,6 +57,43 @@ export interface SessionLogEntry {
     reasoning?: string;
 }
 
+// ── Replayable event stream (OpenHands-inspired) ─────────────────────────────
+// Every action the agent takes — user message, model response, tool call, tool
+// result, guard event — is appended as a numbered event to events.jsonl. Unlike
+// sessions.jsonl (one summary per run), this is a fine-grained, ordered,
+// replayable trace: "what did the agent do between step 5 and 12?" is a simple
+// seq-range read. Sequence numbers are per-run (reset each run) so a run's
+// events form a contiguous, ordered block.
+
+export type AgentEventType =
+    | 'user_message'
+    | 'model_response'
+    | 'tool_call'
+    | 'tool_result'
+    | 'guard'
+    | 'run_start'
+    | 'run_end';
+
+export interface AgentEvent {
+    /** Per-run sequence number (1-based, contiguous within a run). */
+    seq: number;
+    /** ISO timestamp of the event. */
+    ts: string;
+    /** ChatSession.id — ties the event back to the stored session. */
+    sessionId: string;
+    /** Model name in use for this run. */
+    model: string;
+    type: AgentEventType;
+    /** For tool_call / tool_result: the tool name. */
+    tool?: string;
+    /** For tool_call / tool_result: the file path argument, if any. */
+    path?: string;
+    /** For guard: the guard type that fired. */
+    guardType?: string;
+    /** Truncated, human-readable detail (bounded to keep the stream lean). */
+    detail?: string;
+}
+
 // ── Writers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -129,5 +166,60 @@ export function appendSessionLogMd(workspaceRoot: string, entry: SessionLogEntry
         fs.appendFileSync(file, line, 'utf8');
     } catch {
         // Intentionally silent — log errors must never surface to the user
+    }
+}
+
+/**
+ * Append one event to the replayable event stream at
+ * <workspaceRoot>/.ollamaforge/events.jsonl.
+ *
+ * Unlike appendSessionLog (one summary per run), this records every discrete
+ * action in order so a run can be replayed or queried by seq range. The caller
+ * owns the sequence number (per-run, 1-based) — this function only appends.
+ *
+ * Silently swallows I/O errors — tracing must never interrupt the agent.
+ */
+export function appendAgentEvent(workspaceRoot: string, event: AgentEvent): void {
+    if (!workspaceRoot) { return; }
+    try {
+        const dir = path.join(workspaceRoot, '.ollamaforge');
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        const file = path.join(dir, 'events.jsonl');
+        fs.appendFileSync(file, JSON.stringify(event) + '\n', 'utf8');
+    } catch {
+        // Intentionally silent — disk errors must not interrupt the agent
+    }
+}
+
+/**
+ * Read a run's events from the event stream, optionally bounded to a seq range.
+ * Returns events in seq order. Used for "what did the agent do between step 5
+ * and 12?" queries and replay. Returns [] if the file is absent or unreadable.
+ */
+export function readAgentEvents(
+    workspaceRoot: string,
+    sessionId: string,
+    fromSeq?: number,
+    toSeq?: number,
+): AgentEvent[] {
+    if (!workspaceRoot) { return []; }
+    try {
+        const file = path.join(workspaceRoot, '.ollamaforge', 'events.jsonl');
+        if (!fs.existsSync(file)) { return []; }
+        const out: AgentEvent[] = [];
+        for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
+            if (!raw.trim()) { continue; }
+            let ev: AgentEvent;
+            try { ev = JSON.parse(raw); } catch { continue; }
+            if (ev.sessionId !== sessionId) { continue; }
+            if (fromSeq !== undefined && ev.seq < fromSeq) { continue; }
+            if (toSeq !== undefined && ev.seq > toSeq) { continue; }
+            out.push(ev);
+        }
+        return out.sort((a, b) => a.seq - b.seq);
+    } catch {
+        return [];
     }
 }

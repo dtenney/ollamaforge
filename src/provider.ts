@@ -1210,15 +1210,23 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
                 // ── Stop generation ───────────────────────────────────────
                 case 'stopGeneration': {
-                    if (!this._running) { break; } // already stopped (e.g. stop-intent fired first)
-                    this._agent?.stop();
-                    this._running = false;
-                    // Clear any queued message — a user-initiated stop should not auto-resume.
-                    this._tab.pendingMessage = undefined;
+                    // The webview has a single global stop button (agentActive is one
+                    // flag, not per-tab), so the user's intent is "stop whatever is
+                    // running" — NOT "stop the currently displayed tab." Resolving to
+                    // this._tab (active tab) would miss a run on a background tab and
+                    // instead stop an idle active tab. Stop every running tab.
+                    const runningTabs = [...this._tabs.values()].filter(t => t.running);
+                    if (runningTabs.length === 0) { break; } // already stopped (e.g. stop-intent fired first)
+                    for (const tab of runningTabs) {
+                        tab.agent?.stop();
+                        tab.running = false;
+                        // Clear any queued message — a user-initiated stop should not auto-resume.
+                        tab.pendingMessage = undefined;
+                    }
                     post({ type: 'streamEnd' });
                     post({ type: 'agentDone' });
                     post({ type: 'stoppedByUser' });
-                    logInfo('[provider] Generation stopped');
+                    logInfo(`[provider] Generation stopped (${runningTabs.length} tab${runningTabs.length > 1 ? 's' : ''})`);
                     break;
                 }
 

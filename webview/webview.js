@@ -942,10 +942,11 @@ function appendToken(token) {
         // This prevents the brief "flash" of internal monologue before isOscillating fires.
         const SELF_TALK_START_RE = /^(?:(?:ok(?:ay)?[,.]?\s+)?(?:let me|i(?:'ll| will| need to| should| can)|let's|first[,.]?\s+i|so[,.]?\s+(?:i|let me)|alright[,.]?\s+(?:i|let me)))/i;
         const hasSubstantiveContent = display.includes('```') || /^#{1,3}\s/m.test(display) || display.split('\n').some(l => l.trim().length > 120);
+        // Fire immediately when the stream starts with self-talk and has no substantive content yet —
+        // even a single self-talk line is enough; the ratio guard is dropped for the early case.
         const isEarlySelfTalk = SELF_TALK_START_RE.test(display.trim())
             && !hasSubstantiveContent
-            && selfTalkLines.length >= 2
-            && selfTalkLines.length / Math.max(1, display.split('\n').filter(l => l.trim()).length) > 0.6;
+            && selfTalkLines.length >= 1;
 
         if (isOscillating || isEarlySelfTalk) {
             // Route self-talk into the thinking block so it's not lost

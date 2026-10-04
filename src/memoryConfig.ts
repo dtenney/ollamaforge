@@ -13,6 +13,8 @@ export interface MemoryConfig {
     maxContextTokens: number;
     semanticSearchLimit: number;
     fallbackToLocal: boolean;
+    pressureEntryThreshold: number;
+    pressureTokenThreshold: number;
 }
 
 /**
@@ -70,6 +72,8 @@ export function getMemoryConfig(): MemoryConfig {
         archiveThresholdDays: config.get<number>('memory.archiveThresholdDays', 90),
         maxContextTokens: config.get<number>('memory.maxContextTokens', 1500),
         semanticSearchLimit: config.get<number>('memory.semanticSearchLimit', 5),
-        fallbackToLocal: config.get<boolean>('memory.fallbackToLocal', true)
+        fallbackToLocal: config.get<boolean>('memory.fallbackToLocal', true),
+        pressureEntryThreshold: config.get<number>('memory.pressureEntryThreshold', 150),
+        pressureTokenThreshold: config.get<number>('memory.pressureTokenThreshold', 40000)
     };
 }

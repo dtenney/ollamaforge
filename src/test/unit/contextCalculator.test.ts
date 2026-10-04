@@ -49,8 +49,8 @@ type ContextLevel = 'safe' | 'warning' | 'critical' | 'overflow';
 
 function getContextLevel(percentage: number): ContextLevel {
     if (percentage >= 99) return 'overflow';
-    if (percentage >= 95) return 'critical';
-    if (percentage >= 75) return 'warning';
+    if (percentage >= 90) return 'critical';
+    if (percentage >= 70) return 'warning';
     return 'safe';
 }
 
@@ -195,20 +195,20 @@ describe('ContextCalculator Module', () => {
     });
 
     describe('getContextLevel', () => {
-        it('should return safe below 75%', () => {
+        it('should return safe below 70%', () => {
             assert.strictEqual(getContextLevel(0), 'safe');
             assert.strictEqual(getContextLevel(50), 'safe');
-            assert.strictEqual(getContextLevel(74.9), 'safe');
+            assert.strictEqual(getContextLevel(69.9), 'safe');
         });
 
-        it('should return warning at 75%', () => {
-            assert.strictEqual(getContextLevel(75), 'warning');
-            assert.strictEqual(getContextLevel(90), 'warning');
-            assert.strictEqual(getContextLevel(94.9), 'warning');
+        it('should return warning at 70%', () => {
+            assert.strictEqual(getContextLevel(70), 'warning');
+            assert.strictEqual(getContextLevel(85), 'warning');
+            assert.strictEqual(getContextLevel(89.9), 'warning');
         });
 
-        it('should return critical at 95%', () => {
-            assert.strictEqual(getContextLevel(95), 'critical');
+        it('should return critical at 90%', () => {
+            assert.strictEqual(getContextLevel(90), 'critical');
             assert.strictEqual(getContextLevel(98), 'critical');
         });
 

@@ -12,6 +12,8 @@
  *               filterCompleteLine, isPlanningLine, escHtml, looksLikePath,
  *               normalizePath, requiredParams, isAbsPath, isFilePath,
  *               globToRegex, globToRegexDeep
+ *   2026-10-03: toolCallDigest, stableStringify
+ *   2026-10-04: truncateToolResult
  *
  * NOTE: The full loop body (executeTurn) is intentionally NOT extracted here —
  * it is too tightly coupled to run()'s local scope (1,181 `this.` refs, 135
@@ -19,6 +21,7 @@
  */
 
 import * as path from 'path';
+import * as crypto from 'crypto';
 
 /**
  * Strip XML/tool-call artifacts that small models sometimes leak into visible
@@ -193,4 +196,290 @@ export function generateBranchSlug(taskMessage: string): string {
         .slice(0, 5)
         .join('-')
         .slice(0, 40);
+}
+
+/**
+ * StreamFilter — encapsulates the per-turn token filtering pipeline that was
+ * previously inlined as closures inside Agent.run().
+ *
+ * Responsibilities:
+ *   1. Strip leaked XML/tool-call artifacts from each token.
+ *   2. Detect mid-stream spiral (runaway repetition) and signal abort.
+ *   3. Buffer and suppress "thought process" header lines that small models
+ *      emit before a real answer.
+ *   4. Flush any remaining buffered content at end-of-stream.
+ *
+ * Usage:
+ *   const sf = new StreamFilter(() => { agent.stopRef.stop = true; });
+ *   const filtered = sf.filter(token);
+ *   // ... after stream ends:
+ *   const remaining = sf.flush();
+ */
+export class StreamFilter {
+    private _streamLineBuf = '';
+    private _spiralBuf = '';
+    private _spiralAborted = false;
+    private _inToolBlock = false;
+    private _toolOpenCount = 0;
+    private _toolCloseCount = 0;
+    private _spiralCheckCounter = 0;
+    private readonly MAX_LINE_BUF = 400;
+    private readonly SPIRAL_CHECK_INTERVAL = 25;
+    private readonly SUSPECT_PREFIX_RE = /^(?:[\u2728\u{1F914}\u{1F4AD}\u{1F4DD}\u{1F50D}\u{1F4CB}]|#{1,3}\s*(?:Thought|Think|Analysis|Summary|Reasoning)|Let me know|Happy to help|Feel free to ask|Hope (?:this|that) helps)/iu;
+
+    constructor(private onAbort?: () => void) {}
+
+    /** True if the spiral detector has fired (stream should be aborted). */
+    get aborted(): boolean { return this._spiralAborted; }
+
+    /**
+     * Filter a single streamed token. Returns the visible text (may be empty
+     * if the token was suppressed or is still being buffered).
+     */
+    filter(token: string): string {
+        const t = stripXmlArtifacts(token);
+        if (!t) { return ''; }
+
+        // Mid-stream spiral abort: stop generation before garbage floods the chat
+        if (this.checkSpiralMidStream(t)) {
+            if (this.onAbort) { this.onAbort(); }
+            return '';
+        }
+
+        this._streamLineBuf += t;
+
+        // Fast path: if not in a suppressed block and buffer doesn't look suspicious, emit immediately.
+        if (!this.SUSPECT_PREFIX_RE.test(this._streamLineBuf)) {
+            const out = this._streamLineBuf;
+            this._streamLineBuf = '';
+            return out;
+        }
+
+        // Hold until we have a complete line or hit the safety limit
+        if (!this._streamLineBuf.includes('\n') && this._streamLineBuf.length < this.MAX_LINE_BUF) {
+            return ''; // still accumulating
+        }
+
+        // Process complete lines
+        const parts = this._streamLineBuf.split('\n');
+        this._streamLineBuf = parts.pop() ?? '';
+        const filtered = parts.map(filterCompleteLine);
+        const out = filtered.join('\n');
+        return out || (parts.length > 0 ? '\n' : '');
+    }
+
+    /**
+     * Flush any remaining buffered content (e.g. last line with no trailing \n).
+     * Returns the flushed text (empty string if nothing buffered).
+     */
+    flush(): string {
+        if (!this._streamLineBuf) { return ''; }
+        const remaining = filterCompleteLine(this._streamLineBuf);
+        this._streamLineBuf = '';
+        return remaining;
+    }
+
+    private checkSpiralMidStream(text: string): boolean {
+        if (this._spiralAborted) { return true; }
+        this._spiralBuf += text;
+
+        // Track <tool> depth incrementally instead of rescanning the whole buffer.
+        if (text.includes('<tool>'))  { this._toolOpenCount  += (text.match(/<tool>/g)  ?? []).length; }
+        if (text.includes('</tool>')) { this._toolCloseCount += (text.match(/<\/tool>/g) ?? []).length; }
+        this._inToolBlock = this._toolOpenCount > this._toolCloseCount;
+        if (this._inToolBlock) { return false; }
+
+        // Wait for enough model-generated content before checking -- tool output
+        // echoed in the first ~2000 chars (esp. thinking tokens about SSH/JSON output)
+        // can contain repeated tokens and must not trigger abort.
+        if (this._spiralBuf.length < 2000) { return false; }
+
+        // Throttle: run expensive checks only every SPIRAL_CHECK_INTERVAL tokens.
+        if ((++this._spiralCheckCounter % this.SPIRAL_CHECK_INTERVAL) !== 0) { return false; }
+
+        // Check for inline repetition only in the tail -- avoids false-positives on
+        // tool-result data echoed near the start of the response.
+        const tail = this._spiralBuf.slice(-600);
+        if (/(.{15,60})\1{5,}/.test(tail)) { this._spiralAborted = true; return true; }
+        // Check for line repetition: same line 5+ times in recent output (raised from 4
+        // to reduce false-positives on SSH/log/JSON output with naturally repeated structure).
+        const recentLines = this._spiralBuf.slice(-1200).split('\n').map(l => l.trim()).filter(l => l.length > 15);
+        if (recentLines.length >= 8) {
+            const freq: Record<string, number> = {};
+            for (const l of recentLines) { freq[l] = (freq[l] ?? 0) + 1; }
+            if (Object.values(freq).some(c => c >= 5)) { this._spiralAborted = true; return true; }
+        }
+        return false;
+    }
+}
+
+/**
+ * Repair collapsed-JSON args that small models (qwen3, gemma4) sometimes emit
+ * for read_file / shell_read / write_file / edit_file. The model puts all args
+ * into a single key's value as a collapsed JSON string.
+ *
+ * Also coerces numeric offset/limit strings to numbers.
+ * Returns the (possibly repaired) args object.
+ */
+export function repairCollapsedArgs(
+    name: string,
+    args: Record<string, unknown>,
+    logWarn: (msg: string) => void,
+): Record<string, unknown> {
+    if (name !== 'read_file' && name !== 'shell_read' && name !== 'write_file' && name !== 'edit_file') {
+        return args;
+    }
+    const argKeys = Object.keys(args);
+    if (argKeys.length === 1) {
+        const soleKey = argKeys[0];
+        const soleVal = String(args[soleKey] ?? '');
+        if (/,\s*"[\w_]+":\s/.test(soleVal) || /,\s*\\?"[\w_]+"/.test(soleVal)) {
+            try {
+                const jsonAttempt = `{${JSON.stringify(soleKey)}: ${/^\d+$/.test(soleVal.split(',')[0].trim()) ? soleVal : `"${soleVal.replace(/"/g, '\\"')}"`}}`;
+                const reconstructed = JSON.parse(jsonAttempt);
+                if (Object.keys(reconstructed).length > 1) {
+                    logWarn(`[agent] Repaired collapsed ${name} args from single-key "${soleKey}"`);
+                    args = reconstructed;
+                }
+            } catch {
+                try {
+                    const unescaped = soleVal.replace(/\\"/g, '"');
+                    const fragment = `{${JSON.stringify(soleKey)}: ${unescaped.includes(',') ? unescaped : `"${unescaped}"`}}`;
+                    const recovered = JSON.parse(fragment);
+                    if (recovered && Object.keys(recovered).length > 1) {
+                        logWarn(`[agent] Repaired collapsed ${name} args (fragment method) from "${soleKey}"`);
+                        args = recovered;
+                    }
+                } catch { /* leave as-is */ }
+            }
+        }
+    }
+    if (typeof args.offset === 'string' && /^\d+$/.test(args.offset)) { args = { ...args, offset: parseInt(args.offset, 10) }; }
+    if (typeof args.limit === 'string' && /^\d+$/.test(args.limit)) { args = { ...args, limit: parseInt(args.limit, 10) }; }
+    return args;
+}
+
+/**
+ * Return the project check command for a given source file extension.
+ * Used by the 3.1/3.6 verify-reminder that is appended after successful
+ * edit_file / write_file / edit_file_at_line calls.
+ */
+export function getVerifyCommand(filePath: string): string {
+    const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+    switch (ext) {
+        case 'py': return '`python -m pytest -v` (or `ruff check .` if a linter is configured)';
+        case 'ts': case 'tsx': return '`npx tsc --noEmit` (or `npm run compile`)';
+        case 'js': case 'jsx': return '`npx tsc --noEmit` (or `npm run lint`)';
+        case 'go': return '`go build ./...` and `go test ./...`';
+        case 'rs': return '`cargo check` and `cargo test`';
+        case 'java': return '`mvn compile` (or `gradle build`)';
+        case 'rb': return '`bundle exec rspec` (or `ruby -c <file>` for syntax)';
+        case 'cs': return '`dotnet build`';
+        case 'cpp': case 'cc': case 'c': case 'h': case 'hpp': return '`g++ -fsyntax-only <file>` (or the project build)';
+        case 'scad': return '`openscad -o /tmp/check.stl <file>`';
+        case 'yaml': case 'yml': return '`python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" <file>`';
+        case 'json': return '`python3 -m json.tool <file>`';
+        case 'sh': case 'sql': return '`bash -n <file>` (sh) or the project DB linter (sql)';
+        default: return 'the project check command from your system prompt';
+    }
+}
+
+/**
+ * Compute a short stable digest for a (tool_name, args) pair so that
+ * repeated identical calls can be counted.
+ */
+export function toolCallDigest(name: string, args: Record<string, unknown>): string {
+    // Sort keys for a stable canonical form regardless of insertion order.
+    const canonical = JSON.stringify({ name, args: stableStringify(args) });
+    return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+}
+
+/** Recursively sort object keys so JSON.stringify is order-independent. */
+export function stableStringify(value: unknown): unknown {
+    if (Array.isArray(value)) {
+        return value.map(stableStringify);
+    }
+    if (value && typeof value === 'object') {
+        const obj = value as Record<string, unknown>;
+        const sorted: Record<string, unknown> = {};
+        for (const k of Object.keys(obj).sort()) {
+            sorted[k] = stableStringify(obj[k]);
+        }
+        return sorted;
+    }
+    return value;
+}
+
+/**
+ * Truncate a tool-result string for history injection.
+ *
+ * Applies (in order):
+ *   1. Merge-mode line cap (shell_read only, when mergeMode is true)
+ *   2. Large directory-listing cap (shell_read only, ls/find output)
+ *   3. Head+tail char cap (any tool, when result exceeds maxChars)
+ *
+ * Returns the (possibly truncated) string.
+ */
+export function truncateToolResult(
+    toolResult: string,
+    toolName: string,
+    command: string,
+    opts: {
+        mergeMode: boolean;
+        maxChars: number;
+        headChars: number;
+        tailChars: number;
+        mergeMaxLines?: number;
+        mergeSuffix?: string;
+        listingSuffix?: string;
+    },
+): string {
+    let result = toolResult;
+
+    // 1. Merge-mode line cap
+    if (opts.mergeMode && toolName === 'shell_read' && result.length > 6000) {
+        const lines = result.split('\n');
+        const MAX_LINES = opts.mergeMaxLines ?? 120;
+        if (lines.length > MAX_LINES) {
+            const kept = lines.slice(0, MAX_LINES).join('\n');
+            result = kept + `\n\n[TRUNCATED -- file has ${lines.length} lines, showing first ${MAX_LINES}.${opts.mergeSuffix ?? ''}]`;
+        }
+    }
+
+    // 2. Large directory-listing cap
+    if (toolName === 'shell_read' && result.length > 3000) {
+        const isListingOutput = /\bls\b|\bfind\b/i.test(command) && !/grep|cat\b|head\b|tail\b|sed\b|awk\b/.test(command);
+        if (isListingOutput) {
+            const lines = result.split('\n').filter(l => l.trim());
+            if (lines.length > 50) {
+                const sample = lines.slice(0, 50).join('\n');
+                result = sample + `\n\n[LISTING TRUNCATED -- ${lines.length} items total, showing first 50.${opts.listingSuffix ?? ''}]`;
+            }
+        }
+    }
+
+    // 3. Head+tail char cap
+    if (result.length > opts.maxChars && !result.includes('[TRUNCATED') && !result.includes('[LISTING TRUNCATED')) {
+        const head = result.slice(0, opts.headChars);
+        const tail = result.slice(-opts.tailChars);
+        const omitted = result.length - opts.headChars - opts.tailChars;
+        result = `${head}\n\n[...${omitted} chars omitted...]\n\n${tail}`;
+    }
+
+    return result;
+}
+
+/**
+ * Levenshtein edit distance between two strings.
+ * Used for typo detection (filename suggestions, SSH path validation).
+ */
+export function levenshtein(a: string, b: string): number {
+    const m = a.length, n = b.length;
+    const dp: number[][] = Array.from({ length: m + 1 }, (_, i) => Array(n + 1).fill(0).map((_, j) => i === 0 ? j : j === 0 ? i : 0));
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+        }
+    }
+    return dp[m][n];
 }

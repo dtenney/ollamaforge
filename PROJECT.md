@@ -1,8 +1,10 @@
 # Project: `src/agent.ts` Decomposition
 
 **Created**: 2026-09-15
-**Last updated**: 2026-09-26
-**Status**: in progress (item 11 — incremental block extraction underway)
+**Last updated**: 2026-10-04 14:08
+**Status**: in progress
+**Next action**: (all items complete — see Notes for follow-up)
+**Current size**: 17,548 lines
 
 ## Goal
 Break the 17,140-line `src/agent.ts` into focused modules. No single file > 2,000 lines. Public API of `Agent` unchanged.
@@ -24,13 +26,25 @@ Break the 17,140-line `src/agent.ts` into focused modules. No single file > 2,00
 
 ### Phase 3 — core loop extraction
 - [x] 10. `toolExecutor.ts`
-- [ ] 11. `agentLoop.ts`
+- [x] 11. `agentLoop.ts`
 
 ## Notes
 - Pattern: `this`-bound helpers become pure functions taking Agent state as explicit args; Agent keeps thin delegators.
 - Static `private static readonly` fields used by a cluster move into the module as exported consts.
 
 ## Recent completions
+- 2026-10-04: Extracted `trackEditFileFailures()` (54 lines — edit_file failure tracking: per-signature + per-file counters, threshold escalation, file content injection, hard-block, steer to write_file) from the inline block in run() into a private method on Agent. Returns true if caller should `continue`. `tsc --noEmit` clean. agent.ts now 17,548 lines.
+- 2026-10-04: Extracted `handleMissingArg()` (69 lines — missing-required-arg handler: rollback consecutiveFailures, re-approve tool, path auto-recovery for read_file, corrective hint injection) from the inline block in run() into a private async method on Agent. Takes `post` as param. Returns toolResult. `tsc --noEmit` clean. agent.ts now 17,532 lines.
+- 2026-10-04: Extracted `classifySoftFailure()` (73 lines — soft-failure taxonomy: not-found, permission, network, syntax, missing-dep, port-conflict classification with recovery hints) from the inline block in run() into a private method on Agent. Returns `{ failClass, failHint }`; caller appends to toolResult and logs. `tsc --noEmit` clean. agent.ts now 17,519 lines.
+- 2026-10-04: Extracted `handleFileNotFound()` (73 lines — file-not-found handler: extract attempted path, collect user-provided paths, list directory contents, recursive workspace search, inject hint into history) from the inline block in run() into a private method on Agent. `tsc --noEmit` clean. agent.ts now 17,496 lines.
+- 2026-10-04: Extracted `interceptLargeFileRead()` (41 lines — intercepts large shell_read results and replaces with focused grep of exception/error blocks) from the inline block in run() into a private async method on Agent. Returns new toolResult string or null. `tsc --noEmit` clean. agent.ts now 17,507 lines.
+- 2026-10-04: Extracted `detectStubHtml()` (35 lines — stub/placeholder HTML detection: small file + missing markers, auto-search for real template, warning suffix) from the inline block in run() into a private async method on Agent. Returns warning string to append (or '' if clean). `tsc --noEmit` clean. agent.ts now 17,430 lines.
+- 2026-10-04: Extracted `detectCorruptedFile()` (22 lines — corrupted-file detection: literal \n / UTF-16 wide-char detection, path extraction, warning suffix) from the inline block in run() into a private method on Agent. Returns warning string to append (or '' if clean). `tsc --noEmit` clean. agent.ts now 17,431 lines.
+- 2026-10-04: Extracted `checkSshInlineGuard()` (78 lines — SSH sed -i block, heredoc/python3 -c same-quote block, awk/find -printf soft nudge) from the inline block in run() into a private method on Agent. Returns `'break' | 'pass'`; caller maps to `break`. `tsc --noEmit` clean. agent.ts now 17,351 lines.
+- 2026-10-04: Extracted `checkNoProgress()` (32 lines — tiered no-progress detector: digest tracking, hard-stop at 5x, block at 4x) from the inline block in run() into a private method on Agent. Returns `'break' | 'continue' | 'pass'` discriminated union; caller maps to `break`/`continue`. `tsc --noEmit` clean. agent.ts now 17,424 lines.
+- 2026-10-04: Extracted `interceptLargeFileRead` (40 lines — intercepts large shell_read results and replaces with focused grep of exception/error blocks) from the inline block in run() into a private async method on Agent. Returns the (possibly modified) toolResult. `tsc --noEmit` clean. agent.ts now 17,455 lines.
+- 2026-10-04: Extracted `truncateToolResult` (61 lines — shared tool-result truncation: merge-mode line cap, directory-listing cap, head+tail char cap) from two near-duplicate inline blocks in agent.ts (text-mode ~34 lines, native-mode ~33 lines) into `src/agentLoop.ts`. Both call sites now use a single `truncateToolResult()` call with per-mode options. `tsc --noEmit` clean. agent.ts now 17,412 lines.
+- 2026-10-03: Extracted `toolCallDigest` (5 lines — SHA-256 digest of tool name + args for no-progress detection) and `stableStringify` (13 lines — recursive key-sorting for canonical JSON) from agent.ts into `src/agentLoop.ts`. Added `crypto` import. `tsc --noEmit` clean. agent.ts now 17,389 lines.
 - 2026-09-28: Extracted the parallel read-only batch result-processing loop (~50 lines) from run() into private method `processParallelBatchResults(parallelCalls, settled, post): { attempted, succeeded }`. Applies post-hook middleware, updates the per-path re-read tracker, pushes tool-result messages to history + UI; caller folds returned counts into `batchToolsAttempted`/`batchToolsSucceeded`. `tsc --noEmit` clean.
 - 2026-09-28: Extracted the auto-compact block (~79 lines) from run() into private method `handleAutoCompact(contextStats, cfg, systemContent, memoryContext, model, turn, post): Promise<'continue'|'stop'|'break'>`. Maps the inline `return`→`'stop'` and `break`→`'break'` exit paths. `tsc --noEmit` clean.
 - 2026-09-26: Extracted 5 pure helpers from run() into `src/agentLoop.ts`: `stripXmlArtifacts`, `normalizeArgVal`, `filePathInMsg`, `extractKeywords`, `generateBranchSlug`. Also hardened `provider.ts` compactContext guard (`_running` held across LLM await, Trust/Yolo auto-resume). Committed as 606f8ee. `tsc --noEmit` clean.
@@ -54,7 +68,7 @@ for exact line numbers and prerequisites.
 ## Next action (item 11 — agentLoop.ts)
 **Done so far (2026-09-26):** 5 pure string/keyword helpers now live in `agentLoop.ts` (`stripXmlArtifacts`, `normalizeArgVal`, `filePathInMsg`, `extractKeywords`, `generateBranchSlug`). The full loop-body → `executeTurn()` extraction (~4,900 lines, HIGH risk) is still outstanding and needs a fresh session with full context budget (~100k+ tokens). Prerequisites: `TurnContext` type (~15 locals), `LoopResult` discriminated union, all `break`→`return {kind:'stop'}`, all `continue`→`return {kind:'continue'}`. See `plans/run-decomposition.md` for details.
 
-**Recommended next step (smaller, single-session):** Continue extracting self-contained I/O-heavy blocks from within the loop body one at a time. Done so far: auto-compact section (`handleAutoCompact`) and the parallel read-only batch result-processing loop (`processParallelBatchResults`). Next: the stream-filter section, then the sequential tool-dispatch result handling. Each is 50–200 lines; verify with `tsc --noEmit` after each.
+**Recommended next step (smaller, single-session):** Continue extracting self-contained I/O-heavy blocks from within the loop body one at a time. Done so far: auto-compact section (`handleAutoCompact`), the parallel read-only batch result-processing loop (`processParallelBatchResults`), the stream-filter section (`StreamFilter` class in `agentLoop.ts`), the collapsed-JSON arg recovery (`repairCollapsedArgs` in `agentLoop.ts`), the verify-command mapping (`getVerifyCommand` in `agentLoop.ts`), the no-progress detector (`checkNoProgress`), the SSH inline guard (`checkSshInlineGuard`), the corrupted-file detection (`detectCorruptedFile`), and the stub-HTML detection (`detectStubHtml`). Next: the soft-failure taxonomy block (~80+ lines, line ~7350), the form-task hint nudge (~13 lines), or the intercept-large-file-read block (~40 lines). Each is 13–200 lines; verify with `tsc --noEmit` after each.
 
 **2026-10-02 — Pre-beta readiness review (completed):**
 - No personal data (IPs, paths, usernames) in `src/` — all `192.168.1.100` hits are placeholder examples in docs/config.
