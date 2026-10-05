@@ -54,6 +54,21 @@ const contextUsageEl   = /** @type {HTMLSpanElement}   */ (document.getElementBy
 const compactBtnFooter = /** @type {HTMLButtonElement}  */ (document.getElementById('compact-btn-footer'));
 const settingsBtn      = /** @type {HTMLButtonElement}  */ (document.getElementById('settings-btn'));
 
+/** Workspace name indicator — injected into the status bar so the user always knows
+ *  which project the agent is pointed at. Created lazily on first call. */
+function setWorkspaceName(name) {
+    let el = document.getElementById('workspace-name');
+    if (!el) {
+        el = document.createElement('span');
+        el.id = 'workspace-name';
+        el.style.cssText = 'font-size:10px;opacity:0.55;margin-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px;vertical-align:middle;';
+        // Insert after statusText in the status bar
+        statusText?.parentElement?.insertBefore(el, statusText.nextSibling);
+    }
+    el.textContent = name ? `📁 ${name}` : '';
+    el.title = name ? `Workspace: ${name}` : '';
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /** @type {HTMLDivElement | null} */
@@ -3428,6 +3443,7 @@ const msgHandlers = {
 
     models: (msg) => {
         populateModels(msg.models, msg.connected, msg.defaultModel);
+        if (msg.workspaceName) { setWorkspaceName(msg.workspaceName); }
     },
 
     streamStart: (msg) => {
@@ -3511,7 +3527,7 @@ const msgHandlers = {
     toolCall: (msg) => {
         // If a waiting bubble exists with no content yet, remove it — tool cards replace it.
         // We re-add a "still working" stub after the tool card so the user can see activity.
-        if (currentMsgEl && !currentRaw) { currentMsgEl.remove(); currentMsgEl = null; }
+        if (currentMsgEl && !currentRaw) { currentMsgEl.remove(); currentMsgEl = null; currentRaw = ''; }
         addToolCard(msg.id, msg.name, msg.args);
         // Show tool name in status bar so the user always sees what the agent is doing,
         // even when the model emits no narration text before the tool call.
@@ -3568,6 +3584,7 @@ const msgHandlers = {
     clearChat: (msg) => {
         clearChat();
         activeSessionId = null; // reset until sessionLoaded or sessionSaved arrives
+        if (msg.workspaceName) { setWorkspaceName(msg.workspaceName); }
         // Clear the input box and input history state when switching tabs
         promptEl.value = '';
         autoResize();
@@ -3673,6 +3690,10 @@ const msgHandlers = {
             agentActive = true;
             stopBtn.classList.add('visible');
             setStreaming(false); // show stop btn but don't animate send btn (we're not streaming right now)
+            // Always reset thinking state on tab switch — inThinkingBlock from the previous
+            // tab would route tokens to the wrong panel if liveBuffer is empty/absent.
+            inThinkingBlock = false;
+            thinkingBuf = '';
             // Show a subtle status line so user knows agent is between turns (not stuck)
             setStatus('running', 'Agent working in background…');
             // Reattach the in-progress assistant bubble so the user sees the

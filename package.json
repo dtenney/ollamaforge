@@ -64,7 +64,7 @@
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^2.32.0",
-    "better-sqlite3": "^13.0.2",
+    "better-sqlite3": "^13.0.3",
     "esbuild": "^0.28.2",
     "highlight.js": "^11.11.1",
     "mocha": "^10.3.0",

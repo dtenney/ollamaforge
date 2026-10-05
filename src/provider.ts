@@ -502,7 +502,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                 this._fileIndex = [];
 
                 const post = (m: object) => this._view?.webview.postMessage(m);
-                post({ type: 'clearChat' });
+                const wsName2 = vscode.workspace.workspaceFolders?.[0]?.name ?? '';
+                post({ type: 'clearChat', workspaceName: wsName2 });
                 post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
                 logInfo(`[provider] Workspace changed — all tabs reset to new root`);
             } finally {
@@ -592,7 +593,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                 // ── Model discovery ───────────────────────────────────────
                 case 'getModels': {
                     const models = await fetchModels();
-                    post({ type: 'models', models, connected: models.length > 0, defaultModel: getConfig().model });
+                    const wsName = vscode.workspace.workspaceFolders?.[0]?.name ?? '';
+                    post({ type: 'models', models, connected: models.length > 0, defaultModel: getConfig().model, workspaceName: wsName });
                     // Webview is now ready — restore session if there are messages.
                     // This fires every time the webview re-initializes (restart, sidebar re-open),
                     // ensuring the chat is never blank even if the initial setTimeout fires too early.
@@ -1174,6 +1176,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         }
                         // Guard: stopGeneration may have already set running=false and sent agentDone.
                         // Avoid duplicate agentDone which confuses the webview spinner.
+                        this._running = false; // Always clear — set at line 807, not cleared elsewhere in this path
                         const wasRunning = runTab.running;
                         runTab.running = false;
                         if (wasRunning) {

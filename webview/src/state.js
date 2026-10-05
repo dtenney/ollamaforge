@@ -53,6 +53,21 @@ const contextUsageEl   = /** @type {HTMLSpanElement}   */ (document.getElementBy
 const compactBtnFooter = /** @type {HTMLButtonElement}  */ (document.getElementById('compact-btn-footer'));
 const settingsBtn      = /** @type {HTMLButtonElement}  */ (document.getElementById('settings-btn'));
 
+/** Workspace name indicator — injected into the status bar so the user always knows
+ *  which project the agent is pointed at. Created lazily on first call. */
+function setWorkspaceName(name) {
+    let el = document.getElementById('workspace-name');
+    if (!el) {
+        el = document.createElement('span');
+        el.id = 'workspace-name';
+        el.style.cssText = 'font-size:10px;opacity:0.55;margin-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px;vertical-align:middle;';
+        // Insert after statusText in the status bar
+        statusText?.parentElement?.insertBefore(el, statusText.nextSibling);
+    }
+    el.textContent = name ? `📁 ${name}` : '';
+    el.title = name ? `Workspace: ${name}` : '';
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /** @type {HTMLDivElement | null} */
