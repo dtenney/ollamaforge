@@ -3254,8 +3254,15 @@ export class Agent {
         // doesn't have to figure out the path or resort to grepping.
         if (!preProcessedContext && !this._editContextInjected) {
             const readFileMatch = userMessage.match(/\bread\s+([\w\\/.\-]+\.\w+)\b/i);
-            if (readFileMatch) {
-                const rawPath = readFileMatch[1].replace(/\\/g, path.sep);
+            // Factual check: short message (< 120 chars) that names a specific file and asks
+            // a status/contains/check question — pre-read so the answer is grounded in real content,
+            // not model memory. Example: "The plans folder should be in gitignore"
+            const factualFileMatch = !readFileMatch && userMessage.length < 120
+                && /\b(?:in|inside|on|does|is|has|have|check|contain|include|show|what(?:'s| is)|already|exist|missing|added|listed|should)\b/i.test(userMessage)
+                && userMessage.match(/([\w.\-]+\.(?:gitignore|gitattributes|env|json|yaml|yml|toml|md|txt|cfg|conf|ini|lock|sh|ts|js|py))\b/i);
+            const fileMatchSource = readFileMatch ?? factualFileMatch;
+            if (fileMatchSource) {
+                const rawPath = fileMatchSource[1].replace(/\\/g, path.sep);
                 // Try workspace-relative first, then absolute
                 const candidates = [
                     path.join(this.workspaceRoot, rawPath),
@@ -3271,7 +3278,7 @@ export class Agent {
                                 role: 'user',
                                 content: userMessage + injection,
                             };
-                            logInfo(`[pre-read] Injected ${content.length} chars from ${relPath}`);
+                            logInfo(`[pre-read] Injected ${content.length} chars from ${relPath} (${readFileMatch ? 'explicit' : 'factual-check'})`);
                             break;
                         }
                     } catch { /* skip */ }
