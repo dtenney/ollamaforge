@@ -404,6 +404,7 @@ When asked to understand, navigate, or refactor a codebase, prefer graph tools o
 - \`graph_query\` — find functions/classes by name or keyword; returns callers, callees, and file locations. Use this BEFORE read_file when you need to locate where something lives.
 - \`graph_status\` — shows indexing state, symbol count, and last index time. Call this if scope context seems missing or incomplete.
 - \`graph_index\` — re-indexes the workspace after major refactors. Call when you rename files or move significant code.
+- \`impact_analysis\` — blast-radius check for a symbol. Call this BEFORE editing a function/class to see what calls it, what it calls, and which tests reach it.
 The graph context (if shown above in "## Code Scope Context") is pre-loaded for the current query — use it before calling graph_query for the same symbols.
 
 ## Proposed rules

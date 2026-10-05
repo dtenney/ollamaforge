@@ -799,6 +799,21 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
             parameters: { type: 'object', properties: {}, required: [] },
         },
     },
+    {
+        type: 'function',
+        function: {
+            name: 'impact_analysis',
+            description: 'Blast-radius analysis for a symbol. Given a function/class/method name, returns what calls it (callers), what it calls (callees), the distinct files touched, and any test files that reach it. Use this BEFORE editing a symbol to understand what your change will affect.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    symbol: { type: 'string', description: 'Name of the function, class, or method to analyze.' },
+                    depth: { type: 'number', description: 'Optional: how many hops to walk (default 2). Higher = wider but noisier.' },
+                },
+                required: ['symbol'],
+            },
+        },
+    },
 ];
 
 
@@ -831,6 +846,7 @@ export const TOOL_CONTEXT_COST: Record<string, ToolContextCost> = {
     search_files: 'low',
     find_files: 'low',
     graph_query: 'low',
+    impact_analysis: 'low',
     get_diagnostics: 'low',
     memory_search: 'low',
     memory_list: 'low',
@@ -1964,6 +1980,9 @@ export class Agent {
     } | null = null;
 
     private _codeGraph: CodeGraph | null = null;
+
+    /** Public accessor for the structural code graph (null if native modules unavailable). */
+    get codeGraph(): CodeGraph | null { return this._codeGraph; }
 
     constructor(
         private workspaceRoot: string,
@@ -5662,6 +5681,15 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
 
                 if (this.checkReadSaturation(isLegitimateStop, post)) {
                     continue;
+                }
+
+                // ── Legitimate stop with tool calls ────────────────────────────────────
+                // The model called tools this turn then stated completion (isLegitimateStop).
+                // Without this break, the loop falls through and re-runs, causing the agent
+                // to keep re-verifying the same "nothing left to do" conclusion every turn.
+                if (isLegitimateStop && toolCalls.length > 0) {
+                    logInfo(`[agent] isLegitimateStop + toolCalls (${toolCalls.length}) — breaking loop`);
+                    break;
                 }
 
                 // ── Stall handler ──────────────────────────────────────────────────────
@@ -13017,6 +13045,50 @@ ${sampleHtml}
                     ? new Date(stats.indexedAt).toLocaleString()
                     : 'never';
                 return `Code Graph Status:\n- Symbols: ${stats.nodes}\n- Files: ${stats.files}\n- Last indexed: ${indexedAt}${driftStr}`;
+            }
+
+            case 'impact_analysis': {
+                const cg = this._codeGraph;
+                if (!cg || !cg.isReady()) {
+                    return 'Code graph is not available. Run graph_index first to build the symbol graph.';
+                }
+                const symbol = String(args.symbol ?? '').trim();
+                if (!symbol) return 'impact_analysis requires a symbol name.';
+                const depth = args.depth ? Math.max(1, Math.min(5, Number(args.depth))) : 2;
+                const result = cg.impactAnalysis(symbol, depth);
+                if (!result) {
+                    return `No symbol matching "${symbol}" found in the code graph. Try a different name or run graph_index to refresh.`;
+                }
+                const lines: string[] = [];
+                lines.push(`## Impact Analysis: ${result.symbol.kind} ${result.symbol.name}`);
+                lines.push(`Location: ${result.symbol.file}:${result.symbol.startLine}–${result.symbol.endLine}`);
+                lines.push(`Depth: ${result.depth} hop(s)`);
+                lines.push('');
+                if (result.callers.length > 0) {
+                    lines.push(`**Callers (${result.callers.length}):**`);
+                    for (const c of result.callers.slice(0, 15)) {
+                        lines.push(`  - ${c.name} — ${c.file}:${c.startLine}`);
+                    }
+                    if (result.callers.length > 15) lines.push(`  … and ${result.callers.length - 15} more`);
+                } else {
+                    lines.push('**Callers:** none found');
+                }
+                lines.push('');
+                if (result.callees.length > 0) {
+                    lines.push(`**Callees (${result.callees.length}):**`);
+                    for (const c of result.callees.slice(0, 15)) {
+                        lines.push(`  - ${c.name} — ${c.file}:${c.startLine}`);
+                    }
+                    if (result.callees.length > 15) lines.push(`  … and ${result.callees.length - 15} more`);
+                } else {
+                    lines.push('**Callees:** none found');
+                }
+                lines.push('');
+                lines.push(`**Files touched (${result.files.length}):** ${result.files.join(', ')}`);
+                if (result.tests.length > 0) {
+                    lines.push(`**Tests reaching this symbol:** ${result.tests.join(', ')}`);
+                }
+                return lines.join('\n');
             }
 
             default:

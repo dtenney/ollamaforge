@@ -763,6 +763,21 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
             parameters: { type: 'object', properties: {}, required: [] },
         },
     },
+    {
+        type: 'function',
+        function: {
+            name: 'impact_analysis',
+            description: 'Blast-radius analysis for a symbol. Given a function/class/method name, returns what calls it (callers), what it calls (callees), the distinct files touched, and any test files that reach it. Use this BEFORE editing a symbol to understand what your change will affect.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    symbol: { type: 'string', description: 'Name of the function, class, or method to analyze.' },
+                    depth: { type: 'number', description: 'Optional: how many hops to walk (default 2). Higher = wider but noisier.' },
+                },
+                required: ['symbol'],
+            },
+        },
+    },
 ];
 
 

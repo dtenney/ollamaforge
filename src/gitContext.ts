@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { logInfo, logWarn, toErrorMessage } from './logger';
+import type { CodeGraph } from './codeGraph';
 
 const execFileAsync = promisify(execFile);
 
@@ -148,6 +149,131 @@ export async function getGitDiffForRange(root: string, commitRange: string): Pro
     } catch {
         return null;
     }
+}
+
+// ── Entity-level diff ─────────────────────────────────────────────────────────
+
+export interface EntityDiffEntry {
+    file: string;
+    entity: string;
+    kind: string;
+    startLine: number;
+    endLine: number;
+    changedLines: number;
+}
+
+/**
+ * Parse a unified diff and map changed line ranges to codeGraph symbols.
+ * Returns a list of entities (functions/classes/methods) that were touched.
+ * Falls back gracefully if codeGraph is unavailable.
+ */
+export async function getEntityDiff(root: string, codeGraph?: CodeGraph | null): Promise<EntityDiffEntry[]> {
+    if (!isGitRepo(root)) return [];
+    const opts = { cwd: root, timeout: GIT_TIMEOUT_MS };
+
+    let diff = '';
+    try {
+        const [staged, unstaged] = await Promise.all([
+            execAsync('git diff --cached', opts).then((r) => r.stdout).catch(() => ''),
+            execAsync('git diff',          opts).then((r) => r.stdout).catch(() => ''),
+        ]);
+        diff = (staged + unstaged).trim();
+    } catch { return []; }
+    if (!diff) return [];
+
+    // Parse diff hunks: extract file → changed line ranges
+    const fileRanges = new Map<string, Array<[number, number]>>();
+    let currentFile = '';
+    let newLine = 0;
+
+    for (const line of diff.split('\n')) {
+        if (line.startsWith('+++ b/')) {
+            currentFile = line.slice(6).trim();
+            continue;
+        }
+        if (line.startsWith('@@')) {
+            // @@ -oldStart,oldCount +newStart,newCount @@
+            const m = line.match(/\+(\d+)(?:,(\d+))?/);
+            if (m) {
+                newLine = parseInt(m[1], 10);
+                const count = m[2] ? parseInt(m[2], 10) : 1;
+                if (!fileRanges.has(currentFile)) fileRanges.set(currentFile, []);
+                fileRanges.get(currentFile)!.push([newLine, newLine + count]);
+            }
+            continue;
+        }
+        if (line.startsWith('+') && !line.startsWith('+++')) {
+            newLine++;
+        } else if (line.startsWith('-') && !line.startsWith('---')) {
+            // deletion — don't advance newLine
+        } else if (!line.startsWith('\\')) {
+            newLine++;
+        }
+    }
+
+    // If no codeGraph, return file-level summary
+    if (!codeGraph || !codeGraph.isReady()) {
+        return Array.from(fileRanges.entries()).map(([file, ranges]) => ({
+            file,
+            entity: '(file-level)',
+            kind: 'file',
+            startLine: ranges[0]?.[0] ?? 0,
+            endLine: ranges[ranges.length - 1]?.[1] ?? 0,
+            changedLines: ranges.reduce((s, r) => s + (r[1] - r[0]), 0),
+        }));
+    }
+
+    // Map to codeGraph symbols
+    const results: EntityDiffEntry[] = [];
+    for (const [file, ranges] of fileRanges) {
+        const relPath = path.isAbsolute(file) ? path.relative(root, file) : file;
+        const absPath = path.isAbsolute(file) ? file : path.join(root, file);
+        try {
+            // Query the graph for symbols in this file
+            const symbols = codeGraph.getSymbolsForFile(absPath);
+            for (const sym of symbols) {
+                // Check if any changed range overlaps this symbol
+                const overlaps = ranges.some(([start, end]) =>
+                    start <= sym.endLine && end >= sym.startLine
+                );
+                if (overlaps) {
+                    const changedInSymbol = ranges.reduce((s, [start, end]) => {
+                        const overlapStart = Math.max(start, sym.startLine);
+                        const overlapEnd = Math.min(end, sym.endLine);
+                        return s + Math.max(0, overlapEnd - overlapStart);
+                    }, 0);
+                    results.push({
+                        file: relPath,
+                        entity: sym.name,
+                        kind: sym.kind,
+                        startLine: sym.startLine,
+                        endLine: sym.endLine,
+                        changedLines: changedInSymbol,
+                    });
+                }
+            }
+        } catch { /* skip file */ }
+    }
+
+    return results.sort((a, b) => b.changedLines - a.changedLines);
+}
+
+/**
+ * Build a human-readable entity-level diff summary for prompt injection.
+ * Returns empty string if no changes or codeGraph unavailable.
+ */
+export async function buildEntityDiffContext(root: string, codeGraph?: CodeGraph | null): Promise<string> {
+    const entities = await getEntityDiff(root, codeGraph);
+    if (entities.length === 0) return '';
+
+    const lines: string[] = ['\n\n<entity-diff>'];
+    lines.push(`**Changed entities (${entities.length}):**`);
+    for (const e of entities.slice(0, 20)) {
+        lines.push(`  - ${e.kind} \`${e.entity}\` — ${e.file}:${e.startLine}–${e.endLine} (${e.changedLines} lines changed)`);
+    }
+    if (entities.length > 20) lines.push(`  … and ${entities.length - 20} more`);
+    lines.push('</entity-diff>');
+    return lines.join('\n');
 }
 
 // ── Smart diff relevance ──────────────────────────────────────────────────────

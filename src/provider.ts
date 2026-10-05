@@ -9,7 +9,7 @@ import { logInfo, logWarn, logError, channel, toErrorMessage } from './logger';
 import { ChatStorage, ChatSession, StoredMessage, deriveTitle, relativeTime, PendingResume } from './chatStorage';
 import { appendSessionLog, appendSessionLogMd } from './sessionLog';
 import { indexWorkspaceFiles, fuzzySearchFiles, buildMentionContext } from './mentions';
-import { buildGitDiffContext } from './gitContext';
+import { buildGitDiffContext, buildEntityDiffContext } from './gitContext';
 import { TieredMemoryManager } from './memoryCore';
 import { CodeIndexer } from './codeIndex';
 import { TemplateManager } from './promptTemplates';
@@ -892,9 +892,16 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             return sc;
                         })(),
 
-                        // Git diff context
+                        // Git diff context (raw diff + entity-level blast radius)
                         cfg.injectGitDiff && this._currentWorkspaceRoot
-                            ? buildGitDiffContext(this._currentWorkspaceRoot, text)
+                            ? (async (): Promise<string> => {
+                                const root = this._currentWorkspaceRoot!;
+                                const diffCtx = await buildGitDiffContext(root, text);
+                                if (!diffCtx) { return ''; }
+                                // Append entity-level diff (maps changed lines to symbols) when the graph is ready
+                                const entityCtx = await buildEntityDiffContext(root, this._agent?.codeGraph ?? null);
+                                return diffCtx + entityCtx;
+                            })()
                             : Promise.resolve(''),
                     ]);
                     const smartCtx = smartCtxResult;

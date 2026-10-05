@@ -1142,6 +1142,143 @@ export class CodeGraph {
         }
     }
 
+    /**
+     * Get all indexed symbols in a specific file (by relative or absolute path).
+     * Returns name, kind, startLine, endLine for each.
+     */
+    getSymbolsForFile(filePath: string): Array<{ name: string; kind: string; startLine: number; endLine: number }> {
+        if (!this.ready) return [];
+        try {
+            // Try both relative and absolute path forms
+            const rel = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
+            const abs = path.resolve(filePath);
+            const rows = this.db.prepare(`
+                SELECT name, kind, start_line, end_line FROM nodes
+                WHERE file = ? OR file = ?
+                ORDER BY start_line
+            `).all(rel, abs) as any[];
+            return rows.map(r => ({ name: r.name, kind: r.kind, startLine: r.start_line, endLine: r.end_line }));
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Impact analysis / blast radius for a symbol.
+     *
+     * Given a symbol name (or query), finds the best-matching node and walks
+     * the edge graph transitively to report:
+     *   - callers   — symbols that call/reference it (direct + transitive)
+     *   - callees   — symbols it calls/uses (direct + transitive)
+     *   - files     — distinct files touched by the impact set
+     *   - tests     — files under a test-like path that reach the symbol
+     *
+     * Depth is bounded (default 2 hops) to keep output small and fast.
+     * Returns null if the graph is unavailable or no matching symbol is found.
+     */
+    impactAnalysis(query: string, maxDepth = 2): {
+        symbol: { name: string; kind: string; file: string; startLine: number; endLine: number };
+        callers: Array<{ name: string; file: string; startLine: number }>;
+        callees: Array<{ name: string; file: string; startLine: number }>;
+        files: string[];
+        tests: string[];
+        depth: number;
+    } | null {
+        if (!this.ready) return null;
+
+        // 1. Find the best-matching node
+        const scored = this._queryAndScore(query, 5);
+        if (scored.length === 0) return null;
+        const target = scored[0];
+
+        const rel = (f: string) => path.relative(this.workspaceRoot, f).replace(/\\/g, '/');
+        const isTestFile = (f: string) =>
+            /(^|\/)(test|tests|__tests__|spec|specs)\//.test(f) ||
+            /\.(test|spec)\.[a-z]+$/.test(f) ||
+            /(^|\/)test_[^/]+$/.test(f) ||
+            /_test\.[a-z]+$/.test(f);
+
+        const callers: Array<{ name: string; file: string; startLine: number }> = [];
+        const callees: Array<{ name: string; file: string; startLine: number }> = [];
+        const callerSeen = new Set<string>();
+        const calleeSeen = new Set<string>();
+        const fileSet = new Set<string>();
+        const testSet = new Set<string>();
+
+        const targetRel = rel(target.file);
+        fileSet.add(targetRel);
+        if (isTestFile(target.file)) testSet.add(targetRel);
+
+        // 2. Walk edges transitively up to maxDepth
+        let callerFrontier = [target.id];
+        let calleeFrontier = [target.id];
+
+        for (let depth = 0; depth < maxDepth; depth++) {
+            // Callers: edges where dst is in frontier (something calls them)
+            const nextCallers: string[] = [];
+            for (const id of callerFrontier) {
+                try {
+                    const rows = this.db.prepare(`
+                        SELECT n.id, n.name, n.file, n.start_line
+                        FROM edges e
+                        JOIN nodes n ON n.id = e.src
+                        WHERE e.dst = ? AND e.kind IN ('calls','imports','contains','extends')
+                        LIMIT 20
+                    `).all(id);
+                    for (const r of rows) {
+                        if (r.id === target.id || callerSeen.has(r.id)) continue;
+                        callerSeen.add(r.id);
+                        callers.push({ name: r.name, file: rel(r.file), startLine: r.start_line });
+                        fileSet.add(rel(r.file));
+                        if (isTestFile(r.file)) testSet.add(rel(r.file));
+                        nextCallers.push(r.id);
+                    }
+                } catch { /* ignore */ }
+            }
+            callerFrontier = nextCallers;
+            if (callerFrontier.length === 0) break;
+
+            // Callees: edges where src is in frontier (they call something)
+            const nextCallees: string[] = [];
+            for (const id of calleeFrontier) {
+                try {
+                    const rows = this.db.prepare(`
+                        SELECT n.id, n.name, n.file, n.start_line
+                        FROM edges e
+                        JOIN nodes n ON n.id = e.dst
+                        WHERE e.src = ? AND e.kind IN ('calls','imports','contains','extends')
+                        LIMIT 20
+                    `).all(id);
+                    for (const r of rows) {
+                        if (r.id === target.id || calleeSeen.has(r.id)) continue;
+                        calleeSeen.add(r.id);
+                        callees.push({ name: r.name, file: rel(r.file), startLine: r.start_line });
+                        fileSet.add(rel(r.file));
+                        if (isTestFile(r.file)) testSet.add(rel(r.file));
+                        nextCallees.push(r.id);
+                    }
+                } catch { /* ignore */ }
+            }
+            calleeFrontier = nextCallees;
+            if (calleeFrontier.length === 0) break;
+        }
+
+        return {
+            symbol: {
+                name: target.name,
+                kind: target.kind,
+                file: targetRel,
+                startLine: target.start_line,
+                endLine: target.end_line,
+            },
+            callers,
+            callees,
+            files: Array.from(fileSet).sort(),
+            tests: Array.from(testSet).sort(),
+            depth: maxDepth,
+        };
+    }
+
     /** Get graph stats for display */
     getStats(): { nodes: number; files: number; indexedAt: number | null } {
         if (!this.ready) return { nodes: 0, files: 0, indexedAt: null };
