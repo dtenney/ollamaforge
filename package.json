@@ -587,6 +587,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "axios": "^1.13.6"
+    "axios": "^1.20.0"
   }
 }
