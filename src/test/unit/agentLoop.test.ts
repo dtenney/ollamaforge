@@ -29,7 +29,7 @@ describe('agentLoop', () => {
     // ─── stripXmlArtifacts ───────────────────────────────────────────────
     describe('stripXmlArtifacts', () => {
         it('removes  blocks', () => {
-            const input = 'Hello <tool_response>\n{"name": "read_file"}\n</tool_call> world';
+            const input = 'Hello <tool_response>\n{"name": "read_file"}\n</tool_response> world';
             assert.strictEqual(stripXmlArtifacts(input), 'Hello  world');
         });
 
@@ -38,17 +38,17 @@ describe('agentLoop', () => {
         });
 
         it('removes  blocks', () => {
-            const input = 'x  function name="foo"  end';
+            const input = 'x <function_calls> function name="foo" </function_calls> end';
             assert.strictEqual(stripXmlArtifacts(input), 'x  end');
         });
 
         it('removes  blocks', () => {
-            const input = 'a  name="x"  b';
-            assert.strictEqual(stripXmlArtifacts(input), 'a  b');
+            const input = 'a <invoke name="x"> b</invoke>';
+            assert.strictEqual(stripXmlArtifacts(input), 'a ');
         });
 
         it('removes  blocks', () => {
-            const input = 'a  param="v"  b';
+            const input = 'a <parameter name="v">content</parameter> b';
             assert.strictEqual(stripXmlArtifacts(input), 'a  b');
         });
 
@@ -463,7 +463,7 @@ describe('agentLoop', () => {
 
         it('does not abort for normal varied content', () => {
             const sf = new StreamFilter();
-            const content = 'The quick brown fox jumps over the lazy dog. '.repeat(50);
+            const content = Array.from({ length: 50 }, (_, i) => `Sentence number ${i} talks about topic ${i % 7} with unique detail ${i * 31}`).join('\n');
             sf.filter(content);
             assert.strictEqual(sf.aborted, false);
         });
@@ -625,7 +625,7 @@ describe('agentLoop', () => {
         });
 
         it('applies merge-mode line cap for shell_read', () => {
-            const lines = Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n');
+            const lines = Array.from({ length: 200 }, (_, i) => `line ${i} ${'x'.repeat(30)}`).join('\n');
             const result = truncateToolResult(lines, 'shell_read', 'cat file.txt', {
                 ...baseOpts, mergeMode: true, mergeMaxLines: 50,
             });
@@ -634,7 +634,7 @@ describe('agentLoop', () => {
         });
 
         it('applies listing cap for ls output', () => {
-            const items = Array.from({ length: 80 }, (_, i) => `file_${i}.txt`).join('\n');
+            const items = Array.from({ length: 80 }, (_, i) => `file_${i}.txt ${'x'.repeat(30)}`).join('\n');
             const result = truncateToolResult(items, 'shell_read', 'ls -la', {
                 ...baseOpts, listingSuffix: ' (use find for details)',
             });

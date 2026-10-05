@@ -33,6 +33,8 @@ export function stripXmlArtifacts(s: string): string {
     return s
         .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
         .replace(/<\/?tool_call>/g, '')
+        .replace(/<tool_response>[\s\S]*?<\/tool_response>/g, '')
+        .replace(/<\/?tool_response>/g, '')
         .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
         .replace(/<\/?function_calls>/g, '')
         .replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/g, '')
@@ -140,8 +142,9 @@ export function isFilePath(l: string): boolean {
  * and literal dots. Used for file-extension and path matching.
  */
 export function globToRegex(g: string): RegExp {
+    const DBL = '\x00DBL\x00';
     return new RegExp(
-        '^' + g.replace(/\./g, '\\.').replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*').replace(/\?/g, '.') + '$'
+        '^' + g.replace(/\./g, '\\.').replace(/\*\*/g, DBL).replace(/\*/g, '[^/]*').replace(new RegExp(DBL, 'g'), '.*').replace(/\?/g, '.') + '$'
     );
 }
 
@@ -263,9 +266,8 @@ export class StreamFilter {
         // Process complete lines
         const parts = this._streamLineBuf.split('\n');
         this._streamLineBuf = parts.pop() ?? '';
-        const filtered = parts.map(filterCompleteLine);
-        const out = filtered.join('\n');
-        return out || (parts.length > 0 ? '\n' : '');
+        const filtered = parts.map(filterCompleteLine).filter(l => l !== '');
+        return filtered.join('\n');
     }
 
     /**
@@ -295,7 +297,9 @@ export class StreamFilter {
         if (this._spiralBuf.length < 2000) { return false; }
 
         // Throttle: run expensive checks only every SPIRAL_CHECK_INTERVAL tokens.
-        if ((++this._spiralCheckCounter % this.SPIRAL_CHECK_INTERVAL) !== 0) { return false; }
+        this._spiralCheckCounter += text.length;
+        if (this._spiralCheckCounter < this.SPIRAL_CHECK_INTERVAL) { return false; }
+        this._spiralCheckCounter = 0;
 
         // Check for inline repetition only in the tail -- avoids false-positives on
         // tool-result data echoed near the start of the response.

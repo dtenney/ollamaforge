@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as http from 'http';
 import * as https from 'https';
-import * as crypto from 'crypto';
+// crypto import removed — toolCallDigest/stableStringify now imported from './agentLoop'
 import { spawn, execSync, execFileSync } from 'child_process';
 
 import { streamChatRequest, OllamaMessage, OllamaToolCall, StreamResult, ToolsNotSupportedError, setContextWarnPostFn } from './ollamaClient';
@@ -33,7 +33,7 @@ import { evaluateGate } from './core/consistencyGate';
 import { repairToolJson, fixRawNewlinesInJson, extractEditFileArgs, extractJsonStringValue } from './agentToolJsonRepair';
 import { ShellEnvironment, FilePlan, detectShellEnvironment, buildShellExamples, buildTextModeShellExamples, stripSelectStringPrefixes, extractDocVerificationHints } from './agentShellEnv';
 import { buildSystemPrompt, buildSystemPromptAsync, buildSmallModelSystemPrompt, buildTextModeInstructions, buildSmallModelTextModeInstructions, buildToolBiasNote, snapshotContextFileMtimes, loadHierarchicalContext, buildProjectTypeGuidance, buildProjectTypeGuidanceAsync } from './agentPromptBuilder';
-import { stripXmlArtifacts as _stripXmlArtifacts, normalizeArgVal as _normalizeArgVal, filePathInMsg as _filePathInMsg, filterCompleteLine as _filterCompleteLine, isPlanningLine as _isPlanningLine, escHtml as _escHtml, looksLikePath as _looksLikePath, normalizePath as _normalizePath, requiredParams as _requiredParams, isAbsPath as _isAbsPath, isFilePath as _isFilePath, globToRegex as _globToRegex, globToRegexDeep as _globToRegexDeep, extractKeywords as _extractKeywords, generateBranchSlug as _generateBranchSlug, levenshtein} from './agentLoop';
+import { stripXmlArtifacts as _stripXmlArtifacts, normalizeArgVal as _normalizeArgVal, filePathInMsg as _filePathInMsg, filterCompleteLine as _filterCompleteLine, isPlanningLine as _isPlanningLine, escHtml as _escHtml, looksLikePath as _looksLikePath, normalizePath as _normalizePath, requiredParams as _requiredParams, isAbsPath as _isAbsPath, isFilePath as _isFilePath, globToRegex as _globToRegex, globToRegexDeep as _globToRegexDeep, extractKeywords as _extractKeywords, generateBranchSlug as _generateBranchSlug, levenshtein, toolCallDigest, stableStringify} from './agentLoop';
 import { safePath as _safePath, resolvePathWithPolicy as _resolvePathWithPolicy, isOsProtectedPath as _isOsProtectedPath } from './pathPolicy';
 import { writePlanFile as _writePlanFile, updatePlanFile as _updatePlanFile, closePlanFile as _closePlanFile } from './planFile';
 
@@ -859,32 +859,7 @@ export const TOOL_CONTEXT_COST: Record<string, ToolContextCost> = {
 // now live in ./agentToolJsonRepair (imported above).
 
 
-/**
- * Canonical digest of a tool call (name + args) for no-progress detection.
- * Steal from row-bot (agent_budget.py): hash a stable JSON serialization of
- * (tool_name, args) so that repeated identical calls can be counted.
- */
-function toolCallDigest(name: string, args: Record<string, unknown>): string {
-    // Sort keys for a stable canonical form regardless of insertion order.
-    const canonical = JSON.stringify({ name, args: stableStringify(args) });
-    return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
-}
-
-/** Recursively sort object keys so JSON.stringify is order-independent. */
-function stableStringify(value: unknown): unknown {
-    if (Array.isArray(value)) {
-        return value.map(stableStringify);
-    }
-    if (value && typeof value === 'object') {
-        const obj = value as Record<string, unknown>;
-        const sorted: Record<string, unknown> = {};
-        for (const k of Object.keys(obj).sort()) {
-            sorted[k] = stableStringify(obj[k]);
-        }
-        return sorted;
-    }
-    return value;
-}
+// toolCallDigest and stableStringify are imported from './agentLoop' (line 36)
 
 
 /** Pre-compiled: JSON inside markdown code blocks — ```json\n{...}\n``` */
@@ -5610,79 +5585,10 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 //
                 // The read-saturation guard is kept separately because its action is unique:
                 // it injects actual file content so the model has what it needs to act.
-                const thinkingLen = (result.thinking ?? '').length;
+                const { thinkingLen, turnHasToolCall, turnHasText, turnHasThinkOnly, turnIsEmpty } = this.classifyTurnOutcome(toolCalls, displayContent, result.thinking);
 
-                // ── Classify turn outcome ──────────────────────────────────────────────
-                // What did the model actually produce this turn?
-                const turnHasToolCall   = toolCalls.length > 0;
-                const turnHasText       = displayContent.trim().length >= 20;
-                const turnHasThinkOnly  = !turnHasToolCall && !displayContent.trim() && thinkingLen > 0;
-                const turnIsEmpty       = !turnHasToolCall && !displayContent.trim() && thinkingLen === 0;
-
-                // ── Novelty fingerprint ────────────────────────────────────────────────
-                // Did this turn do anything new vs the last few turns?
-                // Fingerprint = tool name + normalized path/args + first 100 chars of output.
-                // Fires only when the same fingerprint appears 3+ times AND the tool results
-                // have been identical each time (no progress). If the model is retrying because
-                // the last attempt failed or returned different output, that's legitimate adaptation
-                // and we let it continue.
-                if (turnHasToolCall || displayContent.trim()) {
-                    const firstTool = toolCalls.length > 0 ? toolCalls[0] : null;
-                    const toolSig = firstTool
-                        ? `${firstTool.function.name}|${String(firstTool.function.arguments?.path ?? firstTool.function.arguments?.command ?? JSON.stringify(firstTool.function.arguments)).slice(0, 60).replace(/\d+/g, 'N')}`
-                        : '';
-                    // Text-only responses use 200 chars for better dedup signal.
-                    // Tool responses use 60 chars of args (already normalized above).
-                    const textSig = displayContent.trim().slice(0, !firstTool ? 200 : 100).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 |]/g, '');
-                    const fingerprint = `${toolSig}|${textSig}`;
-                    // Text-only substantial answers (re-answer loop) use threshold=2 —
-                    // the second time the model re-summarises the same answer without a tool call is a loop.
-                    const fpThreshold = (!firstTool && displayContent.trim().length > 300) ? 2 : _noveltyStallThreshold;
-                    if (fingerprint.replace(/[| ]/g, '').length > 8) {
-                        this._responseFingerprints.push(fingerprint);
-                        if (this._responseFingerprints.length > 20) { this._responseFingerprints.shift(); }
-                        const fpCount = this._responseFingerprints.filter(f => f === fingerprint).length;
-                        if (fpCount >= fpThreshold && this.autoRetryCount < this.effectiveMaxRetries) {
-                            // Before flagging as a loop, check whether the tool results for this
-                            // repeated action have been changing. If the last tool result differs
-                            // from the one before it, the model is adapting to feedback — not looping.
-                            // Compare the last two tool/user result messages in history for this tool.
-                            const toolName = firstTool?.function.name ?? '';
-                            const recentResults = this.history
-                                .filter(m => (m.role === 'tool' || (m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('Tool '))))
-                                .slice(-6)
-                                .map(m => String(m.content).slice(0, 200));
-                            // If the last two results are different, the situation is changing — allow retry.
-                            const lastResult  = recentResults[recentResults.length - 1] ?? '';
-                            const prevResult  = recentResults[recentResults.length - 2] ?? '';
-                            const resultsChanging = lastResult !== prevResult && lastResult.length > 0 && prevResult.length > 0;
-                            // Also allow retry if the most recent result indicates failure/error —
-                            // the model is legitimately trying to recover from a transient error.
-                            const lastResultIsError = /error|failed|not found|no such|permission denied|timed? ?out|cannot|could not|invalid/i.test(lastResult)
-                                && !/error|failed|not found/i.test(prevResult); // only if it newly failed
-                            // Skip novelty stall for conversational / greeting responses —
-                            // the model correctly answers "hi" with "Hi! How can I help?" every
-                            // time, which looks like a loop but is a legitimate stop.
-                            const isConversationalReply = !firstTool
-                                && displayContent.trim().length < 120
-                                && /\?\s*$/.test(displayContent.trim())
-                                && !/\b(?:let me|i will|i'll|i should|i need to)\b/i.test(displayContent);
-                            if (resultsChanging || lastResultIsError || isConversationalReply) {
-                                logInfo(`[agent] Novelty fingerprint matched ${fpCount}x but results are changing or conversational (resultsChanging=${resultsChanging}, newError=${lastResultIsError}, conversational=${isConversationalReply}) — allowing retry`);
-                            } else {
-                                this.autoRetryCount++;
-                                logWarn(`[agent] Novelty stall: fingerprint matched ${fpCount}x (threshold=${_noveltyStallThreshold}) with no progress (turn=${turn}, tool=${toolName || 'text'})`);
-                                this.history.pop();
-                                const toolCallHint = isTextMode ? ' Output ONLY a <tool> block now — no explanation, no narration.' : ' Call the tool now — do not describe what you are going to do.';
-                                const noveltyNudge = toolName
-                                    ? `[SYSTEM: You have repeated the same action (${toolName}) ${fpCount} times and the result is not changing. Take a DIFFERENT approach — if you have been reading the same file, use write_file or edit_file NOW. If a command keeps failing, try a different approach or tell the user what is blocking you. One different action — do it now.]`
-                                    : `[SYSTEM: You have described the same plan ${fpCount} times without calling any tool. STOP describing and ACT. Call the tool that makes the change RIGHT NOW.${toolCallHint}]`;
-                                this.history.push({ role: 'user', content: noveltyNudge });
-                                post({ type: 'removeLastAssistant' });
-                                continue;
-                            }
-                        }
-                    }
+                if (this.checkNoveltyFingerprint(toolCalls, displayContent, turn, isTextMode, post, _noveltyStallThreshold)) {
+                    continue;
                 }
 
                 // ── Shared locals used by the guards below ─────────────────────────────
@@ -5736,168 +5642,25 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // until the "stalled N times" threshold fires on a healthy conversation.
                 if (isLegitimateStop) { this.autoRetryCount = 0; }
 
-                // ── Trust/yolo permission-seeking intercept ────────────────────────────
-                // In trust/yolo mode, if the agent ended its response with a permission-seeking
-                // question ("want me to take X next?", "shall I proceed with Y?") OR a
-                // phase-handoff phrase ("say the word and I'll start Phase 3"), intercept
-                // and force it to continue to the next phase immediately.
-                if (endsWithPermissionQuestion || endsWithPhaseHandoff) {
-                    const toolCallHint2 = isTextMode ? ' Output only a <tool> block.' : ' Call the next tool now.';
-                    const nudge = endsWithPhaseHandoff
-                        ? `[SYSTEM: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT wait for the user to say "the word" or give permission — proceed immediately to the next phase/step now.${toolCallHint2}]`
-                        : `[SYSTEM: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission or offer a choice — pick the next logical action and do it immediately.${toolCallHint2}]`;
-                    this.history.pop();
-                    this.history.push({ role: 'user', content: nudge });
-                    post({ type: 'removeLastAssistant' });
+                if (this.interceptPermissionSeeking(endsWithPermissionQuestion, endsWithPhaseHandoff, isTextMode, post)) {
                     continue;
                 }
 
-                // ── Tracking-document check ────────────────────────────────────────────
-                // If the model is about to declare completion (hasCompletionLanguage) but
-                // the user's task references a tracking/progress document that hasn't been
-                // read this turn, inject a nudge to read it first.
-                // Only fires once per run to avoid a read-doc spiral.
-                if (isLegitimateStop && hasCompletionLanguage && !isUserDismissal
-                    && !this._trackingDocCheckedThisRun) {
-                    // Look for a tracking doc reference in the user's original task message
-                    const taskMsg = (this._originalTaskMessage || this._currentTaskMessage || '').toLowerCase();
-                    const trackingDocMatch = taskMsg.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i)
-                        ?? this.lastUserMessage?.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i);
-                    const trackingDoc = trackingDocMatch?.[1];
-                    if (trackingDoc) {
-                        const trackingDocAbs = path.join(this.workspaceRoot, trackingDoc);
-                        const openItems = this.countTrackingDocOpenItems(trackingDocAbs);
-                        if (openItems) {
-                            // Hard gate: unchecked items remain — suppress "done" and force action.
-                            this._trackingDocCheckedThisRun = true;
-                            const relDoc = path.relative(this.workspaceRoot, trackingDocAbs).replace(/\\/g, '/');
-                            logInfo(`[agent] DONE GATE: completion declared but tracking doc "${relDoc}" has ${openItems.length} unchecked item(s) — blocking stop`);
-                            const itemLines = openItems.slice(0, 15).map(i => `  - [ ] ${i}`).join('\n');
-                            const moreNote = openItems.length > 15 ? `\n  …and ${openItems.length - 15} more` : '';
-                            this.history.pop();
-                            this.history.push({ role: 'user', content: `[system: DONE GATE — you declared completion, but the tracking document "${relDoc}" still has ${openItems.length} unchecked item(s). You may NOT stop yet. Either (a) continue working on the remaining items, or (b) if they are out of scope for this request, explicitly list each one and state why it is being deferred. Remaining items:\n${itemLines}${moreNote}]` });
-                            post({ type: 'removeLastAssistant' });
-                            continue;
-                        }
-                    }
+                if (this.checkTrackingDoc(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post)) {
+                    continue;
                 }
 
-                // ── Plan file: completion guard ──────────────────────────────────────
-                // The agent created its own plan file (plans/<slug>.md) for this task.
-                // If it declares completion while that plan still has unchecked steps,
-                // block the stop — a model that wrote a checklist must not claim "done"
-                // with items still open. Only fires once per run to prevent a nudge spiral.
-                if (isLegitimateStop && hasCompletionLanguage
-                    && !isUserDismissal && this._activePlanFile && !this._planStopGuardFiredThisRun) {
-                    const planOpen = this.countTrackingDocOpenItems(this._activePlanFile);
-                    if (planOpen) {
-                        this._planStopGuardFiredThisRun = true;
-                        const relPlan = path.relative(this.workspaceRoot, this._activePlanFile).replace(/\\/g, '/');
-                        logInfo(`[plan] DONE GATE: completion declared but plan file "${relPlan}" has ${planOpen.length} unchecked step(s) — blocking stop`);
-                        const planLines = planOpen.slice(0, 15).map(i => `  - [ ] ${i}`).join('\n');
-                        const planMore = planOpen.length > 15 ? `\n  …and ${planOpen.length - 15} more` : '';
-                        this.history.pop();
-                        this.history.push({ role: 'user', content: `[system: DONE GATE — you declared completion, but your own plan file "${relPlan}" still has ${planOpen.length} unchecked step(s). You may NOT stop yet. Either (a) continue working on the remaining steps, or (b) if they are out of scope for this request, explicitly list each one and state why it is being deferred. Remaining steps:\n${planLines}${planMore}]` });
-                        post({ type: 'removeLastAssistant' });
-                        continue;
-                    }
+                if (this.checkPlanFileCompletion(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post)) {
+                    continue;
                 }
 
-                // ── Project file: update-before-stop guard ────────────────────────────
-                // When a PROJECT.md is active and the agent is about to stop, require it
-                // to tick off completed items and stamp the next-action line before finishing.
-                // Only fires once per run to prevent a loop, and only on completion stops.
-                if (isLegitimateStop && hasCompletionLanguage && !isUserDismissal
-                    && this._activeProjectFile && !this._projectStopGuardFiredThisRun) {
-                    const openItems = this.readProjectOpenItems();
-                    if (openItems) {
-                        // There are still open items — nudge the agent to check them
-                        this._projectStopGuardFiredThisRun = true;
-                        const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
-                        logInfo(`[project] Completion declared with open project items — injecting project check nudge`);
-                        this.history.pop();
-                        this.history.push({ role: 'user', content: `[SYSTEM: Before stopping, read ${relPf} with read_file. Check which items you completed this session and tick them off with edit_file (change "- [ ]" to "- [x]"). Also update the "Next action" line to describe what should happen next session. Then continue any remaining unchecked items if they are in scope for this request.]` });
-                        post({ type: 'removeLastAssistant' });
-                        continue;
-                    } else {
-                        // All items checked — just stamp the timestamp and next-action
-                        this._projectStopGuardFiredThisRun = true;
-                        this.stampProjectFile('(all items complete — see Notes for follow-up)');
-                    }
+                this.checkProjectFileUpdate(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post);
+
+                if (this.runSelfEvaluation(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post)) {
+                    continue;
                 }
 
-                // ── Self-evaluation loop ───────────────────────────────────────────────
-                // When the agent declares completion after editing TS/JS files, auto-run
-                // get_diagnostics and feed back any NEW errors before allowing the stop.
-                // Gated on: ollamaForge.autoVerifyOnComplete setting (opt-in), having
-                // changed files, and only fires once per run to avoid a diagnostics spiral.
-                const autoVerifyEnabled = vscode.workspace.getConfiguration('ollamaForge')
-                    .get<boolean>('autoVerifyOnComplete', false);
-                if (autoVerifyEnabled
-                    && isLegitimateStop && hasCompletionLanguage
-                    && !isUserDismissal && !this._autoVerifyFiredThisRun
-                    && this._filesChangedThisRun.length > 0) {
-                    const verifiableFiles = this._filesChangedThisRun
-                        .filter(f => /\.(ts|tsx|js|jsx)$/i.test(f));
-                    if (verifiableFiles.length > 0) {
-                        this._autoVerifyFiredThisRun = true;
-                        // Run diagnostics on each changed file; collect errors only
-                        const diagParts: string[] = [];
-                        for (const rel of verifiableFiles.slice(0, 5)) {
-                            try {
-                                const diagResult = this.getDiagnostics(this.workspaceRoot, rel);
-                                // Only surface actual errors (skip "No diagnostics" and warning-only results)
-                                if (diagResult && /error/i.test(diagResult) && !/no (errors|diagnostics)/i.test(diagResult)) {
-                                    diagParts.push(`**${rel}:**\n${diagResult}`);
-                                }
-                            } catch { /* skip */ }
-                        }
-                        if (diagParts.length > 0) {
-                            logInfo(`[auto-verify] Errors found in ${diagParts.length} file(s) — injecting feedback`);
-                            this.history.pop();
-                            this.history.push({ role: 'user', content: `[SYSTEM: Auto-verification found errors in files you just edited. Fix all errors before declaring done.\n\n${diagParts.join('\n\n')}]` });
-                            post({ type: 'removeLastAssistant' });
-                            continue;
-                        } else {
-                            logInfo(`[auto-verify] No errors found in ${verifiableFiles.length} changed file(s) — stop approved`);
-                        }
-                    }
-                }
-
-                // ── Read-saturation guard ──────────────────────────────────────────────
-                // Model keeps reading without acting. Action is unique here: we inject the
-                // actual file content so it has what it needs and has no reason to re-read.
-                const readSpiralThresholdEarly =
-                    this._taskPhase === 'acting'    ? 3 :
-                    this._taskPhase === 'verifying' ? 5 : 8; // research: 10→6→8 (64K); verifying: 5→4→5 (64K)
-                if (this._readOnlyTurnsSinceLastEdit >= readSpiralThresholdEarly
-                    && this.autoRetryCount < this.effectiveMaxRetries
-                    && !isLegitimateStop) {
-                    this.autoRetryCount++;
-                    logInfo(`[agent] Read saturation: ${this._readOnlyTurnsSinceLastEdit} read-only turns (phase=${this._taskPhase}, edits=${this._editsThisRun})`);
-                    this.history.pop();
-                    let fileInject = '';
-                    if (this._taskPhase === 'acting' && this._lastReadFilePath) {
-                        try {
-                            const absPath = path.isAbsolute(this._lastReadFilePath)
-                                ? this._lastReadFilePath
-                                : path.join(this.workspaceRoot, this._lastReadFilePath);
-                            const raw = fs.readFileSync(absPath, 'utf8');
-                            const lines = raw.split('\n');
-                            const MAX_INJECT = 200;
-                            const numbered = lines.slice(0, MAX_INJECT).map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
-                            const rel = path.relative(this.workspaceRoot, absPath).replace(/\\/g, '/');
-                            const truncNote = lines.length > MAX_INJECT ? `\n... (${lines.length - MAX_INJECT} more lines)` : '';
-                            fileInject = `\n\nCURRENT FILE CONTENT (${rel}, ${lines.length} lines):\n${numbered}${truncNote}\n\nCall write_file with path="${rel}" to apply your changes. Do NOT call read_file again.`;
-                        } catch { /* ignore */ }
-                    }
-                    const readNudge = this._taskPhase === 'acting'
-                        ? `[SYSTEM: You have read ${this._readOnlyTurnsSinceLastEdit} times without making changes. The file content is below — use write_file or edit_file NOW. Do NOT read again.]${fileInject}`
-                        : this._taskPhase === 'verifying'
-                        ? `[SYSTEM: You have verified ${this._readOnlyTurnsSinceLastEdit} times without finding anything to fix. Verification is DONE. Write your summary to the user now and STOP. Do NOT read any more files.]`
-                        : `[SYSTEM: You have read ${this._readOnlyTurnsSinceLastEdit} files without acting. You have enough context. Call write_file, edit_file, or run_command — or write your final answer. Do NOT read more files.]`;
-                    this.history.push({ role: 'user', content: readNudge });
-                    post({ type: 'removeLastAssistant' });
+                if (this.checkReadSaturation(isLegitimateStop, post)) {
                     continue;
                 }
 
@@ -5905,30 +5668,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // THINK_ONLY: model thought but emitted nothing.
                 // EMPTY: nothing at all.
                 // In both cases: no progress was made. Nudge the model to act.
-                if ((turnHasThinkOnly || turnIsEmpty) && this.autoRetryCount < this.effectiveMaxRetries) {
-                    this.autoRetryCount++;
-                    // Stalls (think-only / empty) do NOT count against _consecutiveAborts — that
-                    // counter is reserved for mid-stream spiral aborts and model self-stops which
-                    // are actively dangerous. Stalls just need a nudge and are already capped by
-                    // autoRetryCount / effectiveMaxRetries.
-                    this._readOnlyTurnsSinceLastEdit++;
-                    logWarn(`[agent] Stall (${turnIsEmpty ? 'empty' : 'think-only'}, thinking=${thinkingLen}ch, turn=${turn}, retry=${this.autoRetryCount}, aborts=${this._consecutiveAborts})`);
-                    this.history.pop();
-                    const toolCallHint = isTextMode
-                        ? ' Your response must contain ONLY a <tool>{"name":"...","arguments":{...}}</tool> block — no prose, no thinking tags, nothing else.'
-                        : ' Call the tool now.';
-                    // If there's thinking content, extract the plan the model described so we can echo it back
-                    // and make the nudge concrete ("we saw your plan, now execute it").
-                    const thinkSnippet = turnHasThinkOnly
-                        ? (result.thinking ?? '').trim().split('\n').filter(l => l.trim().length > 10).slice(-2).join(' ').slice(0, 200)
-                        : '';
-                    const stallNudge = this.autoRetryCount >= 3
-                        ? `[SYSTEM: You have stalled ${this.autoRetryCount} times. Your thinking is correct but you are not producing any output. STOP all thinking. Your ENTIRE response must be one tool call in this exact format: <tool>{"name":"TOOLNAME","arguments":{...}}</tool>]`
-                        : thinkSnippet
-                        ? `[SYSTEM: You thought "${thinkSnippet.slice(0, 120)}" but produced no output and called no tools. Output ONLY: <tool>{"name":"TOOLNAME","arguments":{...}}</tool>]`
-                        : `[SYSTEM: Your last response was empty.${toolCallHint}]`;
-                    this.history.push({ role: 'user', content: stallNudge });
-                    post({ type: 'removeLastAssistant' });
+                if (this.handleStall(turnHasThinkOnly, turnIsEmpty, thinkingLen, turn, isTextMode, result.thinking, post)) {
                     continue;
                 }
 
@@ -6001,90 +5741,10 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     const toolCallHint = isTextMode ? ' Output only a <tool> block, nothing else.' : ' Call the tool now.';
 
                     // ── No-tool nudge ─────────────────────────────────────────────────────
-                    // Two cases get specialised messages because they require a specific format fix:
-                    //   1. Fenced tool call — model used ``` instead of <tool>
-                    //   2. Small-model edit context — file content is pre-loaded, just needs the tool call
-                    // Everything else gets one generic nudge + an optional one-line hint.
-                    const hasFencedToolCall = /```[\s\S]*?\b(edit_file|edit_file_at_line|shell_read|run_command|write_file|find_files|search_files)\b[\s\S]*?```/.test(resp);
-
-                    // Classify the failure to pick a short hint (not a full custom message).
-                    // Order matters: first match wins.
-                    type NudgeReason = 'fenced' | 'fabricating-blocker' | 'deflecting' | 'task-lost' | 'permission-seeking' | 'giving-instructions' | 'planning-loop' | 'no-tool';
-                    const _taskReminder = (this._originalTaskMessage || this._currentTaskMessage || '').slice(0, 200);
-                    let nudgeReason: NudgeReason = 'no-tool';
-                    let nudgeHint = '';
-                    if (hasFencedToolCall) {
-                        nudgeReason = 'fenced';
-                    } else if (/\b(firewall|network (issue|block|restrict|problem)|can'?t reach|cannot reach|unable to (connect|reach|access)|connection (refused|blocked|timed out)|no route to host|ssh.*block|blocked by|not accessible|unreachable|vpn required|permission denied)\b/i.test(resp)
-                        && !/the tool returned|error:|exit (code|status) [1-9]|timed out after|failed with/i.test(resp)) {
-                        nudgeReason = 'fabricating-blocker';
-                        nudgeHint = ' You claimed a blocker without running a tool to verify it. Run ssh/ping/curl to check first.';
-                    } else if (/please provide|provide the (contents|file|code|text)|share the (contents|file|code)|paste the|send me the|provide me with/i.test(resp)) {
-                        nudgeReason = 'deflecting';
-                        nudgeHint = ' Use shell_read or read_file to read the file yourself — do not ask the user.';
-                    } else if (/\b(what would you like (me to|to)|what('d| would) you like|what (should|shall) (i|we) (do|work on|tackle|start|focus)|where (should|shall) (i|we) (start|begin|focus)|how (can|may) i help|what (would you like|do you want) me to (work on|do|tackle|fix|start|focus)|anything (else|specific) you'?d? like)/i.test(resp)
-                        && /\?/.test(resp.slice(-200))) {
-                        nudgeReason = 'task-lost';
-                        nudgeHint = _taskReminder ? ` Your task: "${_taskReminder}". Continue it — do not ask what to do.` : ' You are mid-task — do not ask what to do, continue working.';
-                    } else if ((this.trustLevel === 'trust' || this.trustLevel === 'yolo')
-                        && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|ok(ay)? (if|to)|shall we|should we|can i go ahead)\b/i.test(resp)
-                        && /\?/.test(resp.slice(-120))) {
-                        nudgeReason = 'permission-seeking';
-                        nudgeHint = ` You are in ${this.trustLevel.toUpperCase()} mode — do not ask for permission, just do it.`;
-                    } else if (/\b(you (should|can|could|need to|must)|you('ll| will) (need|want|have) to)\b.{0,120}\b(run|execute|call|use|add|create|install|edit|update|write|configure)\b/i.test(resp)
-                        || /\b(run (the following|this (command|script|code))|execute (the following|this)|use the following (command|code|script))\b/i.test(resp)
-                        || (/\b(here('s| is) (the|a) (command|script|code|solution|fix))\b/i.test(resp) && /```/.test(resp))) {
-                        nudgeReason = 'giving-instructions';
-                        nudgeHint = ' You gave instructions instead of executing them. Call the tool yourself.';
-                    } else if (isPlanningNarration && this.autoRetryCount >= 2) {
-                        nudgeReason = 'planning-loop';
-                        const fileMatch = resp.match(/\b([\w./\\-]+\.(?:scad|py|ts|js|json|yaml|yml|sh|txt|md|toml|cfg|conf|env))\b/i);
-                        const filePath = fileMatch ? fileMatch[1] : '';
-                        const toolName = /revert|undo|change back|restore|reset/i.test(resp) ? 'edit_file' :
-                                         /read|look|check|view|see/i.test(resp) ? 'shell_read' : 'edit_file';
-                        const exampleArg = filePath
-                            ? (toolName === 'shell_read' ? `{"command": "cat '${filePath}'"}`
-                                : `{"path": "${filePath}", "old_string": "EXACT_OLD_TEXT", "new_string": "NEW_TEXT"}`)
-                            : '{"path": "FILE_PATH", "old_string": "EXACT_OLD_TEXT", "new_string": "NEW_TEXT"}';
-                        nudgeHint = ` You keep describing what to do but are not doing it. Call ${toolName} RIGHT NOW:\n<tool>{"name": "${toolName}", "arguments": ${exampleArg}}</tool>\nReplace EXACT_OLD_TEXT with the actual current text. Output ONLY the <tool> block.`;
+                    if (this.handleNoTool(resp, isTextMode, isPlanningNarration, turn, post)) {
+                        continue;
                     }
 
-                    // Escalation suffix for repeated no-tool turns
-                    const escalationSuffix = nudgeReason === 'planning-loop' ? '' // hint already specific
-                        : this.autoRetryCount >= 4
-                        ? ` YOU HAVE BEEN TOLD ${this.autoRetryCount} TIMES. Output ONLY the tool call — nothing else.`
-                        : this.autoRetryCount >= 2
-                        ? ` You have described your plan ${this.autoRetryCount} times. Stop describing — output the tool call now.`
-                        : '';
-
-                    // Build the single nudge message
-                    const nudgeContent = hasFencedToolCall
-                        ? '[SYSTEM: You wrote a tool call inside a code block (```). That does NOT execute the tool. Output a raw <tool>{"name":"...","arguments":{...}}</tool> XML block — no backticks, no fences. Output ONLY the <tool> block now.]'
-                        : (this._isSmallModel && this._editContextInjected)
-                        ? '[SYSTEM: The file content is in [PRE-LOADED CONTEXT] above. Call edit_file_at_line NOW with the line numbers shown. Output ONLY the <tool> block.]'
-                        : `[SYSTEM: No tool was called and the task is not done.${nudgeHint} Call the next tool NOW.${toolCallHint}${escalationSuffix}]`;
-
-                    logInfo(`[agent] No-tool nudge (reason=${nudgeReason}, turn=${turn}, retry=${this.autoRetryCount})`);
-
-                    // Keep the response visible if it looks like a real answer (substantial text, not
-                    // a mid-task artifact). Remove it if it's planning narration, a fenced tool call,
-                    // or any other mid-task non-answer.
-                    const looksLikeRealAnswer = resp.trim().length > 80
-                        && !isPlanningNarration
-                        && !hasFencedToolCall
-                        && nudgeReason !== 'deflecting'
-                        && nudgeReason !== 'giving-instructions'
-                        && nudgeReason !== 'planning-loop';
-                    if (looksLikeRealAnswer) {
-                        // Keep the assistant message visible; push nudge as next user turn.
-                        this.history.push({ role: 'user', content: nudgeContent });
-                    } else {
-                        // Remove the unhelpful partial response and replace with nudge.
-                        this.history.pop();
-                        this.history.push({ role: 'user', content: nudgeContent });
-                        post({ type: 'removeLastAssistant' });
-                    }
-                    continue;
                 }
 
                 // â"€â"€ Silent-stall escape hatch â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -8999,6 +8659,415 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
      * The critic sees only the diff (removed/added lines), not the whole file,
      * to keep the call fast and focused.
      */
+    /**
+     * Stall handler: model thought but emitted nothing (think-only) or produced
+     * no output at all (empty). Nudge the model to act.
+     * Returns true if the caller should `continue` the loop (nudge was issued),
+     * false if the stall condition was not met (retry cap reached or not a stall).
+     */
+    private handleStall(
+        turnHasThinkOnly: boolean,
+        turnIsEmpty: boolean,
+        thinkingLen: number,
+        turn: number,
+        isTextMode: boolean,
+        thinking: string | undefined,
+        post: PostFn
+    ): boolean {
+        if (!((turnHasThinkOnly || turnIsEmpty) && this.autoRetryCount < this.effectiveMaxRetries)) {
+            return false;
+        }
+        this.autoRetryCount++;
+        // Stalls (think-only / empty) do NOT count against _consecutiveAborts — that
+        // counter is reserved for mid-stream spiral aborts and model self-stops which
+        // are actively dangerous. Stalls just need a nudge and are already capped by
+        // autoRetryCount / effectiveMaxRetries.
+        this._readOnlyTurnsSinceLastEdit++;
+        logWarn(`[agent] Stall (${turnIsEmpty ? 'empty' : 'think-only'}, thinking=${thinkingLen}ch, turn=${turn}, retry=${this.autoRetryCount}, aborts=${this._consecutiveAborts})`);
+        this.history.pop();
+        const toolCallHint = isTextMode
+            ? ' Your response must contain ONLY a <tool>{"name":"...","arguments":{...}}</tool> block — no prose, no thinking tags, nothing else.'
+            : ' Call the tool now.';
+        // If there's thinking content, extract the plan the model described so we can echo it back
+        // and make the nudge concrete ("we saw your plan, now execute it").
+        const thinkSnippet = turnHasThinkOnly
+            ? (thinking ?? '').trim().split('\n').filter(l => l.trim().length > 10).slice(-2).join(' ').slice(0, 200)
+            : '';
+        const stallNudge = this.autoRetryCount >= 3
+            ? `[system: You have stalled ${this.autoRetryCount} times. Your thinking is correct but you are not producing any output. STOP all thinking. Your ENTIRE response must be one tool call in this exact format: <tool>{"name":"TOOLNAME","arguments":{...}}</tool>]`
+            : thinkSnippet
+            ? `[system: You thought "${thinkSnippet.slice(0, 120)}" but produced no output and called no tools. Output ONLY: <tool>{"name":"TOOLNAME","arguments":{...}}</tool>]`
+            : `[system: Your last response was empty.${toolCallHint}]`;
+        this.history.push({ role: 'user', content: stallNudge });
+        post({ type: 'removeLastAssistant' });
+        return true;
+    }
+
+    /**
+     * Trust/yolo permission-seeking intercept: in trust/yolo mode, if the agent
+     * ended its response with a permission-seeking question or a phase-handoff
+     * phrase, intercept and force it to continue immediately.
+     * Returns true if the caller should `continue` the loop.
+     */
+    private interceptPermissionSeeking(
+        endsWithPermissionQuestion: boolean,
+        endsWithPhaseHandoff: boolean,
+        isTextMode: boolean,
+        post: PostFn
+    ): boolean {
+        if (!(endsWithPermissionQuestion || endsWithPhaseHandoff)) {
+            return false;
+        }
+        const toolCallHint2 = isTextMode ? ' Output only a <tool> block.' : ' Call the next tool now.';
+        const nudge = endsWithPhaseHandoff
+            ? `[system: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT wait for the user to say "the word" or give permission — proceed immediately to the next phase/step now.${toolCallHint2}]`
+            : `[system: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission or offer a choice — pick the next logical action and do it immediately.${toolCallHint2}]`;
+        this.history.pop();
+        this.history.push({ role: 'user', content: nudge });
+        post({ type: 'removeLastAssistant' });
+        return true;
+    }
+
+    /**
+     * Tracking-document check: if the model is about to declare completion but
+     * the user's task references a tracking/progress document that still has
+     * unchecked items, block the stop and force the model to address them.
+     * Only fires once per run to avoid a read-doc spiral.
+     * Returns true if the caller should `continue` the loop.
+     */
+    private checkTrackingDoc(
+        isLegitimateStop: boolean,
+        hasCompletionLanguage: boolean,
+        isUserDismissal: boolean,
+        post: PostFn
+    ): boolean {
+        if (!(isLegitimateStop && hasCompletionLanguage && !isUserDismissal && !this._trackingDocCheckedThisRun)) {
+            return false;
+        }
+        const taskMsg = (this._originalTaskMessage || this._currentTaskMessage || '').toLowerCase();
+        const trackingDocMatch = taskMsg.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i)
+            ?? this.lastUserMessage?.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i);
+        const trackingDoc = trackingDocMatch?.[1];
+        if (!trackingDoc) {
+            return false;
+        }
+        const trackingDocAbs = path.join(this.workspaceRoot, trackingDoc);
+        const openItems = this.countTrackingDocOpenItems(trackingDocAbs);
+        if (!openItems) {
+            return false;
+        }
+        this._trackingDocCheckedThisRun = true;
+        const relDoc = path.relative(this.workspaceRoot, trackingDocAbs).replace(/\\/g, '/');
+        logInfo(`[agent] DONE GATE: completion declared but tracking doc "${relDoc}" has ${openItems.length} unchecked item(s) — blocking stop`);
+        const itemLines = openItems.slice(0, 15).map(i => `  - [ ] ${i}`).join('\n');
+        const moreNote = openItems.length > 15 ? `\n  …and ${openItems.length - 15} more` : '';
+        this.history.pop();
+        this.history.push({ role: 'user', content: `[system: DONE GATE — you declared completion, but the tracking document "${relDoc}" still has ${openItems.length} unchecked item(s). You may NOT stop yet. Either (a) continue working on the remaining items, or (b) if they are out of scope for this request, explicitly list each one and state why it is being deferred. Remaining items:\n${itemLines}${moreNote}]` });
+        post({ type: 'removeLastAssistant' });
+        return true;
+    }
+
+    /**
+     * Plan-file completion guard: if the agent created its own plan file and
+     * declares completion while that plan still has unchecked steps, block the stop.
+     * Only fires once per run to prevent a nudge spiral.
+     * Returns true if the caller should `continue` the loop.
+     */
+    private checkPlanFileCompletion(
+        isLegitimateStop: boolean,
+        hasCompletionLanguage: boolean,
+        isUserDismissal: boolean,
+        post: PostFn
+    ): boolean {
+        if (!(isLegitimateStop && hasCompletionLanguage && !isUserDismissal && this._activePlanFile && !this._planStopGuardFiredThisRun)) {
+            return false;
+        }
+        const planOpen = this.countTrackingDocOpenItems(this._activePlanFile);
+        if (!planOpen) {
+            return false;
+        }
+        this._planStopGuardFiredThisRun = true;
+        const relPlan = path.relative(this.workspaceRoot, this._activePlanFile).replace(/\\/g, '/');
+        logInfo(`[plan] DONE GATE: completion declared but plan file "${relPlan}" has ${planOpen.length} unchecked step(s) — blocking stop`);
+        const planLines = planOpen.slice(0, 15).map(i => `  - [ ] ${i}`).join('\n');
+        const planMore = planOpen.length > 15 ? `\n  …and ${planOpen.length - 15} more` : '';
+        this.history.pop();
+        this.history.push({ role: 'user', content: `[system: DONE GATE — you declared completion, but your own plan file "${relPlan}" still has ${planOpen.length} unchecked step(s). You may NOT stop yet. Either (a) continue working on the remaining steps, or (b) if they are out of scope for this request, explicitly list each one and state why it is being deferred. Remaining steps:\n${planLines}${planMore}]` });
+        post({ type: 'removeLastAssistant' });
+        return true;
+    }
+
+    /**
+     * Project-file update-before-stop guard: when a PROJECT.md is active and the
+     * agent is about to stop, require it to tick off completed items and stamp
+     * the next-action line. If open items remain, inject a nudge and return true
+     * (caller should `continue`). If all items are checked, stamp the file.
+     * Only fires once per run to prevent a loop.
+     * Returns true if the caller should `continue` the loop.
+     */
+    private checkProjectFileUpdate(
+        isLegitimateStop: boolean,
+        hasCompletionLanguage: boolean,
+        isUserDismissal: boolean,
+        post: PostFn
+    ): boolean {
+        if (!(isLegitimateStop && hasCompletionLanguage && !isUserDismissal && this._activeProjectFile && !this._projectStopGuardFiredThisRun)) {
+            return false;
+        }
+        const openItems = this.readProjectOpenItems();
+        if (openItems) {
+            this._projectStopGuardFiredThisRun = true;
+            const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
+            logInfo(`[project] Completion declared with open project items — injecting project check nudge`);
+            this.history.pop();
+            this.history.push({ role: 'user', content: `[system: Before stopping, read ${relPf} with read_file. Check which items you completed this session and tick them off with edit_file (change "- [ ]" to "- [x]"). Also update the "Next action" line to describe what should happen next session. Then continue any remaining unchecked items if they are in scope for this request.]` });
+            post({ type: 'removeLastAssistant' });
+            return true;
+        } else {
+            this._projectStopGuardFiredThisRun = true;
+            this.stampProjectFile('(all items complete — see Notes for follow-up)');
+        }
+        return false;
+    }
+
+    private checkReadSaturation(
+        isLegitimateStop: boolean,
+        post: PostFn
+    ): boolean {
+        const readSpiralThresholdEarly =
+            this._taskPhase === 'acting'    ? 3 :
+            this._taskPhase === 'verifying' ? 5 : 8;
+        if (this._readOnlyTurnsSinceLastEdit >= readSpiralThresholdEarly
+            && this.autoRetryCount < this.effectiveMaxRetries
+            && !isLegitimateStop) {
+            this.autoRetryCount++;
+            logInfo(`[agent] Read saturation: ${this._readOnlyTurnsSinceLastEdit} read-only turns (phase=${this._taskPhase}, edits=${this._editsThisRun})`);
+            this.history.pop();
+            let fileInject = '';
+            if (this._taskPhase === 'acting' && this._lastReadFilePath) {
+                try {
+                    const absPath = path.isAbsolute(this._lastReadFilePath)
+                        ? this._lastReadFilePath
+                        : path.join(this.workspaceRoot, this._lastReadFilePath);
+                    const raw = fs.readFileSync(absPath, 'utf8');
+                    const lines = raw.split('\n');
+                    const MAX_INJECT = 200;
+                    const numbered = lines.slice(0, MAX_INJECT).map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
+                    const rel = path.relative(this.workspaceRoot, absPath).replace(/\\/g, '/');
+                    const truncNote = lines.length > MAX_INJECT ? `\n... (${lines.length - MAX_INJECT} more lines)` : '';
+                    fileInject = `\n\nCURRENT FILE CONTENT (${rel}, ${lines.length} lines):\n${numbered}${truncNote}\n\nCall write_file with path="${rel}" to apply your changes. Do NOT call read_file again.`;
+                } catch { /* ignore */ }
+            }
+            const readNudge = this._taskPhase === 'acting'
+                ? `[system: You have read ${this._readOnlyTurnsSinceLastEdit} times without making changes. The file content is below — use write_file or edit_file NOW. Do NOT read again.]${fileInject}`
+                : this._taskPhase === 'verifying'
+                ? `[system: You have verified ${this._readOnlyTurnsSinceLastEdit} times without finding anything to fix. Verification is DONE. Write your summary to the user now and STOP. Do NOT read any more files.]`
+                : `[system: You have read ${this._readOnlyTurnsSinceLastEdit} files without acting. You have enough context. Call write_file, edit_file, or run_command — or write your final answer. Do NOT read more files.]`;
+            this.history.push({ role: 'user', content: readNudge });
+            post({ type: 'removeLastAssistant' });
+            return true;
+        }
+        return false;
+    }
+
+    private runSelfEvaluation(
+        isLegitimateStop: boolean,
+        hasCompletionLanguage: boolean,
+        isUserDismissal: boolean,
+        post: PostFn
+    ): boolean {
+        const autoVerifyEnabled = vscode.workspace.getConfiguration('ollamaForge')
+            .get<boolean>('autoVerifyOnComplete', false);
+        if (autoVerifyEnabled
+            && isLegitimateStop && hasCompletionLanguage
+            && !isUserDismissal && !this._autoVerifyFiredThisRun
+            && this._filesChangedThisRun.length > 0) {
+            const verifiableFiles = this._filesChangedThisRun
+                .filter(f => /\.(ts|tsx|js|jsx)$/i.test(f));
+            if (verifiableFiles.length > 0) {
+                this._autoVerifyFiredThisRun = true;
+                const diagParts: string[] = [];
+                for (const rel of verifiableFiles.slice(0, 5)) {
+                    try {
+                        const diagResult = this.getDiagnostics(this.workspaceRoot, rel);
+                        if (diagResult && /error/i.test(diagResult) && !/no (errors|diagnostics)/i.test(diagResult)) {
+                            diagParts.push(`**${rel}:**\n${diagResult}`);
+                        }
+                    } catch { /* skip */ }
+                }
+                if (diagParts.length > 0) {
+                    logInfo(`[auto-verify] Errors found in ${diagParts.length} file(s) — injecting feedback`);
+                    this.history.pop();
+                    this.history.push({ role: 'user', content: `[system: Auto-verification found errors in files you just edited. Fix all errors before declaring done.\n\n${diagParts.join('\n\n')}]` });
+                    post({ type: 'removeLastAssistant' });
+                    return true;
+                } else {
+                    logInfo(`[auto-verify] No errors found in ${verifiableFiles.length} changed file(s) — stop approved`);
+                }
+            }
+        }
+        return false;
+    }
+
+    private checkNoveltyFingerprint(
+        toolCalls: any[],
+        displayContent: string,
+        turn: number,
+        isTextMode: boolean,
+        post: PostFn,
+        noveltyStallThreshold: number
+    ): boolean {
+        if (!(toolCalls.length > 0 || displayContent.trim())) {
+            return false;
+        }
+        const firstTool = toolCalls.length > 0 ? toolCalls[0] : null;
+        const toolSig = firstTool
+            ? `${firstTool.function.name}|${String(firstTool.function.arguments?.path ?? firstTool.function.arguments?.command ?? JSON.stringify(firstTool.function.arguments)).slice(0, 60).replace(/\d+/g, 'N')}`
+            : '';
+        const textSig = displayContent.trim().slice(0, !firstTool ? 200 : 100).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 |]/g, '');
+        const fingerprint = `${toolSig}|${textSig}`;
+        const fpThreshold = (!firstTool && displayContent.trim().length > 300) ? 2 : noveltyStallThreshold;
+        if (fingerprint.replace(/[| ]/g, '').length > 8) {
+            this._responseFingerprints.push(fingerprint);
+            if (this._responseFingerprints.length > 20) { this._responseFingerprints.shift(); }
+            const fpCount = this._responseFingerprints.filter(f => f === fingerprint).length;
+            if (fpCount >= fpThreshold && this.autoRetryCount < this.effectiveMaxRetries) {
+                const toolName = firstTool?.function.name ?? '';
+                const recentResults = this.history
+                    .filter(m => (m.role === 'tool' || (m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('Tool '))))
+                    .slice(-6)
+                    .map(m => String(m.content).slice(0, 200));
+                const lastResult  = recentResults[recentResults.length - 1] ?? '';
+                const prevResult  = recentResults[recentResults.length - 2] ?? '';
+                const resultsChanging = lastResult !== prevResult && lastResult.length > 0 && prevResult.length > 0;
+                const lastResultIsError = /error|failed|not found|no such|permission denied|timed? ?out|cannot|could not|invalid/i.test(lastResult)
+                    && !/error|failed|not found/i.test(prevResult);
+                const isConversationalReply = !firstTool
+                    && displayContent.trim().length < 120
+                    && /\?\s*$/.test(displayContent.trim())
+                    && !/\b(?:let me|i will|i'll|i should|i need to)\b/i.test(displayContent);
+                if (resultsChanging || lastResultIsError || isConversationalReply) {
+                    logInfo(`[agent] Novelty fingerprint matched ${fpCount}x but results are changing or conversational (resultsChanging=${resultsChanging}, newError=${lastResultIsError}, conversational=${isConversationalReply}) — allowing retry`);
+                } else {
+                    this.autoRetryCount++;
+                    logWarn(`[agent] Novelty stall: fingerprint matched ${fpCount}x (threshold=${noveltyStallThreshold}) with no progress (turn=${turn}, tool=${toolName || 'text'})`);
+                    this.history.pop();
+                    const toolCallHint = isTextMode ? ' Output ONLY a <tool> block now — no explanation, no narration.' : ' Call the tool now — do not describe what you are going to do.';
+                    const noveltyNudge = toolName
+                        ? `[system: You have repeated the same action (${toolName}) ${fpCount} times and the result is not changing. Take a DIFFERENT approach — if you have been reading the same file, use write_file or edit_file NOW. If a command keeps failing, try a different approach or tell the user what is blocking you. One different action — do it now.]`
+                        : `[system: You have described the same plan ${fpCount} times without calling any tool. STOP describing and ACT. Call the tool that makes the change RIGHT NOW.${toolCallHint}]`;
+                    this.history.push({ role: 'user', content: noveltyNudge });
+                    post({ type: 'removeLastAssistant' });
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private classifyTurnOutcome(
+        toolCalls: unknown[],
+        displayContent: string,
+        thinking: string | undefined
+    ): { thinkingLen: number; turnHasToolCall: boolean; turnHasText: boolean; turnHasThinkOnly: boolean; turnIsEmpty: boolean } {
+        const thinkingLen = (thinking ?? '').length;
+        const turnHasToolCall   = toolCalls.length > 0;
+        const turnHasText       = displayContent.trim().length >= 20;
+        const turnHasThinkOnly  = !turnHasToolCall && !displayContent.trim() && thinkingLen > 0;
+        const turnIsEmpty       = !turnHasToolCall && !displayContent.trim() && thinkingLen === 0;
+        return { thinkingLen, turnHasToolCall, turnHasText, turnHasThinkOnly, turnIsEmpty };
+    }
+
+    private handleNoTool(
+        resp: string,
+        isTextMode: boolean,
+        isPlanningNarration: boolean,
+        turn: number,
+        post: PostFn
+    ): boolean {
+        const toolCallHint = isTextMode ? ' Output only a <tool> block, nothing else.' : ' Call the tool now.';
+        const hasFencedToolCall = /```[\s\S]*?\b(edit_file|edit_file_at_line|shell_read|run_command|write_file|find_files|search_files)\b[\s\S]*?```/.test(resp);
+
+        // Classify the failure to pick a short hint (not a full custom message).
+        // Order matters: first match wins.
+        type NudgeReason = 'fenced' | 'fabricating-blocker' | 'deflecting' | 'task-lost' | 'permission-seeking' | 'giving-instructions' | 'planning-loop' | 'no-tool';
+        const _taskReminder = (this._originalTaskMessage || this._currentTaskMessage || '').slice(0, 200);
+        let nudgeReason: NudgeReason = 'no-tool';
+        let nudgeHint = '';
+        if (hasFencedToolCall) {
+            nudgeReason = 'fenced';
+        } else if (/\b(firewall|network (issue|block|restrict|problem)|can'?t reach|cannot reach|unable to (connect|reach|access)|connection (refused|blocked|timed out)|no route to host|ssh.*block|blocked by|not accessible|unreachable|vpn required|permission denied)\b/i.test(resp)
+            && !/the tool returned|error:|exit (code|status) [1-9]|timed out after|failed with/i.test(resp)) {
+            nudgeReason = 'fabricating-blocker';
+            nudgeHint = ' You claimed a blocker without running a tool to verify it. Run ssh/ping/curl to check first.';
+        } else if (/please provide|provide the (contents|file|code|text)|share the (contents|file|code)|paste the|send me the|provide me with/i.test(resp)) {
+            nudgeReason = 'deflecting';
+            nudgeHint = ' Use shell_read or read_file to read the file yourself — do not ask the user.';
+        } else if (/\b(what would you like (me to|to)|what('d| would) you like|what (should|shall) (i|we) (do|work on|tackle|start|focus)|where (should|shall) (i|we) (start|begin|focus)|how (can|may) i help|what (would you like|do you want) me to (work on|do|tackle|fix|start|focus)|anything (else|specific) you'?d? like)/i.test(resp)
+            && /\?/.test(resp.slice(-200))) {
+            nudgeReason = 'task-lost';
+            nudgeHint = _taskReminder ? ` Your task: "${_taskReminder}". Continue it — do not ask what to do.` : ' You are mid-task — do not ask what to do, continue working.';
+        } else if ((this.trustLevel === 'trust' || this.trustLevel === 'yolo')
+            && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|ok(ay)? (if|to)|shall we|should we|can i go ahead)\b/i.test(resp)
+            && /\?/.test(resp.slice(-120))) {
+            nudgeReason = 'permission-seeking';
+            nudgeHint = ` You are in ${this.trustLevel.toUpperCase()} mode — do not ask for permission, just do it.`;
+        } else if (/\b(you (should|can|could|need to|must)|you('ll| will) (need|want|have) to)\b.{0,120}\b(run|execute|call|use|add|create|install|edit|update|write|configure)\b/i.test(resp)
+            || /\b(run (the following|this (command|script|code))|execute (the following|this)|use the following (command|code|script))\b/i.test(resp)
+            || (/\b(here('s| is) (the|a) (command|script|code|solution|fix))\b/i.test(resp) && /```/.test(resp))) {
+            nudgeReason = 'giving-instructions';
+            nudgeHint = ' You gave instructions instead of executing them. Call the tool yourself.';
+        } else if (isPlanningNarration && this.autoRetryCount >= 2) {
+            nudgeReason = 'planning-loop';
+            const fileMatch = resp.match(/\b([\w./\\-]+\.(?:scad|py|ts|js|json|yaml|yml|sh|txt|md|toml|cfg|conf|env))\b/i);
+            const filePath = fileMatch ? fileMatch[1] : '';
+            const toolName = /revert|undo|change back|restore|reset/i.test(resp) ? 'edit_file' :
+                             /read|look|check|view|see/i.test(resp) ? 'shell_read' : 'edit_file';
+            const exampleArg = filePath
+                ? (toolName === 'shell_read' ? `{"command": "cat '${filePath}'"}`
+                    : `{"path": "${filePath}", "old_string": "EXACT_OLD_TEXT", "new_string": "NEW_TEXT"}`)
+                : '{"path": "FILE_PATH", "old_string": "EXACT_OLD_TEXT", "new_string": "NEW_TEXT"}';
+            nudgeHint = ` You keep describing what to do but are not doing it. Call ${toolName} RIGHT NOW:\n<tool>{"name": "${toolName}", "arguments": ${exampleArg}}</tool>\nReplace EXACT_OLD_TEXT with the actual current text. Output ONLY the <tool> block.`;
+        }
+
+        // Escalation suffix for repeated no-tool turns
+        const escalationSuffix = nudgeReason === 'planning-loop' ? '' // hint already specific
+            : this.autoRetryCount >= 4
+            ? ` YOU HAVE BEEN TOLD ${this.autoRetryCount} TIMES. Output ONLY the tool call — nothing else.`
+            : this.autoRetryCount >= 2
+            ? ` You have described your plan ${this.autoRetryCount} times. Stop describing — output the tool call now.`
+            : '';
+
+        // Build the single nudge message
+        const nudgeContent = hasFencedToolCall
+            ? '[system: You wrote a tool call inside a code block (```). That does NOT execute the tool. Output a raw <tool>{"name":"...","arguments":{...}}</tool> XML block — no backticks, no fences. Output ONLY the <tool> block now.]'
+            : (this._isSmallModel && this._editContextInjected)
+            ? '[system: The file content is in [PRE-LOADED CONTEXT] above. Call edit_file_at_line NOW with the line numbers shown. Output ONLY the <tool> block.]'
+            : `[system: No tool was called and the task is not done.${nudgeHint} Call the next tool NOW.${toolCallHint}${escalationSuffix}]`;
+
+        logInfo(`[agent] No-tool nudge (reason=${nudgeReason}, turn=${turn}, retry=${this.autoRetryCount})`);
+
+        // Keep the response visible if it looks like a real answer (substantial text, not
+        // a mid-task artifact). Remove it if it's planning narration, a fenced tool call,
+        // or any other mid-task non-answer.
+        const looksLikeRealAnswer = resp.trim().length > 80
+            && !isPlanningNarration
+            && !hasFencedToolCall
+            && nudgeReason !== 'deflecting'
+            && nudgeReason !== 'giving-instructions'
+            && nudgeReason !== 'planning-loop';
+        if (looksLikeRealAnswer) {
+            // Keep the assistant message visible; push nudge as next user turn.
+            this.history.push({ role: 'user', content: nudgeContent });
+        } else {
+            // Remove the unhelpful partial response and replace with nudge.
+            this.history.pop();
+            this.history.push({ role: 'user', content: nudgeContent });
+            post({ type: 'removeLastAssistant' });
+        }
+        return true;
+    }
+
     private async runCriticPass(
         criticModel: string,
         rel: string,

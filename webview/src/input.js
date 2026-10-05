@@ -17,6 +17,20 @@ function sendMessage() {
     const text = promptEl.value.trim();
     if (!text || streaming) { return; }
 
+    // Auto-deny any open confirmation cards so the new message proceeds unblocked.
+    document.querySelectorAll('.confirm-card:not(.accepted):not(.rejected)').forEach(card => {
+        const confirmId = card.id?.replace(/^confirm-/, '');
+        if (confirmId) {
+            vscode.postMessage({ command: 'confirmResponse', id: confirmId, accepted: false });
+        }
+        card.classList.add('rejected');
+        const actions = card.querySelector('.confirm-actions');
+        if (actions) { actions.innerHTML = '<span class="confirm-resolved">❌ Auto-denied (new message sent)</span>'; }
+    });
+    // Also clear the sticky confirm bar
+    const bar = document.getElementById('pending-confirm-bar');
+    if (bar) { bar.style.display = 'none'; bar.innerHTML = ''; }
+
     pushInputHistory(text);
     addUserMessage(text);
     promptEl.value = '';
