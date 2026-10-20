@@ -2884,7 +2884,10 @@ export class Agent {
         // from the prior session's WIP snapshot -- those bullets are NOT new tasks to auto-advance through.
         const isTaskContinuation = /^\[TASK \d+\/\d+\]/.test(userMessage);
         const isResumeInjection = userMessage.trimStart().startsWith('[Resuming interrupted task]');
-        if (!isConfirmation && !isTaskContinuation && !isResumeInjection) {
+        // Short delegating messages like "keep going" / "continue" are never multi-task lists;
+        // any bullets in them came from injected workspace/snapshot context, not the user.
+        const isShortDelegatingMessage = userMessage.trim().split(/\s+/).length <= 12;
+        if (!isConfirmation && !isTaskContinuation && !isResumeInjection && !isShortDelegatingMessage) {
             const taskItems = Agent.parseMultiItemTaskList(userMessage);
             if (taskItems.length >= 2) {
                 // New multi-item list found -- replace any stale pending items.
@@ -9249,10 +9252,14 @@ If the code looks correct, respond with exactly: OK`;
             // â"€â"€ edit_file â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'edit_file': {
                 let rel              = String(args.path ?? '');
-                // Normalize CRLF in both strings — LLMs sometimes embed \r\n in JSON args,
-                // causing old_string to not match file content that has pure \n line endings.
-                const oldString      = String(args.old_string ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                const newString      = String(args.new_string ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                // Normalize CRLF and literal \n escape sequences in both strings.
+                // LLMs sometimes embed \r\n (CRLF) or literal backslash-n (\\n as two chars)
+                // in JSON args, causing old_string to never match file content.
+                const _normEscapes = (s: string) => s
+                    .replace(/\r\n/g, '\n').replace(/\r/g, '\n')  // CRLF → LF
+                    .replace(/\\n/g, '\n').replace(/\\t/g, '\t');  // literal \n/\t → real chars
+                const oldString      = _normEscapes(String(args.old_string ?? ''));
+                const newString      = _normEscapes(String(args.new_string ?? ''));
                 const forceOverwrite = Boolean(args.force_overwrite);
 
                 // Strip markdown bold markers from path arg (but not Python __dunder__ names)
@@ -9555,7 +9562,7 @@ If the code looks correct, respond with exactly: OK`;
                     let embeddedContent = '';
                     try {
                         const allLines = fs.readFileSync(full, 'utf8').split('\n');
-                        const MAX_EMBED = 150;
+                        const MAX_EMBED = 300; // raised from 150 — plans/markdown files can be long
                         const embedLines = allLines.slice(0, MAX_EMBED);
                         embeddedContent = `\n\nFULL FILE CONTENT (${rel}, ${allLines.length} lines):\n` +
                             embedLines.map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n') +
@@ -9564,10 +9571,9 @@ If the code looks correct, respond with exactly: OK`;
                     throw new Error(
                         `edit_file failed -- old_string not found anywhere in ${rel}.\n\n` +
                         `CAUSE: You constructed old_string from memory or inference. Invented strings always fail.\n\n` +
-                        `STOP. Do NOT retry edit_file. Do NOT call shell_read.\n\n` +
-                        `Use edit_file_at_line instead -- no string matching needed:\n` +
-                        `  path="${rel}", start_line=<first line to replace>, end_line=<last line to replace>, new_content=<replacement>\n` +
-                        `  The line numbers in the file content below tell you exactly what to use.${embeddedContent}${sigHint}`
+                        `ACTION REQUIRED: Call edit_file_at_line RIGHT NOW. Do NOT retry edit_file. Do NOT call shell_read.\n\n` +
+                        `  path="${rel}", start_line=<NNNN from content below>, end_line=<NNNN from content below>, new_content=<replacement lines>\n\n` +
+                        `Find the lines you want to replace in the file content below (NNNN: prefix = line number), then call edit_file_at_line immediately.${embeddedContent}${sigHint}`
                     );
                 }
 
@@ -10156,25 +10162,40 @@ for node in ast.iter_child_nodes(tree):
         module_globals |= collect_names(node.target)
 builtins = set(dir(__builtins__) if isinstance(__builtins__, dict) else dir(__builtins__))
 errors = []
-for node in ast.walk(tree):
-    if isinstance(node, ast.FunctionDef):
-        args = {a.arg for a in node.args.args}
-        assigned = set()
-        used = set()
-        for child in ast.walk(node):
-            if isinstance(child, ast.Assign):
-                for t in child.targets: assigned |= collect_names(t)
-            if isinstance(child, ast.AugAssign): assigned |= collect_names(child.target)
-            if isinstance(child, ast.For): assigned |= collect_names(child.target)
-            if isinstance(child, ast.ExceptHandler) and child.name: assigned.add(child.name)
-            if isinstance(child, (ast.ListComp, ast.GeneratorExp, ast.DictComp, ast.SetComp)):
-                for gen in child.generators: assigned |= collect_names(gen.target)
-            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-                used.add(child.id)
-        defined = args | assigned | module_globals | builtins
-        for name in used:
-            if name not in defined and not name.startswith('_'):
-                errors.append(f"'{name}' may be undefined in {node.name}()")
+# Collect top-level function nodes only — nested functions have closures we cannot
+# track cheaply, so skip them to avoid false positives on closure variables.
+top_level_funcs = [
+    node for node in ast.iter_child_nodes(tree)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+]
+for node in top_level_funcs:
+    args = {a.arg for a in node.args.args}
+    # Also collect names from default args and annotations at definition site
+    if node.args.vararg: args.add(node.args.vararg.arg)
+    if node.args.kwarg: args.add(node.args.kwarg.arg)
+    for a in node.args.kwonlyargs: args.add(a.arg)
+    assigned = set()
+    used = set()
+    inner_func_names = set()
+    for child in ast.walk(node):
+        # Track names of nested functions/classes — they are defined within this scope
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and child is not node:
+            inner_func_names.add(child.name)
+            # Skip walking into nested functions to avoid collecting their internal names as "used"
+            continue
+        if isinstance(child, ast.Assign):
+            for t in child.targets: assigned |= collect_names(t)
+        if isinstance(child, ast.AugAssign): assigned |= collect_names(child.target)
+        if isinstance(child, ast.For): assigned |= collect_names(child.target)
+        if isinstance(child, ast.ExceptHandler) and child.name: assigned.add(child.name)
+        if isinstance(child, (ast.ListComp, ast.GeneratorExp, ast.DictComp, ast.SetComp)):
+            for gen in child.generators: assigned |= collect_names(gen.target)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+            used.add(child.id)
+    defined = args | assigned | module_globals | builtins | inner_func_names
+    for name in used:
+        if name not in defined and not name.startswith('_'):
+            errors.append(f"'{name}' may be undefined in {node.name}()")
 if errors:
     print('UNDEFINED_NAMES:' + '|'.join(errors[:5]))
 `.trim();
@@ -13080,6 +13101,9 @@ ${sampleHtml}
             const m = line.match(/^[-*•]\s+(.+)$/);
             if (m) { bulletItems.push(m[1].trim()); }
         }
+        // Reject if any item looks like a plan-file checkbox (- [ ] or - [x]) — these come
+        // from workspace snapshot injection, not from the user typing a task list.
+        if (bulletItems.some(i => /^\[[ xX]\]/.test(i))) { return []; }
         if (bulletItems.length >= 2 && bulletItems.every(i => i.length >= 15)) {
             return bulletItems;
         }
