@@ -5650,6 +5650,11 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // This specific turn used only lookup tools (memory, read_file, search) — Q&A answer.
                 const READ_ONLY_TOOL_NAMES = new Set(['memory_search', 'memory_list', 'memory_stats', 'read_file', 'find_files', 'search_files', 'shell_read', 'gather_context', 'workspace_summary']);
                 const thisTurnOnlyLookup = toolCalls.length > 0 && toolCalls.every(tc => READ_ONLY_TOOL_NAMES.has(tc.function?.name ?? ''));
+                // All tools called across the ENTIRE run were lookups — this is a pure Q&A run.
+                // The final answer turn will have zero tool calls (model gives the answer), so
+                // thisTurnOnlyLookup won't fire. We need to check the whole run's tool history.
+                const thisRunOnlyLookup = toolsCalledThisRun
+                    && this._toolCallsThisRun.every(tc => READ_ONLY_TOOL_NAMES.has(tc.name ?? ''));
 
                 // Trust/yolo permission questions are NOT legitimate stops.
                 // Permission-seek: a yes/no "shall I do X?" question in Trust/YOLO mode where the
@@ -5699,6 +5704,11 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // This turn used only lookup tools (memory/read) + produced a substantive answer.
                     // Allow stop even in 'acting' phase — this is a Q&A response, not mid-task work.
                     || (thisTurnOnlyLookup && turnHasText && resp.trim().length > 80 && !isPlanningNarration)
+                    // The entire run was lookup-only (memory_search, search_files, etc.) and this turn
+                    // produced a text answer without tools. Classic Q&A: model looked up info then answered.
+                    // Without this, the no-tool nudge fires on the final answer turn and forces the model
+                    // to call yet another search tool, producing a loop of redundant searches + answers.
+                    || (thisRunOnlyLookup && !toolCalls.length && turnHasText && resp.trim().length > 60 && !isPlanningNarration)
                     // Model tried to expand scope to a different task list — stop the current task.
                     || isScopeEscape;
                 // Reset stall budget when the model gives a real answer — it wasn't stalling,
