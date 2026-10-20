@@ -101,7 +101,8 @@ const BUILTIN_CONFIRM: RegExp[] = [
     /\bshred\b/i,                                        // shred
     /\bRemove-Item\b/i,                                  // PowerShell remove
     /\bClear-Content\b/i,                                // PowerShell clear
-    /\brm\s+(-[a-z]*f[a-z]*\b)/i,                        // rm -f
+    /\brm\s+(-[a-z]*r[a-z]*\b)/i,                        // rm -r / rm -rf (recursive)
+    /\brm\s+(-[a-z]*f[a-z]*\s+[^-\s]*[*?[{][^\s]*)/i,   // rm -f with wildcard target
     /\brmdir\b/i,                                        // rmdir
     /\bdel\s+\/[fqs]/i,                                  // del /f
     /\bkill\s+-9\b/i,                                    // kill -9

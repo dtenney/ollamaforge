@@ -138,9 +138,16 @@ const msgHandlers = {
 
     turnLimit: (msg) => {
         addTurnLimitCard(msg.text, msg.canAutoContinue, msg.longSession);
-        agentActive = false;
-        setStreaming(false);
-        statusText.textContent = modelSelect.value ? '● Connected' : 'No model selected';
+        // When YOLO auto-continues (canAutoContinue=true), keep agentActive so the stop
+        // button stays visible between turns. For Normal/Trust the user must click "Keep going".
+        if (msg.canAutoContinue) {
+            setStreaming(false); // stop spinner/token animation but leave stop btn visible
+            statusText.textContent = modelSelect.value ? '⚙ Auto-continuing…' : 'No model selected';
+        } else {
+            agentActive = false;
+            setStreaming(false);
+            statusText.textContent = modelSelect.value ? '● Connected' : 'No model selected';
+        }
     },
 
     clearChat: (msg) => {

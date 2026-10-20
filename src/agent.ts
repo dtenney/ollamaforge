@@ -1677,7 +1677,7 @@ export class Agent {
      *   2. Post-loop turn-limit check (~line 9186): suppress turn-limit card/auto-continue.
      * Single source of truth so both sites stay in sync.
      */
-    static readonly COMPLETION_LANGUAGE_RE = /\b(no (?:further|more|additional) (?:action|work|change|step|changes|edits)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|all (?:three|two|four|five|\d+) (?:change|step|item|fix|update)s? (?:are )?(?:complete|done|applied|finished)|task (?:is )?(?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|awaiting (?:your|hardware|next)|successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed)|(?:correctly|successfully) (?:restored|reverted|applied|updated|changed|fixed|deployed|installed)|(?:verified|confirmed|checked)(?:\s+and)? (?:correct|working|ok|good)|no (?:further|more) (?:changes|edits|work|action)|(?:everything|all) (?:looks|is) (?:correct|good|right|fine|in order)|ready (?:to|for)|let me know (?:when|if)|reach out (?:when|if)|nothing else to (?:act|do|work)|session (?:complete|done|finished|summary)|(?:here|this) (?:concludes|completes|wraps)|you(?:'re| are) welcome|happy to help|glad (?:I could|to help)|anytime[.!]?$|no problem[.!]?|(?:has|have) been (?:regenerated|rebuilt|updated|applied|completed|created|written)|output files?[^.]*(?:regenerated|created|written|saved))\b/i;
+    static readonly COMPLETION_LANGUAGE_RE = /\b(no (?:further|more|additional) (?:action|work|change|step|changes|edits)|nothing (?:more|else|further)|all (?:done|complete|set|finished)|all (?:three|two|four|five|\d+) (?:change|step|item|fix|update)s? (?:are )?(?:complete|done|applied|finished)|task (?:is )?(?:complete|done|finished)|that(?:'s| is) (?:all|it|everything)|awaiting (?:your|hardware|next)|successfully (?:deployed|installed|configured|updated|created|fixed|changed|completed)|(?:correctly|successfully) (?:restored|reverted|applied|updated|changed|fixed|deployed|installed)|(?:verified|confirmed|checked)(?:\s+and)? (?:correct|working|ok|good)|no (?:further|more) (?:changes|edits|work|action)|(?:everything|all) (?:looks|is) (?:correct|good|right|fine|in order)|ready (?:to|for)|let me know (?:when|if)|reach out (?:when|if)|nothing else to (?:act|do|work)|session (?:complete|done|finished|summary)|(?:here|this) (?:concludes|completes|wraps)|you(?:'re| are) welcome|happy to help|glad (?:I could|to help)|anytime[.!]?$|no problem[.!]?|(?:has|have) been (?:regenerated|rebuilt|updated|applied|completed|created|written)|output files?[^.]*(?:regenerated|created|written|saved)|(?:need|require)s? (?:a |the )?(?:physical|real|actual) (?:device|phone|pixel|hardware)|(?:everything|all) that could be done|(?:server.side|client.side) (?:is|are|work is) (?:done|complete|finished))\b/i;
     /** Track consecutive calls to the same tool name (even with different args) */
     private lastToolName = '';
     /** Add a file path to _filesReadThisSession, evicting the oldest entry if the cap is reached. */
@@ -1860,8 +1860,6 @@ export class Agent {
     private _currentTaskMessage: string = '';
     /** The first user task message this session -- never overwritten, used for compaction summaries */
     private _originalTaskMessage: string = '';
-    /** Whether the tracking-document "done" hard gate (4.1) has already fired this run (prevents a block-stop spiral) */
-    private _trackingDocCheckedThisRun = false;
     /** Whether a focused grep was already injected this turn (prevents double-injection within a turn) */
     private _focusedGrepInjectedThisTurn = false;
     /** File paths for which focused grep content was injected this run (prevents re-injection on loop-back) */
@@ -1925,6 +1923,8 @@ export class Agent {
     private _repeatToolCount: number = 0;
     /** How the current run ended -- set by stop() or error path, reset at run start */
     private _runOutcome: 'done' | 'error' | 'stopped' = 'done';
+    /** True when the agent broke the loop via isLegitimateStop — provider uses this to discard stale pendingMessage */
+    private _legitimateStopFired: boolean = false;
     /** Critic model for the current run (resolved from routing config at run start) */
     private _routedCriticModel: string = '';
     /** Base model for the current run (passed into run()) */
@@ -1945,15 +1945,11 @@ export class Agent {
     private _lastPlanStepOutput: string = '';
     /** Absolute path of the active task plan file (plans/<name>.md), or null if none */
     private _activePlanFile: string | null = null;
-    /** True once the plan-file completion guard has fired this run — prevents a nudge spiral */
-    private _planStopGuardFiredThisRun: boolean = false;
     private _velocityNudgeFiredThisRun: boolean = false;
     /** Absolute path of the active PROJECT.md (project-level tracker), or null if none */
     private _activeProjectFile: string | null = null;
     /** Turn number when the project context was last injected — throttles re-injection */
     private _projectNudgeLastTurn: number = -1;
-    /** Whether the project file update-before-stop guard has fired this run */
-    private _projectStopGuardFiredThisRun: boolean = false;
     private _autoVerifyFiredThisRun: boolean = false;
     /** Async subagent handles -- keyed by handle string returned by delegate_task_async */
     private _asyncHandles: Map<string, Promise<string>> = new Map();
@@ -2151,14 +2147,17 @@ export class Agent {
         filesChanged: string[];
         avgLogprob: number | null;
         outcome: 'done' | 'error' | 'stopped';
+        /** True when the agent broke the loop via isLegitimateStop (said "done" or answered Q&A). Provider uses this to discard stale pendingMessage. */
+        legitimateStop: boolean;
     } {
         return {
-            turns:       this._runTurnCount,
-            toolCalls:   [...this._toolCallsThisRun],
-            guardEvents: [...this._guardEvents],
-            filesChanged: [...this._filesChangedThisRun],
-            avgLogprob:  this._lastResponseAvgLogprob,
-            outcome:     this._runOutcome,
+            turns:         this._runTurnCount,
+            toolCalls:     [...this._toolCallsThisRun],
+            guardEvents:   [...this._guardEvents],
+            filesChanged:  [...this._filesChangedThisRun],
+            avgLogprob:    this._lastResponseAvgLogprob,
+            outcome:       this._runOutcome,
+            legitimateStop: this._legitimateStopFired,
         };
     }
 
@@ -2757,7 +2756,10 @@ export class Agent {
         this._lastWebFetchTurn = -1;           // Reset web fetch turn tracker
         this._autoApprovedTools.clear(); // Reset batch-approve for each new user message
         this._currentTaskMessage = userMessage; // Remember current task for post-compaction recovery
-        if (!this._originalTaskMessage) { this._originalTaskMessage = userMessage; } // First turn only
+        // Reset original task on genuine new user messages so stale [TASK N/M] tasks from a prior
+        // session don't bleed into the system prompt ACTIVE TASK injection after VSCode restarts.
+        const _isTaskContinuationMsg = /^keep going(\s+from\s+\S+)?$|^\[TASK \d+\/\d+\]|^\[Resuming interrupted task\]/i.test(userMessage.trim());
+        if (!this._originalTaskMessage || !_isTaskContinuationMsg) { this._originalTaskMessage = userMessage; }
 
         // Fix 5a: Initialize task state machine for this run
         {
@@ -2812,6 +2814,10 @@ export class Agent {
             }
         }
         this._perFileEditCounts.clear();       // Reset per-file edit counts (BUG-02: was carrying across runs)
+        this._mergeMode = false;               // Reset merge mode — must not bleed into next task
+        this._mergeEditedSinceLastDelete = false;
+        this._mergeFileReadCounts.clear();     // Stale read counts cause premature merge-guard blocks
+        this._wasReviewTask = false;           // Reset review-task flag so confirmation logic works correctly
         // _recentToolSigs reset deferred to after _isAutoContinuation is declared below
         this.consecutiveFailures = 0;          // Reset consecutive failure counter (BUG-09: stale across runs)
         this.consecutiveRepeats = 0;           // Reset consecutive repeat counter (BUG-09: stale across runs)
@@ -2821,9 +2827,6 @@ export class Agent {
         // NOTE: _failedEditSignatures intentionally NOT cleared between turns -- persistent across
         // the session so the same broken old_string doesn't retry indefinitely across user replies.
         this._focusedGrepInjectedThisTurn = false; // Reset focused-grep dedup flag
-        this._trackingDocCheckedThisRun = false;   // Reset tracking-doc check so it can fire once per user message
-        this._projectStopGuardFiredThisRun = false; // Reset project stop guard so it can fire once per user message
-        this._planStopGuardFiredThisRun = false;    // Reset plan-file completion guard so it can fire once per user message
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._preExecCache.clear();            // Reset pre-exec cache -- stale entries from prior run waste memory
@@ -2876,9 +2879,12 @@ export class Agent {
         // Multi-item task list detection -- only on fresh user messages (not "keep going" continuations).
         // Parse numbered/bulleted lists into _pendingTaskItems so the agent auto-advances
         // through each item rather than stopping after the first one.
-        // Also skips messages that are already tagged [TASK N/M] (recursive invocations from this logic).
+        // Also skips messages that are already tagged [TASK N/M] (recursive invocations from this logic),
+        // and skips resume-context injections ("[Resuming interrupted task]") which contain bullet lists
+        // from the prior session's WIP snapshot -- those bullets are NOT new tasks to auto-advance through.
         const isTaskContinuation = /^\[TASK \d+\/\d+\]/.test(userMessage);
-        if (!isConfirmation && !isTaskContinuation) {
+        const isResumeInjection = userMessage.trimStart().startsWith('[Resuming interrupted task]');
+        if (!isConfirmation && !isTaskContinuation && !isResumeInjection) {
             const taskItems = Agent.parseMultiItemTaskList(userMessage);
             if (taskItems.length >= 2) {
                 // New multi-item list found -- replace any stale pending items.
@@ -2922,6 +2928,7 @@ export class Agent {
         this._lastToolDigest = '';
         this._repeatToolCount = 0;
         this._runOutcome = 'done';
+        this._legitimateStopFired = false;
         this._confirmTimedOut = false;
         this._currentRunModel = model;
         { const rc = getConfig(); this._routedCriticModel = rc.modelRoutingEnabled ? (rc.criticModel || model) : model; }
@@ -3928,7 +3935,13 @@ ${_nextIdx !== -1 ? `NEXT STEP: ${_ledger.steps[_nextIdx].text}. Work on it now,
         // the task is already visible as the top history message.
         const _anchorTask = this._currentTaskMessage || this._originalTaskMessage;
         if (_anchorTask) {
-            baseSystemContent += `\n\n## ACTIVE TASK\n${_anchorTask.slice(0, 300)}\nDo NOT ask what to work on — continue until this task is complete.`;
+            // When running a [TASK N/M] item from a multi-task list, add a hard scope boundary
+            // so the model doesn't expand into unrelated tasks after completing the current one.
+            const _taskNofM = _anchorTask.match(/^\[TASK (\d+)\/(\d+)\]/);
+            const _taskScopeNote = _taskNofM
+                ? ` This is task ${_taskNofM[1]} of ${_taskNofM[2]}. Complete ONLY this task, then stop. Do NOT start or mention other tasks from other lists.`
+                : '';
+            baseSystemContent += `\n\n## ACTIVE TASK\n${_anchorTask.slice(0, 300)}\nDo NOT ask what to work on — continue until this task is complete.${_taskScopeNote}`;
         }
 
         // ── Project-level task detection ──────────────────────────────────────────
@@ -4114,6 +4127,7 @@ ${hints.join('\n')}`;
             : (isSweepTask || isAuthorizedContinuation) ? 80 : this._mergeMode ? 80 : (this._isSmallModel ? 8 : (isPlanTask || isCreativeTask) ? 80 : 60);
         this.modeSwitchRetries = 0;
         let loopExhausted = true;
+        let legitimateStopFired = false; // set when isLegitimateStop breaks the loop — suppresses multi-task auto-advance
 
         // Pre-compute values that don't change within a single run()
         const memoryTokens = memoryContext ? Math.ceil(memoryContext.length / 4) : 0;
@@ -5630,9 +5644,20 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
 
                 // Tools called this run — agent is mid-task.
                 const toolsCalledThisRun = this._toolCallsThisRun.length > 0;
+                // This specific turn used only lookup tools (memory, read_file, search) — Q&A answer.
+                const READ_ONLY_TOOL_NAMES = new Set(['memory_search', 'memory_list', 'memory_stats', 'read_file', 'find_files', 'search_files', 'shell_read', 'gather_context', 'workspace_summary']);
+                const thisTurnOnlyLookup = toolCalls.length > 0 && toolCalls.every(tc => READ_ONLY_TOOL_NAMES.has(tc.function?.name ?? ''));
 
                 // Trust/yolo permission questions are NOT legitimate stops.
-                const endsWithPermissionQuestion = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
+                // Permission-seek: a yes/no "shall I do X?" question in Trust/YOLO mode where the
+                // agent is waiting for approval to act. Only match single-option asks, not multi-option
+                // design/clarification questions (e.g. "Want me to do A, or would you prefer B?").
+                // Multi-option questions contain " or " in the last 200 chars and should be treated as
+                // genuine user input requests — let isLegitimateStop fire for them.
+                const lastChunk = resp.slice(-200);
+                const isMultiOption = / or /i.test(lastChunk) || /\bvs\.?\b/i.test(lastChunk);
+                const endsWithPermissionQuestion = !isMultiOption
+                    && (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
                     && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|can i go ahead|shall we|should we)\b.{0,120}\?\s*$/i.test(resp);
 
                 // Phase-handoff phrases: "say the word and I'll start Phase 3", "let me know when
@@ -5658,11 +5683,21 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 //   2. Response ends with a question (not a permission-seek) — model is waiting for input.
                 //   3. Completion language present — either after doing work, or in a pure Q&A answer.
                 const endsWithQuestion = /\?\s*$/.test(resp.trim()) && !endsWithPermissionQuestion;
+                // Scope-escape detection: when running a [TASK N/M] item, if the model starts
+                // narrating work on a different list/task, treat that as "current task done" — stop.
+                const isTaskNofM = /^\[TASK \d+\/\d+\]/.test(this._currentTaskMessage ?? '');
+                const isScopeEscape = isTaskNofM && /\b(item|task|issue|fix)\s+\d+\s+(?:from|of|on)\s+(?:the\s+)?(?:first|second|third|other|list|another|different)\b/i.test(resp);
                 const isLegitimateStop =
                     (isUserDismissal && turnHasText && resp.trim().length < 300)
                     || (endsWithQuestion && !isPlanningNarration)
                     || (hasCompletionLanguage && !isPlanningNarration)
-                    || (turnHasText && !isPlanningNarration && !toolsCalledThisRun && !(this._taskPhase === 'research' || this._taskPhase === 'acting'));
+                    // Text-only turn with no tools this run — model gave a standalone answer.
+                    || (turnHasText && !isPlanningNarration && !toolsCalledThisRun && !(this._taskPhase === 'research' || this._taskPhase === 'acting'))
+                    // This turn used only lookup tools (memory/read) + produced a substantive answer.
+                    // Allow stop even in 'acting' phase — this is a Q&A response, not mid-task work.
+                    || (thisTurnOnlyLookup && turnHasText && resp.trim().length > 80 && !isPlanningNarration)
+                    // Model tried to expand scope to a different task list — stop the current task.
+                    || isScopeEscape;
                 // Reset stall budget when the model gives a real answer — it wasn't stalling,
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
@@ -5672,15 +5707,6 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     continue;
                 }
 
-                if (this.checkTrackingDoc(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post)) {
-                    continue;
-                }
-
-                if (this.checkPlanFileCompletion(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post)) {
-                    continue;
-                }
-
-                this.checkProjectFileUpdate(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post);
 
                 if (this.runSelfEvaluation(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post)) {
                     continue;
@@ -5690,12 +5716,15 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     continue;
                 }
 
-                // ── Legitimate stop with tool calls ────────────────────────────────────
-                // The model called tools this turn then stated completion (isLegitimateStop).
-                // Without this break, the loop falls through and re-runs, causing the agent
-                // to keep re-verifying the same "nothing left to do" conclusion every turn.
-                if (isLegitimateStop && toolCalls.length > 0) {
-                    logInfo(`[agent] isLegitimateStop + toolCalls (${toolCalls.length}) — breaking loop`);
+                // ── Legitimate stop ─────────────────────────────────────────────────────
+                // Model declared completion (or gave a Q&A answer). Break the loop.
+                // Without this, the loop falls through and re-runs, causing the agent
+                // to keep working after it already said it was done.
+                if (isLegitimateStop) {
+                    logInfo(`[agent] isLegitimateStop (toolCalls=${toolCalls.length}) — breaking loop`);
+                    loopExhausted = false;           // clean stop — do not show turn-limit card
+                    legitimateStopFired = true;      // block multi-task auto-advance
+                    this._legitimateStopFired = true; // expose to provider so it discards stale pendingMessage
                     break;
                 }
 
@@ -7520,7 +7549,9 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     }
 
                     // Track edit_file failures per (path, old_string) to catch repeated identical failures.
-                    if (name === 'edit_file') {
+                    // Only count actual failures — success results must NOT increment the counter or
+                    // the hard-block will fire after N successful edits on the same file.
+                    if (name === 'edit_file' && /old_string not found|matches \d+ locations|EDIT REJECTED/i.test(toolResult)) {
                         if (this.trackEditFileFailures(args, toolResult, isTextMode)) { continue; }
                     }
 
@@ -7597,13 +7628,15 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                                     } catch { /* ignore */ }
                                 }
 
-                                const injectMsg = `[FILE CONTENT: ${relFailPath}]\n${failGrepClean}\n\n${lineNote}${failReason}\n\nSTOP -- do NOT retry edit_file with old_string. Use edit_file_at_line instead:\n  path="${relFailPath}", start_line=<first line to change>, end_line=<last line to change>, new_content=<replacement>\nThe line numbers in the file content above are your guide.${tailNote}`;
+                                const injectMsg = `[FILE CONTENT: ${relFailPath}]\n${failGrepClean}\n\n${lineNote}${failReason}\n\nSTOP -- do NOT retry edit_file with old_string. Use edit_file_at_line instead:\n  path="${relFailPath}", start_line=<first line to change>, end_line=<last line to change>, new_content=<replacement>\nThe line numbers in the file content above are your guide.${tailNote}\n\n[TASK IS NOT DONE — call edit_file_at_line now to complete the edit.]`;
                                 if (isTextMode) {
                                     this.history.push({ role: 'user', content: `Tool ${name} returned:\n${toolResult}\n---\n${injectMsg}` });
                                 } else {
                                     this.history.push({ role: 'tool', content: `${toolResult}\n\n${injectMsg}` });
                                 }
                                 this.consecutiveFailures = 0;
+                                this.autoRetryCount = 0; // Fresh file content injected — not a stall; reset so model gets full retry budget
+                                this._taskPhase = 'acting'; // Ensure isLegitimateStop doesn't fire on next text-only narration
                                 continue; // Skip the normal history push below -- we already added it
                             }
                         }
@@ -8564,12 +8597,16 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 logInfo(`[agent] Suppressing auto-continue: ${this._consecutiveNoWriteRuns} consecutive runs with no progress`);
             }
             const canAutoContinue = !looksFinished && !this._externalStop && !tooManyNoWriteRuns;
-            if (canAutoContinue) {
-                // Leave the footer blank — provider decides whether to auto-continue (trust/yolo)
-                // or show a "Keep going?" prompt (normal). The turnLimit card handles the UX.
-            } else if (tooManyNoWriteRuns) {
+            // When the agent's final message signals task completion, suppress the turn-limit card
+            // entirely — the task is done, there is nothing to continue. Show the card only when
+            // there is genuine mid-task work remaining that needs more turns.
+            if (looksFinished) {
+                logInfo(`[agent] Turn limit hit but looksFinished=true — suppressing turnLimit card`);
+                return;
+            }
+            if (tooManyNoWriteRuns) {
                 summaryLines.push(`\nStopped after ${this._consecutiveNoWriteRuns} consecutive turns with no tool use. The model may be reasoning in circles. Try: "keep going" to resume, or be more specific about the next step.`);
-            } else {
+            } else if (!canAutoContinue) {
                 summaryLines.push(`\nTo continue, describe what to do next or say "keep going".`);
             }
             post({ type: 'turnLimit', text: summaryLines.join('\n'), canAutoContinue, longSession: this.history.length > 60 });
@@ -8590,7 +8627,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         // If there are pending plan steps and this run completed cleanly, kick off the
         // next step immediately. Capture the last assistant message as step output
         // so the next step can see what was just written.
-        if (!this._externalStop && !loopExhausted && this._pendingPlanSteps.length > 0) {
+        if (!this._externalStop && !loopExhausted && !legitimateStopFired && this._pendingPlanSteps.length > 0) {
             // Capture the final assistant message as context for the next step
             const lastMsg = [...this.history].reverse().find(m => m.role === 'assistant');
             if (lastMsg) {
@@ -8624,25 +8661,25 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
 
         // ── Multi-item task list: auto-advance to next item ──────────────────────────
         // When the user gave a list of unrelated tasks, advance to the next one after
-        // this item completes (whether via normal finish or turnLimit).
-        // Only advance if the run ended cleanly (not stopped by user) and there are items left.
-        if (!this._externalStop && this._pendingTaskItems.length > 0) {
+        // this item completes cleanly. Do NOT advance when loopExhausted — the item is
+        // still mid-task and the turn-limit card will offer the user a "Keep going?" prompt.
+        // Route through the provider's continueTask event so that Normal/Trust mode can
+        // show a "Keep going?" card between items instead of silently auto-advancing.
+        // Note: legitimateStopFired is intentionally NOT checked here. A multi-task item
+        // completing cleanly (saying "done") should still advance to the next queued item.
+        // The provider's pendingMessage guard handles the stale-message case for Q&A answers.
+        if (!this._externalStop && !loopExhausted && this._pendingTaskItems.length > 0) {
             const nextItem = this._pendingTaskItems.shift()!;
             this._currentTaskItemIndex++;
             const itemIdx = this._currentTaskItemIndex;
             const totalItems = this._totalTaskItems;
-            logInfo(`[multi-task] Advancing to item ${itemIdx} of ${totalItems}: "${nextItem.slice(0, 80)}"`);
+            logInfo(`[multi-task] Signalling next item ${itemIdx} of ${totalItems} via continueTask`);
             const nextModel = getConfig().model;
             const progressNote = `[TASK ${itemIdx}/${totalItems}] ${nextItem}`;
-            setImmediate(() => {
-                if (this._externalStop) {
-                    logInfo('[multi-task] stop() called during task transition -- aborting');
-                    return;
-                }
-                this.run(progressNote, nextModel, post).catch(e => {
-                    logWarn(`[multi-task] Item ${itemIdx} failed: ${toErrorMessage(e)}`);
-                });
-            });
+            // Emit continueTask so the provider applies the trust-level gate:
+            //   YOLO  → auto-continues immediately
+            //   Normal/Trust → shows "Keep going?" card, user approves before next item runs
+            post({ type: 'continueTask', prompt: progressNote, model: nextModel, isTaskTransition: true });
         } else if (!this._externalStop && this._pendingTaskItems.length === 0 && this._totalTaskItems > 1 && this._currentTaskItemIndex === this._totalTaskItems) {
             // All items in the multi-task list are done -- reset state
             this._totalTaskItems = 0;
@@ -8757,112 +8794,11 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         const nudge = endsWithPhaseHandoff
             ? `[system: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT wait for the user to say "the word" or give permission — proceed immediately to the next phase/step now.${toolCallHint2}]`
             : `[system: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission or offer a choice — pick the next logical action and do it immediately.${toolCallHint2}]`;
-        this.history.pop();
+        // Keep the assistant's summary visible (streaming already rendered it) but append the
+        // nudge as a user turn so the model proceeds without waiting for real user input.
+        // Do NOT pop the history or call removeLastAssistant — the user already saw the response.
         this.history.push({ role: 'user', content: nudge });
-        post({ type: 'removeLastAssistant' });
         return true;
-    }
-
-    /**
-     * Tracking-document check: if the model is about to declare completion but
-     * the user's task references a tracking/progress document that still has
-     * unchecked items, block the stop and force the model to address them.
-     * Only fires once per run to avoid a read-doc spiral.
-     * Returns true if the caller should `continue` the loop.
-     */
-    private checkTrackingDoc(
-        isLegitimateStop: boolean,
-        hasCompletionLanguage: boolean,
-        isUserDismissal: boolean,
-        post: PostFn
-    ): boolean {
-        if (!(isLegitimateStop && hasCompletionLanguage && !isUserDismissal && !this._trackingDocCheckedThisRun)) {
-            return false;
-        }
-        const taskMsg = (this._originalTaskMessage || this._currentTaskMessage || '').toLowerCase();
-        const trackingDocMatch = taskMsg.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i)
-            ?? this.lastUserMessage?.match(/\b([\w.-]+\.(?:md|txt|todo))\b/i);
-        const trackingDoc = trackingDocMatch?.[1];
-        if (!trackingDoc) {
-            return false;
-        }
-        const trackingDocAbs = path.join(this.workspaceRoot, trackingDoc);
-        const openItems = this.countTrackingDocOpenItems(trackingDocAbs);
-        if (!openItems) {
-            return false;
-        }
-        this._trackingDocCheckedThisRun = true;
-        const relDoc = path.relative(this.workspaceRoot, trackingDocAbs).replace(/\\/g, '/');
-        logInfo(`[agent] DONE GATE: completion declared but tracking doc "${relDoc}" has ${openItems.length} unchecked item(s) — blocking stop`);
-        const itemLines = openItems.slice(0, 15).map(i => `  - [ ] ${i}`).join('\n');
-        const moreNote = openItems.length > 15 ? `\n  …and ${openItems.length - 15} more` : '';
-        this.history.pop();
-        this.history.push({ role: 'user', content: `[system: DONE GATE — you declared completion, but the tracking document "${relDoc}" still has ${openItems.length} unchecked item(s). You may NOT stop yet. Either (a) continue working on the remaining items, or (b) if they are out of scope for this request, explicitly list each one and state why it is being deferred. Remaining items:\n${itemLines}${moreNote}]` });
-        post({ type: 'removeLastAssistant' });
-        return true;
-    }
-
-    /**
-     * Plan-file completion guard: if the agent created its own plan file and
-     * declares completion while that plan still has unchecked steps, block the stop.
-     * Only fires once per run to prevent a nudge spiral.
-     * Returns true if the caller should `continue` the loop.
-     */
-    private checkPlanFileCompletion(
-        isLegitimateStop: boolean,
-        hasCompletionLanguage: boolean,
-        isUserDismissal: boolean,
-        post: PostFn
-    ): boolean {
-        if (!(isLegitimateStop && hasCompletionLanguage && !isUserDismissal && this._activePlanFile && !this._planStopGuardFiredThisRun)) {
-            return false;
-        }
-        const planOpen = this.countTrackingDocOpenItems(this._activePlanFile);
-        if (!planOpen) {
-            return false;
-        }
-        this._planStopGuardFiredThisRun = true;
-        const relPlan = path.relative(this.workspaceRoot, this._activePlanFile).replace(/\\/g, '/');
-        logInfo(`[plan] DONE GATE: completion declared but plan file "${relPlan}" has ${planOpen.length} unchecked step(s) — blocking stop`);
-        const planLines = planOpen.slice(0, 15).map(i => `  - [ ] ${i}`).join('\n');
-        const planMore = planOpen.length > 15 ? `\n  …and ${planOpen.length - 15} more` : '';
-        this.history.pop();
-        this.history.push({ role: 'user', content: `[system: DONE GATE — you declared completion, but your own plan file "${relPlan}" still has ${planOpen.length} unchecked step(s). You may NOT stop yet. Either (a) continue working on the remaining steps, or (b) if they are out of scope for this request, explicitly list each one and state why it is being deferred. Remaining steps:\n${planLines}${planMore}]` });
-        post({ type: 'removeLastAssistant' });
-        return true;
-    }
-
-    /**
-     * Project-file update-before-stop guard: when a PROJECT.md is active and the
-     * agent is about to stop, require it to tick off completed items and stamp
-     * the next-action line. If open items remain, inject a nudge and return true
-     * (caller should `continue`). If all items are checked, stamp the file.
-     * Only fires once per run to prevent a loop.
-     * Returns true if the caller should `continue` the loop.
-     */
-    private checkProjectFileUpdate(
-        isLegitimateStop: boolean,
-        hasCompletionLanguage: boolean,
-        isUserDismissal: boolean,
-        post: PostFn
-    ): boolean {
-        if (!(isLegitimateStop && hasCompletionLanguage && !isUserDismissal && this._activeProjectFile && !this._projectStopGuardFiredThisRun)) {
-            return false;
-        }
-        const openItems = this.readProjectOpenItems();
-        if (openItems) {
-            this._projectStopGuardFiredThisRun = true;
-            const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
-            logInfo(`[project] Completion declared with open project items — injecting project check nudge`);
-            this.history.pop();
-            this.history.push({ role: 'user', content: `[system: Before stopping, read ${relPf} with read_file. Check which items you completed this session and tick them off with edit_file (change "- [ ]" to "- [x]"). Also update the "Next action" line to describe what should happen next session. Then continue any remaining unchecked items if they are in scope for this request.]` });
-            post({ type: 'removeLastAssistant' });
-            return true;
-        } else {
-            this._projectStopGuardFiredThisRun = true;
-            this.stampProjectFile('(all items complete — see Notes for follow-up)');
-        }
-        return false;
     }
 
     private checkReadSaturation(
@@ -8956,6 +8892,11 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             return false;
         }
         const firstTool = toolCalls.length > 0 ? toolCalls[0] : null;
+        // Text-only turns (no tool calls) are completion signals, not stalls — skip fingerprinting.
+        // Nudging a "I'm done" response to call a tool creates an infinite loop.
+        if (!firstTool) {
+            return false;
+        }
         const toolSig = firstTool
             ? `${firstTool.function.name}|${String(firstTool.function.arguments?.path ?? firstTool.function.arguments?.command ?? JSON.stringify(firstTool.function.arguments)).slice(0, 60).replace(/\d+/g, 'N')}`
             : '';
@@ -9323,7 +9264,7 @@ If the code looks correct, respond with exactly: OK`;
 
                 // Soft-redirect: if this file has had too many edit_file failures, suggest write_file
                 if (!forceOverwrite && this._editFileHardBlocked.has(rel.replace(/\\/g, '/'))) {
-                    return `edit_file has failed repeatedly on "${rel}". Use write_file instead: call read_file to get the current content, then write_file with the complete corrected content. DO NOT write a Python script to work around this — write_file is the correct fallback.`;
+                    return `[BLOCKED] edit_file is disabled for "${rel}" after repeated failures.\n\nDo this NOW:\n1. Call read_file with path="${rel}"\n2. Apply your change to the content you receive\n3. Call write_file with path="${rel}" and the complete updated file\n\nDo NOT call edit_file on this file again.`;
                 }
 
                 // Validated-source-file guard: if this file was successfully compiled/exported this
@@ -13161,12 +13102,14 @@ ${sampleHtml}
      * large data pipelines) and for non-bash spawn paths (python -c, ssh).
      */
     private static applySandbox(cmd: string): string {
+        // Windows/Git Bash: ulimit -t and -v always fail — skip sandbox entirely.
+        if (process.platform === 'win32') { return cmd; }
         const skipPatterns = [
             /\b(docker|kubectl|helm|terraform|ansible)\b/,
             /\b(pip3?\s+install|npm\s+(install|ci)|apt(-get)?\s+install)\b/,
             /\b(ssh|scp|sftp)\b/,
-            /\bgit\b/,  // all git commands — ulimit -v fails on Git Bash (Windows) for any git op
-            /\baws\b/,  // AWS CLI on Windows: ulimit breaks the Python-wrapper launcher
+            /\bgit\b/,
+            /\baws\b/,
         ];
         if (skipPatterns.some(re => re.test(cmd))) {
             return cmd;
@@ -13272,11 +13215,14 @@ ${sampleHtml}
             const linuxShell = process.platform !== 'win32'
                 ? (process.env.SHELL || '/bin/bash')
                 : true;
+            // Resolve the Python executable: prefer the shell-env detected path (covers ARM64 installs)
+            // over the bare command name from the regex match.
+            const resolvedPy = (process.platform === 'win32' ? detectShellEnvironment().pythonCmd : '') || (pyMatch ? pyMatch[1] : 'python3');
             const child = winBashPath
                 // Git Bash available: route everything through bash (handles ssh/scp/sftp/unix cmds)
                 ? spawn(winBashPath, ['-c', Agent.applySandbox(safeCmd)], { cwd, env: bashEnv, windowsHide: true })
                 : pyMatch
-                    ? spawn(pyMatch[1], ['-c', pyMatch[2]], { cwd, env: { ...process.env } })
+                    ? spawn(resolvedPy, ['-c', pyMatch[2]], { cwd, env: { ...process.env }, windowsHide: true })
                     : (isSshCmd && !isSshChained)
                         ? (() => {
                             // No bash on Windows (shouldn't happen): use parseSshArgs as last resort
@@ -13492,12 +13438,13 @@ ${sampleHtml}
 
             // Disable MSYS path conversion for shell_read bash invocations too
             const bashEnvR = { ...process.env, MSYS_NO_PATHCONV: '1', MSYS2_ARG_CONV_EXCL: '*' };
+            const resolvedPyR = (process.platform === 'win32' ? detectShellEnvironment().pythonCmd : '') || (pyMatchR ? pyMatchR[1] : 'python3');
             let child;
             if (winBashPathR) {
                 // Git Bash available: route everything (including ssh/scp/sftp) through bash
                 child = spawn(winBashPathR, ['-c', Agent.applySandbox(cmdR)], { cwd, env: bashEnvR, windowsHide: true });
             } else if (pyMatchR) {
-                child = spawn(pyMatchR[1], ['-c', pyMatchR[2]], { cwd, env: { ...process.env } });
+                child = spawn(resolvedPyR, ['-c', pyMatchR[2]], { cwd, env: { ...process.env }, windowsHide: true });
             } else if (isSshCmdR && !isSshChainedR) {
                 // No bash on Windows (shouldn't happen): use parseSshArgs as last resort
                 const args = Agent.parseSshArgs(cmd.trim());
@@ -13509,7 +13456,7 @@ ${sampleHtml}
                 post({ type: 'commandChunk', id: cmdId, text: `\n\u26a0\ufe0f Git Bash not found \u2014 running ${exe} directly (no shell features). Install Git for Windows for full support.`, stream: 'stderr' });
                 child = spawn(exe, args, { cwd, env: { ...process.env }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
             } else {
-                child = spawn(cmdR, [], { cwd, env: { ...process.env }, shell: true });
+                child = spawn(cmdR, [], { cwd, env: { ...process.env }, shell: true, windowsHide: true });
             }
             this.trackChild(child);
 
@@ -14181,7 +14128,7 @@ ${sampleHtml}
 
         if (ext === '.py') {
             try {
-                const pythonCmd = process.platform === 'win32' ? 'py' : 'python3';
+                const pythonCmd = detectShellEnvironment().pythonCmd || (process.platform === 'win32' ? 'py' : 'python3');
                 try {
                     execFileSyncFn(pythonCmd, ['-m', 'py_compile', absPath], {
                         timeout: 5000, stdio: 'pipe', encoding: 'utf8'
@@ -14434,7 +14381,7 @@ ${sampleHtml}
                         ? path.join(root, 'app')
                         : root;
                     const grepCmd = `grep -rn --include="*.py" "\\b${fn}\\b" "${searchDir}" 2>/dev/null`;
-                    const raw = execSync(grepCmd, { timeout: 3000, encoding: 'utf8' }).toString();
+                    const raw = execSync(grepCmd, { timeout: 3000, encoding: 'utf8', stdio: 'pipe' }).toString();
 
                     const callerLines = raw.split('\n')
                         .filter(l => l.trim())
@@ -16865,7 +16812,6 @@ ${sampleHtml}
                                     '  decisions: string[] -- key decisions made',
                                     '  edits_made: string[] -- describe each successful file edit',
                                     '  blockers: string[] -- anything that failed or was unclear',
-                                    '  next_step: string -- what should happen next if the task is not done',
                                     'Output ONLY the JSON. No explanation, no markdown fences.',
                                 ].join('\n'),
                             },
@@ -16897,7 +16843,6 @@ ${sampleHtml}
                 if (Array.isArray(structured.edits_made) && structured.edits_made.length) {
                     lines.push(`Edits made: ${(structured.edits_made as string[]).join(' | ')}`);
                 }
-                if (structured.next_step) { lines.push(`Next step: ${structured.next_step}`); }
                 if (Array.isArray(structured.blockers) && structured.blockers.length) {
                     lines.push(`Blockers: ${(structured.blockers as string[]).join(' | ')}`);
                 }
@@ -16978,18 +16923,10 @@ ${sampleHtml}
     private injectPostCompactContext(wipSnapshot: string, wipLines: string[]): string {
         if (!this._currentTaskMessage) { return ''; }
 
-        // Load any recent Tier 2 memory facts (includes the sync WIP entry we just saved)
-        let recentMemFacts = '';
-        if (this.memory) {
-            try {
-                const tier2 = this.memory.getTier(2)
-                    .filter(e => e.tags?.includes('auto-compact') || e.tags?.includes('wip-sync'))
-                    .slice(0, 4);
-                if (tier2.length) {
-                    recentMemFacts = '\n\nSession memory (from compaction):\n' + tier2.map(e => `- ${e.content.slice(0, 150)}`).join('\n');
-                }
-            } catch { /* skip */ }
-        }
+        // NOTE: Do NOT inject Tier 2 memory here. auto-compact entries accumulate across
+        // sessions and contain next_step / task context from prior unrelated tasks. Injecting
+        // them after compaction causes the agent to pursue work from old sessions.
+        // The WIP snapshot and task log below are sufficient for current-session continuity.
 
         // Read task log file -- the richest record of what was planned and completed.
         let taskLogContent = '';
@@ -17006,7 +16943,7 @@ ${sampleHtml}
             } catch { /* skip */ }
         }
 
-        const injectedCompactNote = `${wipSnapshot}${taskLogContent}${recentMemFacts}\n\nResume task: ${this._currentTaskMessage}`;
+        const injectedCompactNote = `${wipSnapshot}${taskLogContent}\n\nResume task: ${this._currentTaskMessage}`;
         this.history.unshift({ role: 'user', content: injectedCompactNote });
         logInfo(`[context] Injected WIP snapshot after compaction (${wipLines.length} facts, taskLog=${taskLogId ?? 'none'})`);
         return injectedCompactNote;
@@ -17596,15 +17533,21 @@ return { failClass: _failClass, failHint: _failHint };
             : `You have tried to edit "${args.path}" with the same old_string ${editFailCount} times and it keeps failing.`;
         // Proactively inject the current file content so the model can write_file
         // without another read round-trip — this is the main cause of post-compaction loops.
+        // For large files (>12000 chars), don't truncate — instead tell the model to read_file
+        // first. A truncated content block causes the model to write an incomplete file.
         let fileContentBlock = '';
         try {
             const absEscPath = path.isAbsolute(filePath) ? filePath : path.join(this.workspaceRoot, filePath.replace(/\//g, path.sep));
             const fileLines = fs.readFileSync(absEscPath, 'utf8').split('\n');
             const numbered = fileLines.map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n');
-            const truncated = numbered.length > 12000 ? numbered.slice(0, 12000) + '\n...(file truncated at 12000 chars)' : numbered;
-            fileContentBlock = `\n\n[CURRENT FILE CONTENT: ${filePath}]\n${truncated}\n\nUse write_file with path="${filePath}" and the full corrected content. Line numbers above (NNNN:) are for reference only — do NOT include them in write_file content.`;
+            if (numbered.length <= 12000) {
+                fileContentBlock = `\n\n[CURRENT FILE CONTENT: ${filePath}]\n${numbered}\n\nUse write_file with path="${filePath}" and the full corrected content. Line numbers above (NNNN:) are for reference only — do NOT include them in write_file content.`;
+            } else {
+                // File is too large to inline — tell the model the exact steps to avoid freezing
+                fileContentBlock = `\n\n[FILE IS LARGE (${fileLines.length} lines) — do NOT try to reconstruct it from memory]\n\nRequired steps:\n1. Call read_file with path="${filePath}" to get the current content\n2. Apply your change to that content\n3. Call write_file with path="${filePath}" and the COMPLETE updated content\n\nDo NOT call edit_file on this file again — it is hard-blocked.`;
+            }
         } catch { /* non-fatal */ }
-        const editHint = `${reason}\n\nSTOP using edit_file on this file. Switch to write_file: read the current content shown below, apply your change, and call write_file with the complete corrected file. DO NOT use a Python script.${sweepHint}${fileContentBlock}`;
+        const editHint = `${reason}\n\nSTOP using edit_file on this file. Switch to write_file.${sweepHint}${fileContentBlock}\n\n[TASK IS NOT DONE — call write_file now to complete the edit.]`;
         logWarn(`[agent] edit_file failure threshold reached (${editFailCount}x same-sig, ${fileFailCount}x file) on "${args.path}" -- hard-blocking, injecting file content`);
         this._editFileHardBlocked.add(filePath);
         if (isTextMode) {
@@ -17613,6 +17556,8 @@ return { failClass: _failClass, failHint: _failHint };
             this.history.push({ role: 'tool', content: `${toolResult}\n\n${editHint}` });
         }
         this.consecutiveFailures = 0;
+        this.autoRetryCount = 0; // File content injected — reset retry budget so model can act on it
+        this._taskPhase = 'acting'; // Prevent isLegitimateStop from firing on next narration turn
         return true;
         }
         return false;

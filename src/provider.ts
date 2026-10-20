@@ -709,6 +709,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             if (this._tab.agent) {
                                 this._tab.agent?.clearAutoApprovals();
                                 this._tab.agent.trustLevel = incoming;
+                                // Downgrade to Normal: inject history note to stop autonomous behavior.
                                 const filteredSM = incoming === 'normal'
                                     ? [...this._persistentApprovals].filter(t => !COMMAND_TOOLS_SM.has(t))
                                     : [...this._persistentApprovals];
@@ -940,20 +941,21 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     // Map: cmdId -> { cmd, outputBuf }
                     const _activeCmds = new Map<string, { cmd: string; outputBuf: string }>();
                     const trackedPost: PostFn = (m: object) => {
-                        // Intercept turnLimit: always re-evaluate canAutoContinue based on trust level.
-                        // Normal mode → canAutoContinue=false (show "Keep going?" button).
-                        // Trust/YOLO → canAutoContinue=true (show "Continuing…" spinner, auto-resumes).
+                        // Intercept turnLimit: re-evaluate canAutoContinue based on trust level.
+                        // Normal/Trust → canAutoContinue=false (show "Keep going?" button, user decides).
+                        // YOLO → always canAutoContinue=true (fully autonomous, overrides agent stop).
                         const _tlPm = m as { type: string; canAutoContinue?: boolean };
                         if (_tlPm.type === 'turnLimit') {
-                            const autoResuming = this._trustLevel === 'trust' || this._trustLevel === 'yolo';
+                            const agentWantsStop = !_tlPm.canAutoContinue;
+                            // Only YOLO auto-resumes. Normal and Trust both show the "Keep going?" card.
+                            const autoResuming = this._trustLevel === 'yolo';
                             if (runTab.id === this._activeTabId) {
                                 post({ ...(m as object), canAutoContinue: autoResuming });
                             }
-                            // If Trust/YOLO is overriding a canAutoContinue:false from the agent,
-                            // synthesize the continueTask ourselves so the run actually resumes.
-                            // (The agent only emits continueTask when it decides canAutoContinue=true.)
-                            if (autoResuming && !_tlPm.canAutoContinue) {
-                                logInfo(`[provider] Trust/YOLO: synthesizing continueTask for agent-stopped turn limit`);
+                            // YOLO only: synthesize continueTask when the agent tried to stop.
+                            // Normal/Trust: let the turn-limit card handle it — user decides.
+                            if (this._trustLevel === 'yolo' && agentWantsStop) {
+                                logInfo(`[provider] YOLO: synthesizing continueTask for agent-stopped turn limit`);
                                 trackedPost({ type: 'continueTask', prompt: 'keep going', model });
                             }
                             return;
@@ -1038,14 +1040,15 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             runTab.session.activeTask   = runTab.agent!.activeTask;
                             this.storage.upsert(runTab.session);
                         } else if (pm.type === 'continueTask') {
-                            // Agent exhausted its turn budget mid-task.
-                            // Normal: show "Keep going?" prompt in the turn-limit card — user decides.
-                            // Trust/YOLO: compact context first, then auto-continue.
-                            const ct = m as { type: string; prompt: string; model: string };
+                            // Agent wants to continue (turn-limit hit OR multi-task item transition).
+                            // isTaskTransition=true  → multi-task item boundary (auto-advance in Trust+YOLO, pause in Normal)
+                            // isTaskTransition=false → turn-limit hit (auto-advance in YOLO only, pause in Normal+Trust)
+                            const ct = m as { type: string; prompt: string; model: string; isTaskTransition?: boolean };
                             const continueModel = ct.model || model;
                             const continueText  = ct.prompt || 'keep going';
-                            if (this._trustLevel === 'trust' || this._trustLevel === 'yolo') {
-                                logInfo(`[provider] Trust/YOLO: compacting then auto-continuing: "${continueText}"`);
+                            const autoAdvance = this._trustLevel === 'yolo' || (ct.isTaskTransition && this._trustLevel === 'trust');
+                            if (autoAdvance) {
+                                logInfo(`[provider] ${this._trustLevel}: auto-advancing: "${continueText}"`);
                                 // Compact in background — don't await so we don't block the event stream.
                                 // The continuation is queued; it will fire after agentDone drains pendingMessage.
                                 runTab.pendingCompact = runTab.agent!.compactContext(25).then(() => {
@@ -1059,9 +1062,14 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                     raw:   { command: 'sendMessage', text: continueText, model: continueModel, trustLevel: this._trustLevel, includeFile: false, includeSelection: false },
                                 };
                             } else {
-                                // Normal mode: the turnLimit card already shows a "Keep going" button.
-                                // Don't auto-queue — let the user decide.
-                                logInfo(`[provider] Normal mode: turn limit hit, awaiting user input`);
+                                // Normal mode (or Trust hitting a turn-limit, not a task transition):
+                                // surface a turnLimit card so the user approves before continuing.
+                                logInfo(`[provider] ${this._trustLevel} mode: pausing — awaiting user input`);
+                                const taskMatch = continueText.match(/^\[TASK (\d+)\/(\d+)\]\s*(.*)/s);
+                                const cardText = taskMatch
+                                    ? `✅ Task ${Number(taskMatch[1]) - 1} done.\n\nNext: **${taskMatch[3].slice(0, 200)}**\n\nClick "Keep going" to continue or stop here.`
+                                    : `Ready for next step. Click "Keep going" to continue.`;
+                                post({ type: 'turnLimit', text: cardText, canAutoContinue: false, longSession: false, nextPrompt: continueText, nextModel: continueModel });
                             }
                             return; // don't forward continueTask to the webview
                         } else if (pm.type === 'confirmAction') {
@@ -1084,6 +1092,12 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         } else if (pm.type === 'error') {
                             const errText = (m as { type: string; text: string }).text;
                             runTab.session.messages.push({ role: 'error', content: errText, timestamp: Date.now() });
+                            // Discard any queued task-list message — errors should not auto-resume into the next item.
+                            if (runTab.pendingMessage) {
+                                logInfo(`[provider] Discarding queued message after error: "${runTab.pendingMessage.text.slice(0, 80)}"`);
+                                runTab.pendingMessage = undefined;
+                                runTab.pendingCompact = undefined;
+                            }
                             // Save rich scratchpad so user can resume after network drop or crash.
                             const task = runTab.agent!.activeTask;
                             const wsRoot = this._currentWorkspaceRoot ?? '';
@@ -1192,18 +1206,27 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
                         // Drain pending message — post it back to the webview so it
                         // re-sends as a normal sendMessage after agentDone renders.
+                        // Guard: if the agent declared legitimate completion (isLegitimateStop),
+                        // discard any stale queued [TASK N/M] message — it was queued by a prior
+                        // multi-task run and must not re-fire after a Q&A answer or task completion.
                         const pending = runTab.pendingMessage;
                         if (pending) {
                             runTab.pendingMessage = undefined;
-                            logInfo(`[provider] Draining queued message: "${pending.text.slice(0, 80)}"`);
-                            const compactWait = runTab.pendingCompact;
-                            runTab.pendingCompact = undefined;
-                            const dispatchDelay = compactWait
-                                ? compactWait.then(() => new Promise<void>(r => setTimeout(r, 300)))
-                                : new Promise<void>(r => setTimeout(r, 300));
-                            dispatchDelay.then(() => {
-                                post({ type: 'dispatchQueued', msg: pending.raw });
-                            });
+                            const wasLegitimateStop = runTab.agent?.runStats?.legitimateStop ?? false;
+                            if (wasLegitimateStop) {
+                                logInfo(`[provider] Discarding queued message after legitimate stop: "${pending.text.slice(0, 80)}"`);
+                                runTab.pendingCompact = undefined;
+                            } else {
+                                logInfo(`[provider] Draining queued message: "${pending.text.slice(0, 80)}"`);
+                                const compactWait = runTab.pendingCompact;
+                                runTab.pendingCompact = undefined;
+                                const dispatchDelay = compactWait
+                                    ? compactWait.then(() => new Promise<void>(r => setTimeout(r, 300)))
+                                    : new Promise<void>(r => setTimeout(r, 300));
+                                dispatchDelay.then(() => {
+                                    post({ type: 'dispatchQueued', msg: pending.raw });
+                                });
+                            }
                         }
                         }
                     }
@@ -1226,7 +1249,15 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     // this._tab (active tab) would miss a run on a background tab and
                     // instead stop an idle active tab. Stop every running tab.
                     const runningTabs = [...this._tabs.values()].filter(t => t.running);
-                    if (runningTabs.length === 0) { break; } // already stopped (e.g. stop-intent fired first)
+                    if (runningTabs.length === 0) {
+                        // No tabs running on the provider side, but the webview still shows
+                        // the stop button (agentActive=true). This happens when tab.running
+                        // was cleared by the finally block before the webview received agentDone.
+                        // Force-clear the webview spinner so the user is not stuck.
+                        post({ type: 'agentDone' });
+                        logInfo(`[provider] stopGeneration: no running tabs — force-clearing webview spinner`);
+                        break;
+                    }
                     for (const tab of runningTabs) {
                         tab.agent?.stop();
                         tab.running = false;

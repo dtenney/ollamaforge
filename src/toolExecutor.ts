@@ -19,12 +19,17 @@ import { logInfo } from './logger';
  * Pure — no `this`, no side-effects.
  */
 export function applySandbox(cmd: string): string {
+    // Windows/Git Bash: ulimit -t (cpu time) and ulimit -v (virtual memory) always fail with
+    // "cannot modify limit: Invalid argument", causing the shell to exit non-zero before the
+    // actual command runs. Skip the sandbox entirely on Windows.
+    if (process.platform === 'win32') { return cmd; }
+
     const skipPatterns = [
         /\b(docker|kubectl|helm|terraform|ansible)\b/,
         /\b(pip3?\s+install|npm\s+(install|ci)|apt(-get)?\s+install)\b/,
         /\b(ssh|scp|sftp)\b/,
-        /\bgit\b/,  // all git commands — ulimit -v fails on Git Bash (Windows) for any git op
-        /\baws\b/,  // AWS CLI on Windows: ulimit breaks the Python-wrapper launcher
+        /\bgit\b/,
+        /\baws\b/,
     ];
     if (skipPatterns.some(re => re.test(cmd))) {
         return cmd;

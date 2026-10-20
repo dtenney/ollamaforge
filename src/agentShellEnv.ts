@@ -147,11 +147,16 @@ export function detectShellEnvironment(): ShellEnvironment {
         else { shell = 'bash'; }
     }
 
-    // Detect Python executable -- try python3 first (Unix convention), then python (Windows/venvs)
+    // Detect Python executable -- try python3 first (Unix convention), then python (Windows/venvs),
+    // then well-known Windows ARM64 install path as a fallback.
     let pythonCmd = '';
-    for (const candidate of ['python3', 'python']) {
+    const WIN_ARM64_PYTHON = 'C:/Users/david/AppData/Local/Programs/Python/Python314-arm64/python.exe';
+    const candidates: string[] = isWin
+        ? ['python3', 'python', WIN_ARM64_PYTHON]
+        : ['python3', 'python'];
+    for (const candidate of candidates) {
         try {
-            const out = execSync(`${candidate} --version`, { stdio: 'pipe', timeout: 3000 }).toString().trim();
+            const out = execSync(`"${candidate}" --version`, { stdio: 'pipe', timeout: 3000 }).toString().trim();
             if (/python\s+3\./i.test(out)) { pythonCmd = candidate; break; }
         } catch { /* not found */ }
     }
