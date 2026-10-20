@@ -346,6 +346,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
     // ── Tab management ────────────────────────────────────────────────────────
     private _tabs: Map<string, TabState> = new Map();
     private _activeTabId: string = '';
+    /** Monotonically incremented on every tab switch/open. Sent in sessionLoaded
+     *  so the webview can drop stale loads that arrive out of order. */
+    private _tabSwitchGen: number = 0;
 
     /** Active tab — always valid after resolveWebviewView */
     private get _tab(): TabState { return this._tabs.get(this._activeTabId)!; }
@@ -1446,8 +1449,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         runGeneration: 0,
                     });
                     this._activeTabId = newTabId;
+                    this._tabSwitchGen++;
                     // Order: clear content first, then update tab bar
-                    post({ type: 'clearChat' });
+                    post({ type: 'clearChat', tabSwitchGen: this._tabSwitchGen });
                     post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
                     logInfo(`[provider] Opened new tab: ${newTabId}`);
                     break;
@@ -1484,13 +1488,15 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             this._activeTabId = allIds[allIds.length - 1];
                         }
                         const active = this._tab;
+                        this._tabSwitchGen++;
                         // Order: clear, populate content, then update tab bar
-                        post({ type: 'clearChat' });
+                        post({ type: 'clearChat', tabSwitchGen: this._tabSwitchGen });
                         post({
                             type: 'sessionLoaded',
                             session: toSummary(active.session),
                             messages: active.session.messages,
                             pinnedMsgIds: active.session.pinnedMsgIds || [],
+                            tabSwitchGen: this._tabSwitchGen,
                         });
                     }
                     post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
@@ -1505,9 +1511,10 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     const outgoing = this._tab;
                     outgoing.draft = switchMsg.draft ?? '';
                     this._activeTabId = switchMsg.tabId;
+                    this._tabSwitchGen++;
                     const incoming = this._tab;
                     // Order: clear content, populate incoming session, then update tab bar highlight
-                    post({ type: 'clearChat' });
+                    post({ type: 'clearChat', tabSwitchGen: this._tabSwitchGen });
                     post({
                         type: 'sessionLoaded',
                         session: toSummary(incoming.session),
@@ -1516,6 +1523,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         draft: incoming.draft,
                         agentRunning: incoming.running,
                         liveBuffer: incoming.liveBuffer || '',
+                        tabSwitchGen: this._tabSwitchGen,
                     });
                     post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
                     // Restore context usage bar for the incoming tab

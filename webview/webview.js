@@ -3438,6 +3438,11 @@ function clearSearch() {
 // ═══ handlers.js ═══
 // ── Message handler (extension → webview) ────────────────────────────────────
 
+// Monotonic tab-switch generation counter. Incremented (via clearChat) whenever
+// the provider switches tabs. sessionLoaded messages from a prior generation are
+// dropped — they belong to a tab switch that has already been superseded.
+let currentTabSwitchGen = 0;
+
 /** @type {Record<string, (msg: any) => void>} */
 const msgHandlers = {
 
@@ -3597,6 +3602,9 @@ const msgHandlers = {
         autoResize();
         inputHistoryIdx = -1;
         inputHistoryDraft = '';
+        // Advance the tab-switch generation so any stale sessionLoaded (from a
+        // prior tab switch that hasn't been processed yet) is dropped.
+        if (msg.tabSwitchGen !== undefined) { currentTabSwitchGen = msg.tabSwitchGen; }
     },
 
     removeLastAssistant: (msg) => {
@@ -3674,6 +3682,12 @@ const msgHandlers = {
     },
 
     sessionLoaded: (msg) => {
+        // Drop stale session loads — if the provider sent clearChat with a higher
+        // tabSwitchGen after this sessionLoaded was queued, the load is for a tab
+        // that has already been superseded. Rendering it would blend two sessions.
+        if (msg.tabSwitchGen !== undefined && msg.tabSwitchGen < currentTabSwitchGen) {
+            return;
+        }
         renderStoredSession(msg.session, msg.messages, msg.pinnedMsgIds);
         // Always land at the bottom of the conversation when a tab is (re)loaded.
         // userScrolledUp/streaming state is stale from the previous tab, so force it.
