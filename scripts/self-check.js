@@ -28,8 +28,11 @@ try {
     checks.push({ ok: false, file: 'package.json (invalid JSON)' });
 }
 
-// 4. .ollamaforge directory exists
-checks.push({ ok: fs.existsSync(path.join(root, '.ollamaforge')), file: '.ollamaforge/' });
+// 4. .ollamaforge directory — only checked in local deploys, not CI
+// (it is gitignored and created at runtime, so CI fresh checkouts won't have it)
+if (!process.env.CI) {
+    checks.push({ ok: fs.existsSync(path.join(root, '.ollamaforge')), file: '.ollamaforge/' });
+}
 
 // 5. Node modules present
 for (const mod of ['better-sqlite3', 'tree-sitter', 'axios']) {
