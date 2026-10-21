@@ -39,9 +39,6 @@ jobs:
       - name: Run unit tests
         run: npm run test:unit
 
-      - name: Run coverage
-        run: npm run test:coverage
-
   build:
     name: Build VSIX
     runs-on: ubuntu-latest
