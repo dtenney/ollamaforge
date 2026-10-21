@@ -51,7 +51,7 @@
     "test": "npm run compile && vscode-test",
     "test:unit": "npm run compile && mocha --require dist/test/vscode-mock.js --ignore \"dist/test/unit/agentHarness.test.js\" \"dist/test/unit/**/*.test.js\"",
     "test:harness": "npm run compile && mocha --require dist/test/vscode-mock.js --timeout 30000 \"dist/test/unit/agentHarness.test.js\"",
-    "test:coverage": "npm run compile && nyc mocha --require dist/test/vscode-mock.js \"dist/test/unit/**/*.test.js\"",
+    "test:coverage": "npm run compile && c8 mocha --require dist/test/vscode-mock.js \"dist/test/unit/**/*.test.js\"",
     "self-check": "node scripts/self-check.js",
     "verify:deploy": "node scripts/verify-deploy.js"
   },
@@ -65,6 +65,7 @@
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^2.32.0",
     "better-sqlite3": "^13.0.3",
+    "c8": "^12.0.0",
     "esbuild": "^0.28.2",
     "highlight.js": "^11.11.1",
     "mocha": "^10.3.0",
