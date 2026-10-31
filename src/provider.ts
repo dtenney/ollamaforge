@@ -5,7 +5,7 @@ import { Agent, PostFn } from './agent';
 import { fetchModels, rawGet, streamChatRequest, generateChatTitle } from './ollamaClient';
 import { getConfig, MODEL_PRESETS } from './config';
 import { getActiveContext, buildContextString } from './context';
-import { logInfo, logWarn, logError, channel, toErrorMessage } from './logger';
+import { logInfo, logWarn, logError, channel, toErrorMessage, writeToErrorLog } from './logger';
 import { ChatStorage, ChatSession, StoredMessage, deriveTitle, relativeTime, PendingResume } from './chatStorage';
 import { appendSessionLog, appendSessionLogMd } from './sessionLog';
 import { indexWorkspaceFiles, fuzzySearchFiles, buildMentionContext } from './mentions';
@@ -598,6 +598,10 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     const models = await fetchModels();
                     const wsName = vscode.workspace.workspaceFolders?.[0]?.name ?? '';
                     post({ type: 'models', models, connected: models.length > 0, defaultModel: getConfig().model, workspaceName: wsName });
+                    // Always re-send the full tab list so the tab bar rebuilds correctly on
+                    // every webview re-init (sidebar hide/show, extension reload, etc.).
+                    // Without this the webview starts with tabList=[] and loses all open tabs.
+                    post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });
                     // Webview is now ready — restore session if there are messages.
                     // This fires every time the webview re-initializes (restart, sidebar re-open),
                     // ensuring the chat is never blank even if the initial setTimeout fires too early.
@@ -609,6 +613,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             messages: this.currentSession.messages,
                             pinnedMsgIds: this.currentSession.pinnedMsgIds || [],
                             resumeSummary,
+                            agentRunning: this._running,
                         });
                         logInfo(`[provider] Session restored on getModels: "${this.currentSession.title}" — ${this.currentSession.messages.length} msgs`);
                     }
@@ -752,6 +757,37 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                     const resumeReason = (isResumeIntent && this.currentSession.pendingContinuation)
                         ? this.currentSession.pendingContinuation.reason
                         : null;
+                    // If resume intent but no pendingContinuation (e.g. second "keep going" click
+                    // after the first already cleared it), reconstruct task context from session
+                    // history so the agent doesn't start fresh and pivot to PROJECT.md items.
+                    const _resumeFallbackContext = (isResumeIntent && !this.currentSession.pendingContinuation)
+                        ? (() => {
+                            const msgs = this.currentSession.messages;
+                            const RESUME_RE = /^(keep going|continue|ok|okay|yes|yeah|yep|let'?s go|go ahead|carry on|keep going|more|next|still there|you there)\b/i;
+                            // Find the last substantive user message (not a resume phrase, not a "keep going")
+                            const lastRealTask = [...msgs].reverse().find(m =>
+                                m.role === 'user' &&
+                                m.content.trim().length > 30 &&
+                                !RESUME_RE.test(m.content.trim())
+                            );
+                            if (!lastRealTask) { return null; }
+                            const taskSnippet = lastRealTask.content
+                                .replace(/<active-file[\s\S]*?<\/active-file>/g, '')
+                                .replace(/<selection[\s\S]*?<\/selection>/g, '')
+                                .replace(/<mention[\s\S]*?<\/mention>/g, '')
+                                .trim()
+                                .slice(0, 300);
+                            // Find the last assistant message for what was most recently done
+                            const lastAsst = [...msgs].reverse().find(m => m.role === 'assistant');
+                            const lastAsstSnippet = lastAsst?.content?.trim().slice(0, 200) ?? '';
+                            const lines = [`[Continuing task — no saved resume state]`, `Original task: ${taskSnippet}`];
+                            if (lastAsstSnippet) { lines.push(`Last action: ${lastAsstSnippet}`); }
+                            lines.push(`IMPORTANT: Do NOT read PROJECT.md or plans/ — continue the task above from where it left off.`);
+                            logInfo(`[provider] Resume intent with no pendingContinuation — injecting task fallback from session history`);
+                            return lines.join('\n');
+                        })()
+                        : null;
+
                     const agentText = this.currentSession.pendingContinuation
                         ? (() => {
                             const r = this.currentSession.pendingContinuation!;
@@ -801,7 +837,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                                 return lines.join('\n');
                             }
                         })()
-                        : displayText;
+                        : (_resumeFallbackContext ?? displayText);
                     // Clear pendingContinuation in-memory whenever the user sends any message.
                     // Don't persist here — the run's finally block already upserts on completion,
                     // and if we crash between here and agent.run() the paused state is still on disk.
@@ -1095,6 +1131,10 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         } else if (pm.type === 'error') {
                             const errText = (m as { type: string; text: string }).text;
                             runTab.session.messages.push({ role: 'error', content: errText, timestamp: Date.now() });
+                            // Mirror chat errors to agent-errors.log for easy review.
+                            { const sessionLabel = runTab.session.title || 'untitled';
+                              const _safeErr = errText.replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ').slice(0, 2000);
+                              writeToErrorLog(`[CHAT-ERROR] ${new Date().toISOString()}  [${sessionLabel}]  ${_safeErr}`); }
                             // Discard any queued task-list message — errors should not auto-resume into the next item.
                             if (runTab.pendingMessage) {
                                 logInfo(`[provider] Discarding queued message after error: "${runTab.pendingMessage.text.slice(0, 80)}"`);
@@ -1151,6 +1191,19 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             this._outdatedTracker.markShown(req, model);
                             post({ type: 'info', text: `⚠ "${model}" is an older model family. Consider a newer model (e.g. gemma4, qwen3, llama3.3) for better agentic coding performance.` });
                         }
+                    }
+
+                    // Build peer-tab context: brief summary of what other tabs are doing.
+                    // Lets this agent know to stay in its lane when PROJECT.md has items
+                    // that belong to a different tab's active task.
+                    {
+                        const peerLines: string[] = [];
+                        for (const [tid, t] of this._tabs) {
+                            if (tid === runTab.id || !t.session.title || t.session.title === 'New Chat') { continue; }
+                            const status = t.running ? '(running)' : '(idle)';
+                            peerLines.push(`- Tab "${t.session.title}" ${status}`);
+                        }
+                        runTab.agent!.peerTabContext = peerLines.join('\n');
                     }
 
                     try {
@@ -1408,6 +1461,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                         messages: session.messages,
                         pinnedMsgIds: session.pinnedMsgIds || [],
                         resumeSummary: buildResumeSummary(session),
+                        agentRunning: this._tab.running,
                     });
                     // Re-sync trust level to the webview after session load
                     // (the webview resets its dropdown on sessionLoaded)
@@ -1497,6 +1551,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
                             messages: active.session.messages,
                             pinnedMsgIds: active.session.pinnedMsgIds || [],
                             tabSwitchGen: this._tabSwitchGen,
+                            agentRunning: active.running,
                         });
                     }
                     post({ type: 'tabList', tabs: this.getTabSummaries(), activeTabId: this._activeTabId });

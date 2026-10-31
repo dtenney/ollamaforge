@@ -242,13 +242,18 @@ export function buildSystemPrompt(autoSaveMemory: boolean, workspaceRoot?: strin
     const activeLanguage = activeEditor?.document.languageId ?? '';
     const activeFile = activeEditor ? vscode.workspace.asRelativePath(activeEditor.document.uri) : '';
 
+    // Always-on: explicit "remember / save to memory" commands must work regardless of autoSaveMemory setting.
+    const memoryExplicitBlock = `
+## Memory -- explicit save commands (always active)
+When the user says "remember", "save to memory", "add to memory", "note that", or "don't forget": call memory_tier_write immediately. Do NOT say "I'll save that" — actually call the tool.
+Tiers: 0=infrastructure (IPs, ports, paths, URLs), 1=tools/frameworks/languages, 2=current work/decisions, 3=conventions/workflows, 4=past solutions.
+One atomic fact per call. Multiple facts = multiple calls. Never save passwords or tokens.
+Stale correction: if a tool result contradicts a memory entry, delete the old one and write the corrected fact.
+`;
+
+    // Auto-save: additionally save facts silently as the agent discovers them (requires config opt-in).
     const autoSaveBlock = autoSaveMemory ? `
-## Memory -- save facts silently as you learn them
-When you discover an IP, hostname, path, URL, framework, tool, convention, or decision: call memory_tier_write immediately, without announcing it.
-Tiers: 0=infrastructure (IPs/paths/ports), 1=tools/frameworks, 2=current work, 3=conventions, 4=solutions/workarounds.
-One fact per entry, atomic. Never save passwords, tokens, or credentials.
-Stale correction: if a tool result contradicts a loaded memory entry, delete the old entry and write the corrected fact before continuing.
-Session end: write one Tier 2 summary -- what was done, what is open, any decisions made.
+Auto-save is ON: also save any newly discovered IP, hostname, URL, port, path, framework, tool, or convention to memory without being asked. Session end: write one Tier 2 summary of what was done and what remains open.
 ` : '';
 
     const workspaceInfo = workspaceRoot ? `Workspace: ${workspaceRoot}` : '';
@@ -274,6 +279,24 @@ Check memory_search and hosts_inventory.json before SSHing anywhere. Save every 
     const hasCsvOrLargeData = workspaceRoot && (() => {
         try { return fs.readdirSync(workspaceRoot).some(f => /\.(csv|log|parquet|jsonl)$/i.test(f)); } catch { return false; }
     })();
+
+    // Windows/Git Bash constraint — always injected on win32, regardless of workspace type.
+    // The agent runs inside Git Bash on Windows; certain SSH patterns are broken by the shell
+    // before the command reaches the remote host, so the model must know this unconditionally.
+    const isWindows = process.platform === 'win32';
+    const gitBashBlock = isWindows ? `
+## Windows / Git Bash shell constraints (ALWAYS applies on this machine)
+You are running inside Git Bash on Windows. This affects ALL ssh commands you issue:
+- **NEVER use heredocs (<< EOF) over ssh.** Git Bash mangles the quoting before ssh sees it — the remote receives garbage or an error. This applies to ALL workspaces, not just server-admin ones.
+- **NEVER use ssh ... sed -i or ssh ... 'cat > file << EOF'** — same quoting problem. The remote file ends up corrupted.
+- **NEVER use ssh with inline Python (python3 -c "...")** — quote nesting fails in Git Bash.
+- **NEVER use long ssh && chains** — a silent failure in an early step leaves the system half-applied.
+- **For any multi-line content that needs to land on a remote host**, always use the local write + scp pattern:
+  1. write_file locally (e.g. scripts/my.conf)
+  2. run_command: scp scripts/my.conf user@host:/tmp/my.conf
+  3. run_command: ssh user@host 'sudo mv /tmp/my.conf /etc/target/my.conf'
+- Simple one-liners over ssh are fine: "ssh host systemctl restart svc", "ssh host ls /path".
+` : '';
 
     const remoteExecBlock = hasRemoteHints ? `
 ## Remote execution (SSH / BusyBox targets)
@@ -382,7 +405,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 **Configuration spirals: stop at 2.** If you write a config file and the service fails to start or rejects it twice, do NOT keep tweaking the config from memory or guesswork. Stop immediately, fetch the official documentation or a working example from the web (web_search or web_fetch the GitHub README/docs), and only rewrite the config once you have confirmed the correct format from a real source.
 **One question at a time.** If you must ask the user something, ask the single most important question. Never ask for information you can discover yourself with a tool.
 **Clean up temp scripts when done.** Any helper scripts you wrote to accomplish the task (files in scripts/, /tmp/, or named like stage_*.py, check_*.py, fix_*.py, validate_*.py, migrate_*.py, convert_*.py) are temporary. Delete them with run_command before declaring the task complete, unless the user explicitly asked you to keep the script.
-**Local scratch work stays in the workspace.** Never use /tmp or the OS temp dir for local clones, scratch files, or intermediate data. Use .ollamaforge/tmp/ instead (it is gitignored and workspace-local). /tmp is only acceptable for scripts being scp'd to a remote host.
+**Local scratch work stays in the workspace.** Never redirect output to /tmp/ for local scratch, large-output capture, or intermediate data — use .ollamaforge/tmp/ instead (gitignored, workspace-local). Example: "python3 script.py > .ollamaforge/tmp/output.txt" NOT "> /tmp/output.txt". Reading back /tmp/ files triggers a confirmation dialog because they are outside the workspace. /tmp/ is only acceptable as a destination in scp commands targeting a remote host.
 **Don't run long scripts — hand them to the user.** Before running a Python script with run_command, ask yourself: will this finish in under 60 seconds? If it crawls files (os.walk, glob **), reads large datasets (pd.read_csv, iterrows), makes network calls in a loop (requests, paramiko, scp), or touches a large database (cursor.execute over many rows), it will timeout. Instead: (1) tell the user the script is ready and give them the exact command to run themselves, OR (2) add a --limit N flag and run only a small sample to verify it works, then hand the full run to the user. Never silently let a long-running script time out and then retry it.
 
 ## Deep review checklist (apply before declaring any review/audit complete)
@@ -400,7 +423,7 @@ Rule of thumb: Looks right does not mean it works. Always verify the full call c
 - OpenSCAD internal threads: bore at MAJOR_R using difference(), then OUTSIDE the difference block union annular ridge cylinders at MINOR_R. NEVER place thread rings inside difference() -- they will be subtracted (removed), not added. Pattern: \`difference() { cube([...]); translate([cx,cy,cz]) rotate([0,90,0]) cylinder(h=depth+1, r=MAJOR_R, center=true); }\` then separately \`for (i=[0:n-1]) { translate([cx, cy, cz_i]) rotate([0,90,0]) cylinder(h=pitch*0.55, r=MINOR_R, center=true); }\` where MINOR_R < MAJOR_R and the ridge cylinders sit inside the bore.
 - Merging files: copy ACTUAL method bodies verbatim from the source file. Do NOT use placeholder comments like "# Implementation from X.py" or bare pass statements. Read the source first, copy real code.
 
-${remoteExecBlock}${dataPipelineBlock}${autoSaveBlock}${serverAdminBlock}
+${gitBashBlock}${remoteExecBlock}${dataPipelineBlock}${memoryExplicitBlock}${autoSaveBlock}${serverAdminBlock}
 ## Cross-workspace system map
 Call system_map_query only when the task explicitly involves SSH, a remote host, a shared service, or an inter-workspace dependency. Do NOT call it for local file edits, 3D printing, coding tasks, or anything that runs entirely on the local machine. Call system_map_update when you learn a new host, IP, port, or service relationship. Mirror critical facts (IPs, paths, URLs) to Tier 0 memory as well.
 
@@ -548,7 +571,7 @@ INVESTIGATION DEPTH RULES -- apply when diagnosing issues or recommending system
 - When a previous developer left a feature in an incomplete state: say so explicitly. Distinguish between "the service is down and should be restarted" vs "the service is built but the integration into the app is missing."
 
 CRITICAL RULES:
-- When user says "Add to memory:" or "Save to memory:" -> IMMEDIATELY call memory_tier_write with the appropriate tier
+- When user says "Add to memory:", "Save to memory:", "Remember that", "Note that", or "Don't forget" -> IMMEDIATELY call memory_tier_write with the appropriate tier. This applies ALWAYS, not just when auto-save is on.
 - When user provides MULTIPLE pieces of information -> call memory_tier_write MULTIPLE TIMES (once per concept)
 - NEVER say "Saved to memory" or "I will save" - ACTUALLY CALL THE TOOL
 - DO NOT explain what tool to call - JUST CALL IT by outputting the <tool> block

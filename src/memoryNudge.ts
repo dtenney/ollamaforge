@@ -274,36 +274,54 @@ export function buildOrientationAnchor(
     activeTask: ActiveTaskState | null,
     trustLevel: string,
 ): string {
-    // Only inject periodically to avoid bloating context
-    if (toolCallsCount < 3 || toolCallsCount % 3 !== 0) { return ''; }
+    // Inject every 3 tool calls at low counts; every 5 at high counts to reduce noise.
+    // Always inject at the 10, 20, 30... milestones regardless of the interval.
+    const isHighCount = toolCallsCount >= 10;
+    const interval = isHighCount ? 5 : 3;
+    const isMilestone = toolCallsCount % 10 === 0;
+    if (toolCallsCount < 3 || (toolCallsCount % interval !== 0 && !isMilestone)) { return ''; }
 
     const parts: string[] = [];
 
-    // What was just done
+    // Progress header — escalate detail at high turn counts
+    if (isHighCount) {
+        parts.push(`tool call #${toolCallsCount}`);
+    }
+
+    // What was accomplished — show more files at high turn counts
     if (filesChanged.length > 0) {
-        const recent = filesChanged.slice(-3);
-        parts.push(`Files edited this run: ${recent.join(', ')}`);
+        const showCount = isHighCount ? 6 : 3;
+        const shown = filesChanged.slice(-showCount);
+        const andMore = filesChanged.length > showCount ? ` (+${filesChanged.length - showCount} more)` : '';
+        parts.push(`Files edited: ${shown.join(', ')}${andMore}`);
     }
 
     // Active task orientation
     if (activeTask) {
         if (activeTask.stepsCompleted.length > 0) {
-            parts.push(`Done: ${activeTask.stepsCompleted.slice(-3).join(', ')}`);
+            const showDone = isHighCount ? 5 : 3;
+            parts.push(`Done: ${activeTask.stepsCompleted.slice(-showDone).join(', ')}`);
         }
         if (activeTask.stepsPending.length > 0) {
             const next = activeTask.stepsPending[0];
-            parts.push(`NEXT: ${next}`);
+            const remaining = activeTask.stepsPending.length;
+            parts.push(`NEXT (${remaining} remaining): ${next}`);
         }
     }
 
-    // If no structured steps, nudge the model to check the plan file or work tracker
-    if (parts.length === 0 && trustLevel !== 'normal') {
-        return '\n\n[ORIENTATION] You have made ' + toolCallsCount + ' tool calls. Do NOT summarize progress. Act on the NEXT item immediately. If unsure what is next, read the work tracker or plan file.';
+    // If no structured steps, nudge the model — escalate urgency at high turn counts
+    if (parts.length <= (isHighCount ? 1 : 0)) {
+        if (trustLevel !== 'normal') {
+            const urgency = toolCallsCount >= 20
+                ? `You have made ${toolCallsCount} tool calls with no tracked steps. You may be spinning. STOP reading and make the change, or tell the user what is blocking you.`
+                : `You have made ${toolCallsCount} tool calls. Act on the NEXT item immediately. If unsure what is next, read the work tracker or plan file.`;
+            return '\n\n[ORIENTATION] ' + urgency;
+        }
+        return '';
     }
 
-    if (parts.length === 0) { return ''; }
-
-    return '\n\n[ORIENTATION] ' + parts.join(' | ') + (trustLevel !== 'normal' ? ' -- act on the NEXT item now, do not summarize.' : '');
+    const suffix = trustLevel !== 'normal' ? ' -- act on the NEXT item now, do not summarize.' : '';
+    return '\n\n[ORIENTATION] ' + parts.join(' | ') + suffix;
 }
 
 // ── autoLearnCorrection ─────────────────────────────────────────────────────

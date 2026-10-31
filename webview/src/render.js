@@ -226,13 +226,24 @@ messagesEl.addEventListener('click', (e) => {
 /** Whether the agent loop is actively running (broader than streaming — covers tool execution gaps) */
 let agentActive = false;
 
+// True while scrollBottom() is executing — prevents the scroll event from
+// re-locking userScrolledUp when the programmatic scroll fires the listener.
+let _programmingScroll = false;
+
 function scrollBottom(force = false) {
     if (force || (!userScrolledUp && (streaming || agentActive))) {
+        _programmingScroll = true;
         messagesEl.scrollTop = messagesEl.scrollHeight;
+        // Clear flag after the scroll event has fired (next microtask is too early;
+        // rAF ensures the browser has processed the scroll event handler).
+        requestAnimationFrame(() => { _programmingScroll = false; });
     }
 }
 
 messagesEl.addEventListener('scroll', () => {
+    // Ignore scroll events that we triggered ourselves — they must not re-lock
+    // userScrolledUp after the user has already scrolled back to the bottom.
+    if (_programmingScroll) { return; }
     const distFromBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
     userScrolledUp = distFromBottom > 60;
     scrollBtn.classList.toggle('visible', userScrolledUp && (streaming || agentActive));

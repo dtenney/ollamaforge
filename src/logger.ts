@@ -10,6 +10,7 @@ const ts = () => new Date().toISOString();
 
 const MAX_LOG_BYTES = 2 * 1024 * 1024; // 2 MB rolling cap
 let _logFilePath: string | null = null;
+let _errorLogPath: string | null = null;
 let _logLines: string[] = [];         // in-memory buffer, flushed on each write
 
 export function initFileLogger(workspaceRoot: string): void {
@@ -26,12 +27,28 @@ export function initFileLogger(workspaceRoot: string): void {
                 fs.writeFileSync(_logFilePath, existing.slice(-MAX_LOG_BYTES / 2), 'utf8');
             }
         } catch { /* ignore stat errors */ }
-    } catch { _logFilePath = null; }
+
+        // ── Errors-only log ───────────────────────────────────────────────────
+        _errorLogPath = path.join(dir, 'agent-errors.log');
+        fs.appendFileSync(_errorLogPath, `\n\n===== SESSION START ${new Date().toISOString()} =====\n`, 'utf8');
+        try {
+            if (fs.statSync(_errorLogPath).size > MAX_LOG_BYTES) {
+                const existing = fs.readFileSync(_errorLogPath, 'utf8');
+                fs.writeFileSync(_errorLogPath, existing.slice(-MAX_LOG_BYTES / 2), 'utf8');
+            }
+        } catch { /* ignore stat errors */ }
+    } catch { _logFilePath = null; _errorLogPath = null; }
 }
 
 function writeToFile(line: string): void {
     if (!_logFilePath) { return; }
     try { fs.appendFileSync(_logFilePath, line + '\n', 'utf8'); } catch { /* ignore */ }
+}
+
+/** Append a line to the errors-only log. */
+export function writeToErrorLog(line: string): void {
+    if (!_errorLogPath) { return; }
+    try { fs.appendFileSync(_errorLogPath, line + '\n', 'utf8'); } catch { /* ignore */ }
 }
 
 export function exportLog(workspaceRoot: string): string | null {
@@ -82,8 +99,8 @@ function sanitizeLog(m: string): string {
 }
 
 export const logInfo  = (m: string): void => { const line = `[INFO]  ${ts()}  ${sanitizeLog(redactSecrets(m))}`; channel.appendLine(line); writeToFile(line); };
-export const logWarn  = (m: string): void => { const line = `[WARN]  ${ts()}  ${sanitizeLog(redactSecrets(m))}`; channel.appendLine(line); writeToFile(line); };
-export const logError = (m: string): void => { const line = `[ERROR] ${ts()}  ${sanitizeLog(redactSecrets(m))}`; channel.appendLine(line); writeToFile(line); };
+export const logWarn  = (m: string): void => { const line = `[WARN]  ${ts()}  ${sanitizeLog(redactSecrets(m))}`; channel.appendLine(line); writeToFile(line); writeToErrorLog(line); };
+export const logError = (m: string): void => { const line = `[ERROR] ${ts()}  ${sanitizeLog(redactSecrets(m))}`; channel.appendLine(line); writeToFile(line); writeToErrorLog(line); };
 
 /** Extract a human-readable message from any caught value. */
 export function toErrorMessage(err: unknown): string {

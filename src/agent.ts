@@ -36,6 +36,12 @@ import { buildSystemPrompt, buildSystemPromptAsync, buildSmallModelSystemPrompt,
 import { stripXmlArtifacts as _stripXmlArtifacts, normalizeArgVal as _normalizeArgVal, filePathInMsg as _filePathInMsg, filterCompleteLine as _filterCompleteLine, isPlanningLine as _isPlanningLine, escHtml as _escHtml, looksLikePath as _looksLikePath, normalizePath as _normalizePath, requiredParams as _requiredParams, isAbsPath as _isAbsPath, isFilePath as _isFilePath, globToRegex as _globToRegex, globToRegexDeep as _globToRegexDeep, extractKeywords as _extractKeywords, generateBranchSlug as _generateBranchSlug, levenshtein, toolCallDigest, stableStringify} from './agentLoop';
 import { safePath as _safePath, resolvePathWithPolicy as _resolvePathWithPolicy, isOsProtectedPath as _isOsProtectedPath } from './pathPolicy';
 import { writePlanFile as _writePlanFile, updatePlanFile as _updatePlanFile, closePlanFile as _closePlanFile } from './planFile';
+import { ReasoningTrace, buildLoopNudge } from './loopDetector';
+import { handleTruncation, resetContinuationState, updateContinuationState, ContinuationState } from './truncationContinuation';
+import { findProjectFile as _findProjectFile, readProjectOpenItems as _readProjectOpenItems, countTrackingDocOpenItems as _countTrackingDocOpenItems, writeProjectFile as _writeProjectFileFn, stampProjectFile as _stampProjectFileFn } from './projectTracking';
+import { readTerminal as _readTerminal, getDiagnostics as _getDiagnostics, syntaxCheck as _syntaxCheck, findTestFile as _findTestFile } from './verification';
+import { buildMemoryNudge as _buildMemoryNudge, buildOrientationAnchor as _buildOrientationAnchor } from './memoryNudge';
+import { findFileByName as _findFileByName, findEditCandidates as _findEditCandidates } from './preEdit';
 
 // â"€â"€ Tool definitions
 
@@ -1621,6 +1627,10 @@ export class Agent {
         const lower = model.toLowerCase();
         return Agent.KNOWN_TEXT_MODE_FAMILIES.some(family => lower.startsWith(family) || lower.includes(':' + family));
     }
+    /** Cross-round loop detector — fires on sustained repetitive reasoning. */
+    private _reasoningTrace = new ReasoningTrace();
+    /** Truncation-continuation state — tracks consecutive length-truncated turns. */
+    private _continuationState: ContinuationState = { consecutiveCount: 0, lastRoundText: null };
     /** Track consecutive failed tool calls to prevent infinite loops */
     private consecutiveFailures = 0;
     private readonly MAX_CONSECUTIVE_FAILURES = 4;
@@ -1722,12 +1732,19 @@ export class Agent {
     /**
      * Sliding window of recent tool call signatures (tool_name + args hash).
      * Used to detect loops where the same call recurs non-consecutively
-     * (e.g. search -> read -> search -> read -> ...). Break after 4 occurrences
+     * (e.g. search -> read -> search -> read -> ...). Break after 3 occurrences
      * of any single signature within the last 12 calls (Thoth pattern).
      */
     private _recentToolSigs: string[] = [];
     private readonly RECENT_TOOL_SIG_WINDOW = 12;
-    private readonly RECENT_TOOL_SIG_MAX_REPEATS = 4;
+    private readonly RECENT_TOOL_SIG_MAX_REPEATS = 3;
+    /** Count of consecutive turns within the current run that made no meaningful progress.
+     *  "Progress" = any write/edit/command/search tool that advances toward the task goal.
+     *  Nudge fires at IDLE_TURN_NUDGE; hard break fires at IDLE_TURN_MAX. */
+    private _idleTurns: number = 0;
+    private _idleNudgeFired: boolean = false;
+    private readonly IDLE_TURN_NUDGE = 5;   // inject user-role warning
+    private readonly IDLE_TURN_MAX  = 10;  // hard break, show turnLimit card
     /** Total shell_read calls this run -- used to cap plan-task exploration regardless of interleaving */
     /** Higher limit for action tools (rename, run_command) during batch operations */
     private readonly MAX_CONSECUTIVE_SAME_TOOL_ACTION = 20;
@@ -1878,6 +1895,10 @@ export class Agent {
     private _editContextInjected: boolean = false;
     /** Whether the pre-flight write gate has fired this run (at most once per run) */
     private _preflightWriteGateFired: boolean = false;
+    /** User asked for plan-first: block edits/writes until they confirm */
+    public _planFirstMode: boolean = false;
+    /** User confirmed after plan-first plan was presented — writes now allowed */
+    public _planConfirmed: boolean = false;
     /** Count of one-at-a-time enumeration-style shell_read/run_command calls this run */
     private _enumerationCallCount: number = 0;
     /** Whether the SSH inline script guard has fired this run (resets each run to avoid repeated blocks) */
@@ -2471,6 +2492,10 @@ export class Agent {
     /** Current trust/autonomy level -- controls both tool auto-approval and proceed-question behavior. */
     trustLevel: 'normal' | 'trust' | 'yolo' = 'normal';
 
+    /** Brief summary of what other open tabs are working on, set by provider before each run.
+     *  Injected into the system prompt so this agent knows to stay in its own lane. */
+    peerTabContext: string = '';
+
     /** Seed trust-level approvals -- these survive per-turn resets and persist for the agent's lifetime. */
     seedPersistentApprovals(toolNames: Iterable<string>): void {
         for (const t of toolNames) { this._trustedTools.add(t); }
@@ -2615,6 +2640,22 @@ export class Agent {
         // Register post function so context-length warnings appear in the chat UI
         setContextWarnPostFn(post);
         this._currentTaskMessage = userMessage; // Capture task for use in tool interception
+        this._reasoningTrace.reset();
+        resetContinuationState(this._continuationState);
+
+        // ── Skill auto-activation ────────────────────────────────────────────────
+        // If the user message matches a skill's trigger patterns, activate it now
+        // so the skill prompt is injected into the system prompt for the first turn.
+        this.activeSkill = undefined;
+        if (this.workspaceRoot) {
+            const { loadSkills, findSkillByTrigger } = await import('./skillLibrary');
+            const skills = loadSkills(this.workspaceRoot);
+            const matched = findSkillByTrigger(skills, userMessage);
+            if (matched) {
+                this.activeSkill = matched;
+                logInfo(`[skillLibrary] Auto-activated skill "${matched.name}"`);
+            }
+        }
 
         // â"€â"€ Safety: deferred loop.done â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         // Guarantee the webview spinner always stops -- even if the run() body
@@ -2644,6 +2685,12 @@ export class Agent {
         // function or file named), inject a scope-first note so the agent searches and
         // reports what already exists before acting. This prevents the agent from using
         // a stale plan file as a standing order.
+        // If user confirms after a plan-first request, unlock the write gate.
+        if (isConfirmation && this._planFirstMode && !this._planConfirmed) {
+            logInfo('[plan-first] User confirmed — unlocking edit/write gate');
+            this._planConfirmed = true;
+        }
+
         const filePathInMsg = _filePathInMsg;
         const isVagueScope = /\b(add\s+some|add\s+(?:a\s+bit\s+of\s+)?validation|improve|make\s+(?:it\s+)?better|clean\s+up|refactor\s+(?:it|things)|can\s+you\s+add)\b/i.test(userMessage)
             && !/\b(function|method|file|class|def |import )\b/i.test(userMessage)
@@ -2793,7 +2840,7 @@ export class Agent {
         // step list -- it will be filled in once the model responds with its approach.
         const isExplicitPlanRequest = /\b(make|create|write|give me|draft)\s+(a\s+)?(plan|step[- ]by[- ]step|checklist)\b/i.test(userMessage);
         if (isExplicitPlanRequest && !this._activePlanFile && !this._isSubagent) {
-            this.writePlanFile(userMessage, ['Planning in progress...']);
+            await this.writePlanFile(userMessage, ['Planning in progress...']);
         }
 
         this._failedCommandSignatures.clear(); // Reset failed command tracking
@@ -2876,6 +2923,9 @@ export class Agent {
         this._preflightWriteGateFired = false; // Reset pre-flight write gate
         this._enumerationCallCount = 0;        // Reset enumeration loop counter
         this._sshInlineGuardFired = false;     // Reset SSH inline script guard
+        // Plan-first mode: persists across the initial run but clears when user confirms.
+        // Reset _planConfirmed each run so a new "before you proceed" request re-arms it.
+        this._planConfirmed = false;
         // Multi-item task list detection -- only on fresh user messages (not "keep going" continuations).
         // Parse numbered/bulleted lists into _pendingTaskItems so the agent auto-advances
         // through each item rather than stopping after the first one.
@@ -2931,6 +2981,8 @@ export class Agent {
         this._lastToolDigest = '';
         this._repeatToolCount = 0;
         this._runOutcome = 'done';
+        this._idleTurns = 0;
+        this._idleNudgeFired = false;
         this._legitimateStopFired = false;
         this._confirmTimedOut = false;
         this._currentRunModel = model;
@@ -3360,6 +3412,18 @@ export class Agent {
         const isCreativeTask = /\b(brainstorm|creative|ideate|suggest|what (could|can|should) we (build|add|create|do)|let'?s (build|create|design|explore|think about)|find (examples?|inspiration|ideas?)|what (ideas?|options?|possibilities)|how (might|could) we|what (would|if we)|explore (ideas?|options?|possibilities)|pitch|envision|imagine|what (features?|things?) (could|can|should)|get (creative|building|started))\b/i.test(userMessage)
             && !/\b(implement now|do it now|go ahead|proceed|fix|rename|delete|remove)\b/i.test(userMessage);
 
+        // "Plan first" request: user explicitly asks the agent to describe its approach
+        // before making any changes. The agent must explain what it will do, then stop
+        // and wait for the user to say "go ahead" or similar before touching any files.
+        const isPlanFirstRequest = /\b(tell me (what you('re| are| will| would|'?ll) (do|change|modify|update|fix|make|build|create|touch)|your plan|your approach|the plan|the approach)|review (the )?(effort|plan|approach|changes?|work|scope|impact)|what (are you going to|will you|would you) (do|change)|before (you )?(proceed|start|make|do|implement|chang|modif|edit)|don'?t (start|proceed|do|implement) (yet|until)|let me (know|see|review|approve) (first|before)|explain (first|before)|outline (what you|the steps|your plan)|show me (the plan|what you|your approach))\b/i.test(userMessage)
+            && !isConfirmation;  // "go ahead / yes / ok / let's do it" clears the gate
+        // Arm the gate on a plan-first request; keep it armed until the user confirms.
+        // _planConfirmed is set to true at the isConfirmation check above (line ~2681).
+        if (isPlanFirstRequest) {
+            this._planFirstMode = true;
+            this._planConfirmed = false;
+        }
+
         const isEditTask = /\b(add|insert|append|implement|fix|modify|update|change|remove|delete|refactor|rename|replace|wrap|extract|move|convert|migrate)\b/i.test(userMessage)
             && !/\b(import\s+\w+|from\s+\w+\s+import|path)\b/i.test(userMessage)
             && !isMultiFileRestructure
@@ -3457,7 +3521,7 @@ export class Agent {
                     logInfo(`[task-state] Pending steps: ${this._activeTask.stepsPending.join(' | ')}`);
                     // Auto-create a plan file when the task has 4+ programmatically-derived steps
                     if (!this._activePlanFile && !this._isSubagent && this._activeTask.stepsPending.length >= 4) {
-                        this.writePlanFile(userMessage, this._activeTask.stepsPending);
+                        await this.writePlanFile(userMessage, this._activeTask.stepsPending);
                     }
                 }
             }
@@ -3904,6 +3968,35 @@ The user has set trust level to Trust. This means:
 Before executing anything, call task_plan with action="create" and a "steps" array listing the steps you plan to take (e.g. ["Review X", "Fix Y", "Deploy Z"]). Then call task_plan action="advance" after each step completes. The ledger persists to disk and is re-injected every turn, so you never lose track of what is done vs. pending across context compactions and turn-limit resets.`;
         }
 
+        // ── Plan-first gate ───────────────────────────────────────────────────────
+        // User said "tell me what you're going to do before proceeding" (or equivalent).
+        // The agent must explain its plan and then STOP — no edits or writes until the
+        // user sends a confirmation ("go ahead", "looks good", "do it", etc.).
+        if (isPlanFirstRequest) {
+            this._planFirstMode = true;
+            baseSystemContent += `\n\n## ⛔ PLAN-FIRST MODE — DO NOT MAKE ANY CHANGES YET
+The user has explicitly asked you to explain what you are going to do BEFORE making any changes.
+
+Your job this turn:
+1. Read whatever files you need to understand the task (read_file / search_files are allowed).
+2. Write a clear, numbered plan describing exactly what you will change and why.
+3. End your response with: "Shall I proceed?" — then STOP. Do not call edit_file or write_file.
+
+The edit_file and write_file tools are BLOCKED until the user replies with a confirmation ("go ahead", "yes", "do it", "proceed", "looks good", or similar). If you call them now, they will be rejected. Present your plan and wait.`;
+        } else if (this._planFirstMode && (isConfirmation || this._planConfirmed)) {
+            // Gate was previously active but is now cleared — user explicitly confirmed.
+            // Inject an explicit cancellation so the model doesn't carry over the old block
+            // from a prior turn's system prompt still visible in its context window.
+            this._planFirstMode = false;
+            baseSystemContent += `\n\n## ✅ PLAN-FIRST MODE CLEARED
+The plan-first hold from an earlier turn is now lifted. write_file, edit_file, and all other tools are available. Proceed with the task immediately — do not ask for permission again.`;
+        } else if (this._planFirstMode) {
+            // Gate still active — user has not confirmed yet. Re-inject the block so
+            // the model remembers it persists even if it asks a clarifying question.
+            baseSystemContent += `\n\n## ⛔ PLAN-FIRST MODE — STILL WAITING FOR CONFIRMATION
+You already presented your plan. The user has NOT yet confirmed. Do NOT call edit_file or write_file. Answer any questions, then remind the user to say "go ahead" when ready.`;
+        }
+
         // ── Plan ledger injection ─────────────────────────────────────────────────
         // If a task_plan ledger exists for the active task, re-inject its current
         // state every turn so the model always knows exactly which step it is on.
@@ -3975,11 +4068,18 @@ This task spans multiple phases or streams. A PROJECT.md skeleton has been creat
                 const nextActionMatch = pfContent.match(/\*\*Next action\*\*:\s*(.+)/);
                 const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
                 if (nextActionMatch) {
-                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nLast recorded next action: **${nextActionMatch[1].trim()}**\nRead ${relPf} now to see the current open items before responding.`;
+                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nLast recorded next action: **${nextActionMatch[1].trim()}**\nThis is background context — handle the user's current request first, then consult ${relPf} for next steps if no other task is active.`;
                 } else {
-                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nA project tracking file exists. Read it now to see current status before responding.`;
+                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nA project tracking file exists. This is background context — handle the user's current request first, then consult it if no other task is active.`;
                 }
             } catch { /* non-fatal */ }
+        }
+
+        // Inject peer-tab context so this agent knows what other open tabs are working on.
+        // This prevents PROJECT.md nudges from causing a tab to abandon its own task for
+        // an item another tab is already handling.
+        if (this.peerTabContext) {
+            baseSystemContent += `\n\n## OTHER OPEN TABS\n${this.peerTabContext}\nStay focused on YOUR current task. Do not start work on tasks listed above — those belong to other tabs.`;
         }
 
         // Inject active skill prompt into system content (skip when using slim prompt to save space)
@@ -4038,7 +4138,7 @@ ${hints.join('\n')}`;
                 const openItems = this.readProjectOpenItems();
                 if (openItems) {
                     const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
-                    const nudgeText = `[SYSTEM: PROJECT CONTEXT REMINDER — You are working on an extended project tracked in ${relPf}. Current open items:\n\n${openItems}\n\nAfter completing any item, tick it off in ${relPf} with edit_file. Do not declare the overall project done until all items are checked. Do not mention this reminder to the user.]`;
+                    const nudgeText = `[SYSTEM: PROJECT CONTEXT REMINDER — You are working on an extended project tracked in ${relPf}. Current open items:\n\n${openItems}\n\nIMPORTANT: This is background context only. If the user has given you a specific task in this conversation, finish THAT task first — do not switch to a PROJECT.md item mid-task. After completing any item, tick it off in ${relPf} with edit_file. Do not declare the overall project done until all items are checked. Do not mention this reminder to the user.]`;
                     projectNudgeMsg = { role: 'user', content: nudgeText };
                     this._projectNudgeLastTurn = this.userTurnCount;
                     logInfo(`[project] Project nudge injected at turn ${this.userTurnCount} (${openItems.split('\n').filter(l => l.startsWith('- [ ]')).length} open items)`);
@@ -4562,6 +4662,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
             post({ type: 'agentStatus', turn: turn + 1, maxTurns: MAX_TURNS, phase: 'thinking' });
             this._focusedGrepInjectedThisTurn = false; // Reset per-turn to prevent double-injection
             this._recentSearchResultIds.clear();        // Reset per-turn search_hit tracking
+            let _progressThisTurn = false;             // Set when any progress tool runs this turn
 
             // Mtime-based drift detection: check every 5 turns if context files changed on disk
             if (turn > 0 && turn % 5 === 0 && !this._contextDriftWarned && this.workspaceRoot && this._contextFileMtimes.size > 0) {
@@ -5630,6 +5731,50 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // it injects actual file content so the model has what it needs to act.
                 const { thinkingLen, turnHasToolCall, turnHasText, turnHasThinkOnly, turnIsEmpty } = this.classifyTurnOutcome(toolCalls, displayContent, result.thinking);
 
+                // ── Cross-round loop detection ──────────────────────────────────────────
+                // Feed the reasoning text (thinking + display content) into ReasoningTrace.
+                // On tool calls reset the continuation state (agent is making progress).
+                // On non-tool turns, check for the escalating loop response ladder.
+                {
+                    const roundText = (result.thinking ?? '') + '\n' + displayContent;
+                    if (toolCalls.length > 0) {
+                        resetContinuationState(this._continuationState);
+                        this._reasoningTrace.reset();
+                    } else {
+                        updateContinuationState(this._continuationState, roundText);
+                        const loopResult = this._reasoningTrace.recordRound(roundText);
+                        if (loopResult.isLooping) {
+                            let nudge = buildLoopNudge(loopResult);
+                            logWarn(`[agent] Loop detected level=${loopResult.level} streak=${loopResult.streak} — ${loopResult.reason}`);
+                            // Level 1: append plan progress ledger so the model knows what's left
+                            if (loopResult.level === 1 && this._activePlanFile) {
+                                try {
+                                    const fs = await import('fs');
+                                    const planText = fs.readFileSync(this._activePlanFile, 'utf8');
+                                    if (planText.trim().length > 0) {
+                                        const { trackPlanSteps } = await import('./planStepTracker');
+                                        const facts = this._toolCallsThisRun.map(tc => ({
+                                            tool: tc.name,
+                                            filePath: tc.path,
+                                            success: true,
+                                        }));
+                                        const tracking = trackPlanSteps(planText, facts);
+                                        nudge += `\n\n**Plan progress:** ${tracking.ledger.ledgerText}`;
+                                    }
+                                } catch { /* best-effort */ }
+                            }
+                            if (loopResult.level >= 3) {
+                                // Honest stop: surface to user and break
+                                post({ type: 'token', text: `\n\n${nudge}` });
+                                post({ type: 'streamEnd' });
+                                break;
+                            }
+                            // Levels 0-2: inject nudge into history and continue
+                            this.history.push({ role: 'user', content: nudge });
+                        }
+                    }
+                }
+
                 if (this.checkNoveltyFingerprint(toolCalls, displayContent, turn, isTextMode, post, _noveltyStallThreshold)) {
                     continue;
                 }
@@ -5734,6 +5879,62 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 // Without this, the loop falls through and re-runs, causing the agent
                 // to keep working after it already said it was done.
                 if (isLegitimateStop) {
+                    // ── Done-gate: block stop if plan has unchecked steps ───────────────
+                    if (this._activePlanFile) {
+                        try {
+                            const fs = await import('fs');
+                            const planText = fs.readFileSync(this._activePlanFile, 'utf8');
+                            if (planText.trim().length > 0) {
+                                const { trackPlanSteps } = await import('./planStepTracker');
+                                const facts = this._toolCallsThisRun.map(tc => ({
+                                    tool: tc.name,
+                                    filePath: tc.path,
+                                    success: true,
+                                }));
+                                const tracking = trackPlanSteps(planText, facts);
+                                if (tracking.doneGate) {
+                                    // Escape hatch: the agent used task_plan (JSON ledger) instead of
+                                    // the markdown checkbox system to track steps. If it advanced
+                                    // enough steps OR if the JSON ledger is fully done, release the gate.
+                                    // tc.path for task_plan is encoded as "action:task_id"
+                                    const taskPlanAdvances = this._toolCallsThisRun.filter(
+                                        tc => tc.name === 'task_plan' && String(tc.path ?? '').startsWith('advance:')
+                                    ).length;
+                                    const taskPlanTaskIds = [...new Set(
+                                        this._toolCallsThisRun
+                                            .filter(tc => tc.name === 'task_plan')
+                                            .map(tc => String(tc.path ?? '').split(':')[1] ?? '')
+                                            .filter(p => p.length > 0)
+                                    )];
+                                    let taskPlanAllDone = false;
+                                    for (const tid of taskPlanTaskIds) {
+                                        try {
+                                            const ledgerPath = path.join(this.workspaceRoot, '.ollamaforge', 'tasks', tid, 'plan.json');
+                                            if (fs.existsSync(ledgerPath)) {
+                                                const ledger = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+                                                if (Array.isArray(ledger.steps) && ledger.steps.length > 0
+                                                    && ledger.steps.every((s: { status: string }) => s.status === 'done' || s.status === 'skipped')) {
+                                                    taskPlanAllDone = true;
+                                                    logInfo(`[planStepTracker] Done-gate escaped via task_plan ledger "${tid}" (all steps done)`);
+                                                    break;
+                                                }
+                                            }
+                                        } catch { /* ignore */ }
+                                    }
+                                    if (!taskPlanAllDone && taskPlanAdvances < tracking.ledger.pending.length) {
+                                        logInfo(`[planStepTracker] Done-gate fired: ${tracking.ledger.pending.length} step(s) remain`);
+                                        this.history.push({ role: 'user', content: tracking.doneGate });
+                                        continue;
+                                    }
+                                    if (taskPlanAllDone || taskPlanAdvances >= tracking.ledger.pending.length) {
+                                        logInfo(`[planStepTracker] Done-gate satisfied via task_plan (advances=${taskPlanAdvances}, allDone=${taskPlanAllDone})`);
+                                    }
+                                }
+                            }
+                        } catch {
+                            // plan file missing or unreadable — allow stop
+                        }
+                    }
                     logInfo(`[agent] isLegitimateStop (toolCalls=${toolCalls.length}) — breaking loop`);
                     loopExhausted = false;           // clean stop — do not show turn-limit card
                     legitimateStopFired = true;      // block multi-task auto-advance
@@ -5799,10 +6000,17 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // text response as its previous turn (no tools, same content), it's stuck in
                     // a "I already told you" replay loop. Accept the response and break rather than
                     // nudging again — nudging only makes it repeat the same answer more times.
+                    // Exception: if the last injected message was a hard-block with file content
+                    // (TASK IS NOT DONE), the model hasn't actually been given a chance to act yet —
+                    // the pre-failure narration was popped, so the "previous turn" match is stale context.
+                    // Skip the repetition check when we're mid-task (acting phase) with a hard-block pending.
+                    const lastInjected = this.history[this.history.length - 1];
+                    const lastInjectedIsHardBlock = typeof lastInjected?.content === 'string'
+                        && lastInjected.content.includes('TASK IS NOT DONE');
                     const prevAssistant = [...this.history].reverse().find((h, i) => i > 0 && h.role === 'assistant');
                     const prevText = typeof prevAssistant?.content === 'string' ? prevAssistant.content.trim() : '';
                     const curText = resp.trim();
-                    if (prevText.length > 100 && curText.length > 100) {
+                    if (!lastInjectedIsHardBlock && prevText.length > 100 && curText.length > 100) {
                         // Similarity: compare first 200 chars (enough to detect same-answer replay)
                         const prevHead = prevText.slice(0, 200).toLowerCase();
                         const curHead = curText.slice(0, 200).toLowerCase();
@@ -5897,7 +6105,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         const actionSteps = steps.filter(s => actionVerbPattern.test(s));
                         const hasPlanPhrasing = /\b(step|phase|plan|will|need to|should|going to|first|then|finally|next)\b/i.test(respText);
                         if (actionSteps.length >= 2 && hasPlanPhrasing) {
-                            this.writePlanFile(userMessage, steps);
+                            await this.writePlanFile(userMessage, steps);
                         }
                     }
                 }
@@ -5923,7 +6131,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             .map(m => m[1].trim());
                         if (missingSteps.length >= 2) {
                             logInfo(`[agent] Gap-analysis detected -- auto-creating plan with ${missingSteps.length} missing items`);
-                            this.writePlanFile(userMessage, missingSteps);
+                            await this.writePlanFile(userMessage, missingSteps);
                         }
                     }
                 }
@@ -6361,6 +6569,18 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     )
                 );
 
+                // ── Plan-first gate ── block edits/writes until user confirms ──────
+                if (this._planFirstMode && !this._planConfirmed
+                    && (name === 'write_file' || name === 'edit_file' || name === 'edit_file_at_line')) {
+                    logWarn(`[plan-first] Blocked ${name} — user asked for plan before changes`);
+                    const planFirstBlock = `[PLAN-FIRST GATE] The user asked you to explain your plan BEFORE making any changes. You have not received confirmation yet. Do NOT call ${name} now. Present your plan in plain text, end with "Shall I proceed?", and wait for the user's reply.`;
+                    this.history.push({ role: 'user', content: planFirstBlock });
+                    const _pfId = `pf_${Date.now()}`;
+                    post({ type: 'toolResult', id: _pfId, name, success: false, preview: '(blocked — plan-first gate: present plan and wait for confirmation)' });
+                    // Break out of the tool loop so the model responds with the plan text
+                    break;
+                }
+
                 if (!this._preflightWriteGateFired
                     && (name === 'write_file' || name === 'edit_file')
                     && turn <= 10
@@ -6429,9 +6649,19 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                 if (!isWriteTool) { batchAllWereWriteTools = false; }
 
                 // Record tool call for session log
-                const tcPath = String(args.path ?? args.file_path ?? args.command ?? args.query ?? args.url ?? '') || undefined;
+                // For task_plan, encode "action:task_id" into path so the done-gate can inspect it.
+                const tcPath = name === 'task_plan'
+                    ? `${String(args.action ?? 'status')}:${String(args.task_id ?? '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 64)}`
+                    : (String(args.path ?? args.file_path ?? args.command ?? args.query ?? args.url ?? '') || undefined);
                 this._toolCallsThisRun.push({ name, path: tcPath });
                 this._consecutiveAborts = 0; // model made a real tool call -- abort streak is over
+                // Mark progress for idle-turn detector.
+                // Any tool call counts as progress — the idle detector only fires when the model
+                // emits ZERO tool calls (pure text/thinking turns with no action taken).
+                // The sliding-window loop detector (_recentToolSigs) already handles the case where
+                // the same tool is called repeatedly — idle-turn detection covers a different failure
+                // mode: the model narrating/planning endlessly without calling any tools at all.
+                _progressThisTurn = true;
 
                 // ── Per-path re-read tracker ───────────────────────────────────────────
                 // Count how many times this run the model has read the same file path.
@@ -6488,13 +6718,13 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // loopySig = `${toolName}_${JSON.stringify(normArgs)}` — strip the JSON suffix to recover the tool name
                     const loopyName = loopySig.replace(/_\{.*$/, '') || name;
                     logWarn(`[agent] Sliding-window loop detected: "${loopyName}" called ${maxSigCount}x in last ${this._recentToolSigs.length} tool calls`);
-                    this._recentToolSigs = []; // reset so it doesn't fire every turn
-                    const loopMsg = `[SYSTEM: Loop detected -- you have called "${loopyName}" with the same arguments ${maxSigCount} times in the last ${this.RECENT_TOOL_SIG_WINDOW} tool calls. You are going in circles. Stop. Either (1) act on what you already found, or (2) tell the user what the blocker is and ask for guidance. Do NOT call this tool again.]`;
-                    if (isTextMode) {
-                        this.history.push({ role: 'user', content: loopMsg });
-                    } else {
-                        this.history.push({ role: 'tool', content: loopMsg });
-                    }
+                    // Keep last 2 sigs so the detector can re-fire after 2 more repeats instead
+                    // of immediately (prevents full reset → full re-cycle back-to-back).
+                    this._recentToolSigs = this._recentToolSigs.slice(-2);
+                    const loopMsg = `[SYSTEM: Loop detected — you have called "${loopyName}" ${maxSigCount} times in the last ${this.RECENT_TOOL_SIG_WINDOW} tool calls and are going in circles. STOP calling this tool. You already have the output from previous runs — act on what you found. Do NOT write another script and run it again. Summarize your findings and move forward with the task.]`;
+                    // Always inject as 'user' role so the model treats it as an authoritative instruction,
+                    // not just a tool failure it can ignore.
+                    this.history.push({ role: 'user', content: loopMsg });
                     post({ type: 'toolResult', id: toolId, name, success: false, preview: `(loop detected -- ${loopyName} called ${maxSigCount}x)` });
                     break;
                 }
@@ -7565,7 +7795,13 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     // Only count actual failures — success results must NOT increment the counter or
                     // the hard-block will fire after N successful edits on the same file.
                     if (name === 'edit_file' && /old_string not found|matches \d+ locations|EDIT REJECTED/i.test(toolResult)) {
-                        if (this.trackEditFileFailures(args, toolResult, isTextMode)) { continue; }
+                        if (this.trackEditFileFailures(args, toolResult, isTextMode)) {
+                            // Break the batch tool loop so the model responds immediately with a
+                            // visible message rather than silently retrying tool after tool.
+                            // The hint is already injected — the LLM will see it on the next turn.
+                            breakAfterBatch = true;
+                            break;
+                        }
                     }
 
                     // On edit_file "old_string not found" failure: read the exact line range reported
@@ -7577,8 +7813,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     if (name === 'edit_file' && this._mergeMode && /matches \d+ locations/i.test(toolResult)) {
                         if (await this.handleMergeAmbiguousEdit(args, toolResult, isTextMode)) { continue; }
                     }
+                    // Skip the awk auto-read if edit_file already embedded the full file content in
+                    // the error (the "not found anywhere" error path at line 9684 adds "FULL FILE CONTENT").
+                    // Running awk on top would produce contradictory instructions and confuse the model.
                     if (name === 'edit_file' && /old_string not found|matches \d+ locations/i.test(toolResult)
-                        && !String(args.path ?? '').endsWith('.ollamaforge-plan.md')) {
+                        && !String(args.path ?? '').endsWith('.ollamaforge-plan.md')
+                        && !toolResult.includes('FULL FILE CONTENT')) {
                         const failedPath = String(args.path ?? '');
                         if (failedPath) {
                             // Resolve to absolute path for the read command
@@ -8476,6 +8716,35 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     if (this._taskPhase === 'acting') { this._taskPhase = 'verifying'; }
                 }
             }
+
+            // ── Idle-turn detector ───────────────────────────────────────────────────
+            // Fires when the model emits zero tool calls (pure narration/planning turns).
+            // This catches "thinking out loud" loops where the model writes paragraphs of
+            // analysis but never acts. The sliding-window detector handles repeated-same-tool
+            // loops; this catches tool-free stalls.
+            // Also counts turns where the model made NO tool call at all (pure narration/thinking).
+            // Do NOT count tool-failure turns as idle — the model IS acting, just failing.
+            // The edit_file failure escalation (trackEditFileFailures) handles repeated failures
+            // by injecting a write_file hint and breaking the batch; that's the recovery path.
+            const _isIdleTurn = !_progressThisTurn;
+            if (_isIdleTurn) {
+                this._idleTurns++;
+                if (this._idleTurns >= this.IDLE_TURN_MAX) {
+                    logWarn(`[agent] Idle-turn limit reached (${this._idleTurns} turns with no progress) -- breaking`);
+                    const idleBreakMsg = `[SYSTEM: You have completed ${this._idleTurns} consecutive turns without making meaningful progress (no file writes, edits, or commands). You appear to be spinning. STOP researching. Either: (1) make the edit/command you have been planning, or (2) tell the user what is blocking you and ask for guidance. Do NOT search or read more files.]`;
+                    this.history.push({ role: 'user', content: idleBreakMsg });
+                    loopExhausted = false;
+                    post({ type: 'turnLimit', text: `**Agent paused** — ${this._idleTurns} turns with no progress.\n\nThe agent was searching or planning but not making changes. Say "keep going" to resume, or give more specific direction.`, canAutoContinue: false, longSession: false });
+                    break;
+                } else if (this._idleTurns === this.IDLE_TURN_NUDGE && !this._idleNudgeFired) {
+                    this._idleNudgeFired = true;
+                    logWarn(`[agent] Idle-turn nudge at turn ${this._idleTurns} -- injecting progress prompt`);
+                    this.history.push({ role: 'user', content: `[SYSTEM: You have now spent ${this._idleTurns} turns without writing, editing, or running commands. You are spinning. If you have enough information, make the change NOW. If you are blocked, say so explicitly and stop searching.]` });
+                }
+            } else {
+                this._idleTurns = 0;
+                this._idleNudgeFired = false;
+            }
         }
 
         // If we exhausted all turns without the model producing a final answer, tell the user
@@ -8578,6 +8847,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 || t.name === 'run_command' || t.name === 'shell_read'
                 || t.name === 'web_search' || t.name === 'web_fetch'
                 || t.name === 'run_command_pip' || t.name === 'run_command_destructive'
+                // search_files and find_files are active investigative work toward a goal
+                // (not idle narration) — including them prevents the no-write stall counter
+                // from firing on legitimate research-then-write tasks.
+                || t.name === 'search_files' || t.name === 'find_files'
             );
             // Q&A detection: run used ONLY lookup/read tools (no state changes) — treat as a
             // complete answer regardless of how many web pages were fetched. This prevents a
@@ -8597,7 +8870,11 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // Raised from 6→8 with 64K context window (more headroom for multi-step research).
             const isPureQA = (!usedToolsThisRun || onlyLookupToolsUsed)
                 && lastAssistantText.length > 400
-                && this._runTurnCount <= 8;
+                && this._runTurnCount <= 8
+                // Never treat as pure Q&A mid-implementation: if the agent already made
+                // file edits/writes this session, it is executing a task, not answering a question.
+                && this._editsThisRun === 0
+                && this._writtenPathsThisSession.size === 0;
             const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession;
             if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
@@ -8770,6 +9047,20 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         this._readOnlyTurnsSinceLastEdit++;
         logWarn(`[agent] Stall (${turnIsEmpty ? 'empty' : 'think-only'}, thinking=${thinkingLen}ch, turn=${turn}, retry=${this.autoRetryCount}, aborts=${this._consecutiveAborts})`);
         this.history.pop();
+
+        // For think-only stalls with substantial reasoning, try truncation continuation
+        // instead of a generic stall nudge — carry the tail so the model doesn't restart cold.
+        if (turnHasThinkOnly && thinkingLen > 500 && thinking) {
+            const contResult = handleTruncation(thinking, this._continuationState);
+            if (contResult.shouldContinue && contResult.continuationText) {
+                updateContinuationState(this._continuationState, thinking);
+                logInfo(`[agent] Truncation continuation: ${contResult.reason}`);
+                this.history.push({ role: 'user', content: contResult.continuationText });
+                post({ type: 'removeLastAssistant' });
+                return true;
+            }
+        }
+
         const toolCallHint = isTextMode
             ? ' Your response must contain ONLY a <tool>{"name":"...","arguments":{...}}</tool> block — no prose, no thinking tags, nothing else.'
             : ' Call the tool now.';
@@ -10065,10 +10356,18 @@ If the code looks correct, respond with exactly: OK`;
                     // active plan so the plan-file completion guard can enforce "no done with
                     // unchecked steps" even when the model wrote it via write_file (not the
                     // internal writePlanFile path).
+                    // Exception: if the user asked to "review" / "let me review" the plan
+                    // (i.e. the file is a deliverable for user review, not an agent work-plan),
+                    // do NOT adopt it — the done-gate would block the stop and force the agent
+                    // to start implementing the checklist without user sign-off.
                     const _planRel = rel.replace(/\\/g, '/');
-                    if (_planRel.startsWith('plans/') && _planRel.endsWith('.md')) {
+                    const _isPlanDeliverable = /\b(let me review|for (me to |you to )?review|then (i|you|we|let me|we can|i can|we will) review|create.*then review|review it|review (the|this) (file|plan)|and then (let me|i will|we will|i can) review)\b/i.test(this._currentTaskMessage ?? '')
+                        || /\b(don'?t (start|implement|proceed|do it|begin)|create (the )?file (only|first|and stop|and wait)|just (create|write|make) (the )?(file|plan)|file (only|and stop|and wait|for review)|awaiting (review|sign.?off|approval)|review before (i |we )?(start|implement|proceed|build|make changes))\b/i.test(this._currentTaskMessage ?? '');
+                    if (_planRel.startsWith('plans/') && _planRel.endsWith('.md') && !_isPlanDeliverable) {
                         this._activePlanFile = full;
                         logInfo(`[plan] Agent created tracking plan file: ${rel}`);
+                    } else if (_planRel.startsWith('plans/') && _planRel.endsWith('.md') && _isPlanDeliverable) {
+                        logInfo(`[plan] Skipped adopting plan file as _activePlanFile — task asked for review-only deliverable: ${rel}`);
                     }
 
                     // Auto-scan document files for hallucination artifacts (corrupted characters
@@ -10568,7 +10867,15 @@ if errors:
 
             // â"€â"€ read_file (native, no shell) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'read_file': {
-                const rfPathRaw = String(args.path ?? '');
+                let rfPathRaw = String(args.path ?? '');
+                // Auto-redirect: if the agent tries to read a /tmp/ file, silently rewrite
+                // to .ollamaforge/tmp/ (workspace-local scratch).  This avoids the outside-workspace
+                // confirmation dialog that fires when the agent uses /tmp/ for large-output capture.
+                if (/^\/tmp\/[\w.\-]+$/.test(rfPathRaw)) {
+                    const redirected = `.ollamaforge/tmp/${path.basename(rfPathRaw)}`;
+                    logWarn(`[read_file] Auto-redirected /tmp/ read to workspace scratch: "${rfPathRaw}" -> "${redirected}"`);
+                    rfPathRaw = redirected;
+                }
                 if (!rfPathRaw) {
                     // No path given — the model doesn't know what to read yet.
                     // Return a directory listing of the workspace root so the model
@@ -10591,6 +10898,11 @@ if errors:
                     const rfLines = rfRaw.split('\n');
                     const rfOffset = Math.max(0, (Number(args.offset) || 1) - 1);
                     const rfLimit  = Math.min(2000, Number(args.limit) || 2000);
+                    // Guard: offset past end-of-file — return a clear message so the model
+                    // does not interpret an empty result as "more to read".
+                    if (rfOffset >= rfLines.length) {
+                        return `[read_file] Offset ${rfOffset + 1} is past end of file (${rfLines.length} lines). The file has already been fully read. Do not call read_file again with a higher offset.`;
+                    }
                     const rfSlice  = rfLines.slice(rfOffset, rfOffset + rfLimit);
                     const rfNumbered = rfSlice.map((l, i) => `${String(rfOffset + i + 1).padStart(4, ' ')}\t${l}`).join('\n');
                     const rfRel = path.relative(this.workspaceRoot, rfPath).replace(/\\/g, '/');
@@ -10602,8 +10914,11 @@ if errors:
                     this._lastReadFilePath = rfPathRaw; // used for edit path auto-recovery
                     // Warn when the model passed an explicit tiny limit -- prevents re-read spirals
                     const rfExplicitLimit = args.limit !== undefined && args.limit !== null;
+                    const rfExplicitOffset = args.offset !== undefined && args.offset !== null && Number(args.offset) > 1;
                     const rfPartialNote = rfExplicitLimit && rfSlice.length < rfLines.length
-                        ? `\n[NOTE: You requested limit=${args.limit}. The file has ${rfLines.length} total lines. Call read_file again without limit to see the full file.]`
+                        ? `\n[NOTE: You requested limit=${args.limit} starting at line ${rfOffset + 1}. The file has ${rfLines.length} total lines. If you already read lines 1–${rfOffset} in a previous call and have no truncation warning, you already have the complete file — do NOT call read_file again.]`
+                        : rfExplicitOffset && !rfExplicitLimit && rfTruncLines <= 0
+                        ? `\n[NOTE: You read from offset ${rfOffset + 1} to end of file (${rfLines.length} lines). If you already read lines 1–${rfOffset} previously, you now have the complete file.]`
                         : '';
 
                     // ── Tool result intelligence (graph-guided symbol extraction) ──────
@@ -10625,7 +10940,10 @@ if errors:
 
                     const rfRedacted = redactSecrets(rfNumbered);
                     if (rfRedacted.count > 0) logInfo(`[read_file] Redacted ${rfRedacted.count} secret(s) from output`);
-                    return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total):\n${rfRedacted.text}${rfTrunc}${rfPartialNote}`;
+                    // Explicit "complete" suffix when nothing was truncated, so the model does not
+                    // mistake the line count for a page size and try to read more with offset/limit.
+                    const rfCompleteNote = rfTrunc ? '' : ' — complete file shown';
+                    return `[CWD: ${this.workspaceRoot}]\n${rfRel} (${rfLines.length} lines total${rfCompleteNote}):\n${rfRedacted.text}${rfTrunc}${rfPartialNote}`;
                 } catch (e) {
                     return `[read_file] Error: ${e instanceof Error ? e.message : String(e)}`;
                 }
@@ -10750,7 +11068,22 @@ if errors:
                 const sfCombined = results.join('\n') + sfTrunc + prefetch;
                 const sfRedacted = redactSecrets(sfCombined);
                 if (sfRedacted.count > 0) logInfo(`[search_files] Redacted ${sfRedacted.count} secret(s) from output`);
-                return `[CWD: ${this.workspaceRoot}]\n${sfRedacted.text}`;
+
+                // Augment with semantic context from codeGraph/codeIndex/memory
+                let fanoutAugment = '';
+                try {
+                    const { findRelevant } = await import('./contextFanout');
+                    const fanout = await findRelevant(
+                        sfPattern,
+                        (this as any).codeGraph ?? null,
+                        this.codeIndex ?? null,
+                        this.memory ?? null,
+                        { budgetGraph: 400, budgetIndex: 300, budgetMemory: 300 },
+                    );
+                    if (fanout.text) { fanoutAugment = `\n\n[Semantic context]\n${fanout.text}`; }
+                } catch { /* fanout is best-effort */ }
+
+                return `[CWD: ${this.workspaceRoot}]\n${sfRedacted.text}${fanoutAugment}`;
             }
 
             // â"€â"€ find_files (native, no shell) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -11567,15 +11900,50 @@ if errors:
                         return `[BLOCKED: cat > cannot reliably write source files on Windows]\n\nUsing \`cat > file << 'EOF'\` on Windows Git Bash truncates or corrupts the file because heredocs in non-interactive shells don't work reliably.\n\nTo write "${catTarget}", use write_file instead:\n  write_file path="${catTarget}" content="<full file content>"\n\nDo NOT use cat, echo, or shell redirects to write source code files.`;
                     }
 
+                    // Block ALL python3 -c file writes (pathlib.write_text, open().write, etc.).
+                    // These fail on Windows Git Bash due to quote-nesting in long strings, and
+                    // write_file handles encoding, escaping, and syntax-checking correctly.
+                    const py3WriteMatch = cmd.match(/python3?\s+-c\s+["'][\s\S]*?(?:\.write_text\s*\(|\.write\s*\(|open\s*\([^)]*['"w]['"]\)\.write)/i)
+                        // Also catch pathlib short form: pathlib.Path('...').write_text(...)
+                        ?? cmd.match(/python3?\s+-c\s+["'][\s\S]*?pathlib/i);
+                    if (py3WriteMatch) {
+                        // Extract the target filename if we can
+                        const py3Target = cmd.match(/(?:pathlib\.Path|open)\s*\(\s*['"]([^'"]+)['"]/)?.[1]?.replace(/\\/g, '/') ?? 'the file';
+                        logWarn(`[agent] Blocked python3 -c file write to "${py3Target}" — use write_file instead`);
+                        return `[BLOCKED: python3 -c cannot reliably write files on Windows Git Bash]\n\nQuote-nesting in long -c strings causes truncation or corruption on Git Bash. write_file handles escaping and encoding correctly.\n\nUse write_file instead:\n  write_file path="${py3Target}" content="<full file content>"\n\nDo NOT use python3 -c, echo, cat, or any shell redirect to write files.`;
+                    }
                     const shellWriteMatch = cmd.match(/python3?\s+-c\s+["'].*open\s*\(\s*['"]([^'"]+\.(?:py|ts|js|sh|bash|rb|go|json|yaml|yml|md|txt))['"].*[,\s].*['"w]['"].*write\s*\(/i);
                     if (shellWriteMatch) {
                         const shellWriteTarget = shellWriteMatch[1].replace(/\\/g, '/');
-                        const alreadyWritten = this._writtenPathsThisSession.has(shellWriteTarget)
-                            || [...this._writtenPathsThisSession].some(p => p.endsWith(shellWriteTarget) || shellWriteTarget.endsWith(p));
-                        if (alreadyWritten) {
-                            logWarn(`[agent] Blocked python3 -c shell rewrite of "${shellWriteTarget}" — already written this session via write_file`);
-                            return `[BLOCKED: file already written this session]\n\n"${shellWriteTarget}" was already written successfully by write_file this session. Do NOT rewrite it via shell commands — that approach has escaping issues and will corrupt the file.\n\nInstead: run_command: python3 ${shellWriteTarget}\n\nIf the output shows a real error, use edit_file to fix the specific failing line.`;
-                        }
+                        logWarn(`[agent] Blocked python3 -c shell write of "${shellWriteTarget}" — use write_file instead`);
+                        return `[BLOCKED: python3 -c cannot reliably write files on Windows Git Bash]\n\nUse write_file instead:\n  write_file path="${shellWriteTarget}" content="<full file content>"\n\nDo NOT use python3 -c, echo, cat, or any shell redirect to write files.`;
+                    }
+                }
+
+                // Auto-fix: redirect output from /tmp/ to .ollamaforge/tmp/ (workspace-local scratch).
+                // The agent must never use the OS temp dir for local scratch work — it is outside
+                // the workspace and triggers the read_file outside-workspace confirmation prompt.
+                // Pattern: any "command > /tmp/file" or "command >> /tmp/file" redirection
+                // where the target is a plain /tmp/ path (not a remote scp target like HOST:/tmp/).
+                // We rewrite the path in-place and inject a nudge so the agent uses read_file correctly.
+                {
+                    const tmpRedirectRe = /(?<![:\w])>>\s*(\/tmp\/[\w.\-]+)/g;
+                    const tmpRedirectRe2 = /(?<![:\w])>\s*(\/tmp\/[\w.\-]+)/g;
+                    let tmpFixed = cmd
+                        .replace(tmpRedirectRe, (m, file) => m.replace(`/tmp/${path.basename(file)}`, `.ollamaforge/tmp/${path.basename(file)}`))
+                        .replace(tmpRedirectRe2, (m, file) => m.replace(`/tmp/${path.basename(file)}`, `.ollamaforge/tmp/${path.basename(file)}`));
+                    if (tmpFixed !== cmd) {
+                        logWarn(`[run_command] Auto-redirected /tmp/ output to .ollamaforge/tmp/: "${cmd}" -> "${tmpFixed}"`);
+                        cmd = tmpFixed;
+                        // Ensure the tmp dir exists (gitignored, workspace-local)
+                        const tmpDir = path.join(root ?? this.workspaceRoot, '.ollamaforge', 'tmp');
+                        if (!fs.existsSync(tmpDir)) { fs.mkdirSync(tmpDir, { recursive: true }); }
+                    }
+                    // Also rewrite bare /tmp/ in read_file-style paths that slipped into the command arg
+                    // e.g. "wc -l /tmp/tree_output.txt" after a prior redirect was already rewritten
+                    if (/(?<![:\w])\/tmp\/[\w.\-]+/.test(cmd)) {
+                        cmd = cmd.replace(/(?<![:\w])(\/tmp\/)([\w.\-]+)/g, (m, _prefix, file) => `.ollamaforge/tmp/${file}`);
+                        logWarn(`[run_command] Auto-redirected bare /tmp/ path in command: ${cmd}`);
                     }
                 }
 
@@ -12854,7 +13222,20 @@ ${sampleHtml}
                 }
 
                 if (action === 'create') {
-                    const steps = Array.isArray(args.steps) ? args.steps.map(s => String(s).slice(0, 300)) : [];
+                    // Accept steps as a real array OR as a JSON-encoded string (models often serialize
+                    // array arguments as strings: "[\"step1\", \"step2\"]" or "step1, step2, step3").
+                    let rawSteps = args.steps;
+                    if (typeof rawSteps === 'string') {
+                        const trimmed = rawSteps.trim();
+                        if (trimmed.startsWith('[')) {
+                            try { rawSteps = JSON.parse(trimmed); } catch { /* fall through to comma-split */ }
+                        }
+                        if (typeof rawSteps === 'string') {
+                            // Comma-separated fallback: "step1, step2, step3"
+                            rawSteps = rawSteps.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0);
+                        }
+                    }
+                    const steps = Array.isArray(rawSteps) ? rawSteps.map((s: unknown) => String(s).slice(0, 300)) : [];
                     if (steps.length === 0) { throw new Error('action=create requires a non-empty "steps" array'); }
                     ledger.steps = steps.map(text => ({ text, status: 'pending' as const }));
                     ledger.updated = now;
@@ -13647,7 +14028,7 @@ ${sampleHtml}
      * Create a plan file at plans/<slug>.md and set _activePlanFile.
      * Called when the agent decides a task warrants a plan (>= 4 steps or explicit request).
      */
-    private writePlanFile(task: string, steps: string[]): void {
+    private async writePlanFile(task: string, steps: string[]): Promise<void> {
         if (!this.workspaceRoot) { return; }
         try {
             const plansDir = path.join(this.workspaceRoot, 'plans');
@@ -13671,6 +14052,13 @@ ${sampleHtml}
             fs.writeFileSync(filePath, content, 'utf8');
             this._activePlanFile = filePath;
             logInfo(`[plan] Created plan file: plans/${slug}.md (${steps.length} steps)`);
+            // Ground the plan: warn if referenced files/symbols don't exist yet
+            const { runGroundingCheck } = await import('./planGrounding');
+            const gr = runGroundingCheck(content, this.workspaceRoot);
+            if (gr.advisory) {
+                this.history.push({ role: 'user', content: gr.advisory });
+                logInfo(`[planGrounding] Advisory injected: ${gr.missing.length} unresolved ref(s)`);
+            }
         } catch (err) {
             logWarn(`[plan] Could not write plan file: ${toErrorMessage(err)}`);
         }
@@ -13813,15 +14201,7 @@ ${sampleHtml}
      * Searches for PROJECT.md (or any *.project.md) in the workspace root.
      */
     private findProjectFile(): string | null {
-        if (!this.workspaceRoot) { return null; }
-        const explicit = path.join(this.workspaceRoot, 'PROJECT.md');
-        if (fs.existsSync(explicit)) { return explicit; }
-        try {
-            const files = fs.readdirSync(this.workspaceRoot);
-            const match = files.find(f => f.toLowerCase().endsWith('.project.md'));
-            if (match) { return path.join(this.workspaceRoot, match); }
-        } catch { /* non-fatal */ }
-        return null;
+        return _findProjectFile(this.workspaceRoot);
     }
 
     /**
@@ -13829,25 +14209,7 @@ ${sampleHtml}
      * Returns a formatted summary of open items by section, or empty if all done.
      */
     private readProjectOpenItems(): string {
-        const pf = this._activeProjectFile;
-        if (!pf || !fs.existsSync(pf)) { return ''; }
-        try {
-            const content = fs.readFileSync(pf, 'utf8');
-            const rawLines = content.split('\n');
-            const openItems: string[] = [];
-            let currentSection = '';
-            for (const line of rawLines) {
-                const sectionMatch = line.match(/^#+\s+(.+)/);
-                if (sectionMatch) { currentSection = sectionMatch[1].trim(); }
-                if (/^[-*]\s+\[ \]/.test(line)) {
-                    const item = line.replace(/^[-*]\s+\[ \]\s*/, '').trim();
-                    openItems.push(currentSection ? `[${currentSection}] ${item}` : item);
-                }
-            }
-            if (openItems.length === 0) { return ''; }
-            const relPath = path.relative(this.workspaceRoot, pf).replace(/\\/g, '/');
-            return `## Open project items (from ${relPath})\n${openItems.map(i => `- [ ] ${i}`).join('\n')}`;
-        } catch { return ''; }
+        return _readProjectOpenItems(this._activeProjectFile, this.workspaceRoot);
     }
 
     /**
@@ -13856,78 +14218,22 @@ ${sampleHtml}
      * or has no unchecked items. Used to hard-block a "done" declaration while items remain open.
      */
     private countTrackingDocOpenItems(docPath: string): string[] | null {
-        if (!fs.existsSync(docPath)) { return null; }
-        try {
-            const content = fs.readFileSync(docPath, 'utf8');
-            const openItems: string[] = [];
-            let currentSection = '';
-            for (const line of content.split('\n')) {
-                const sectionMatch = line.match(/^#+\s+(.+)/);
-                if (sectionMatch) { currentSection = sectionMatch[1].trim(); }
-                if (/^[-*]\s+\[ \]/.test(line)) {
-                    const item = line.replace(/^[-*]\s+\[ \]\s*/, '').trim();
-                    openItems.push(currentSection ? `[${currentSection}] ${item}` : item);
-                }
-            }
-            return openItems.length > 0 ? openItems : null;
-        } catch { return null; }
+        return _countTrackingDocOpenItems(docPath);
     }
 
     /**
      * Create PROJECT.md for a new multi-phase project.
      */
     private writeProjectFile(goal: string, phases: string[], streams: string[]): void {
-        if (!this.workspaceRoot) { return; }
-        try {
-            const filePath = path.join(this.workspaceRoot, 'PROJECT.md');
-            const now = new Date().toISOString().slice(0, 10);
-            const fileLines: string[] = [
-                `# Project: ${goal.slice(0, 100)}`,
-                '',
-                `**Created**: ${now}`,
-                `**Last updated**: ${now}`,
-                '**Status**: in progress',
-                '',
-            ];
-            if (phases.length > 0) {
-                fileLines.push('## Phases');
-                for (const p of phases) { fileLines.push(`- [ ] ${p}`); }
-                fileLines.push('');
-            }
-            if (streams.length > 0) {
-                fileLines.push('## Streams');
-                for (const s of streams) { fileLines.push(`- [ ] ${s}`); }
-                fileLines.push('');
-            }
-            fileLines.push('## Notes', '');
-            fs.writeFileSync(filePath, fileLines.join('\n'), 'utf8');
-            this._activeProjectFile = filePath;
-            logInfo(`[project] Created PROJECT.md (${phases.length} phases, ${streams.length} streams)`);
-        } catch (err) {
-            logWarn(`[project] Could not write PROJECT.md: ${toErrorMessage(err)}`);
-        }
+        const fp = _writeProjectFileFn(this.workspaceRoot, goal, phases, streams);
+        if (fp) { this._activeProjectFile = fp; }
     }
 
     /**
      * Stamp PROJECT.md with "last updated" and a next-action line before the agent stops.
      */
     private stampProjectFile(nextAction: string): void {
-        const pf = this._activeProjectFile;
-        if (!pf || !fs.existsSync(pf)) { return; }
-        try {
-            let pfContent = fs.readFileSync(pf, 'utf8');
-            const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
-            pfContent = pfContent.replace(/\*\*Last updated\*\*: .*/, `**Last updated**: ${now}`);
-            if (nextAction) {
-                if (pfContent.includes('**Next action**:')) {
-                    pfContent = pfContent.replace(/\*\*Next action\*\*: .*/, `**Next action**: ${nextAction}`);
-                } else {
-                    pfContent = pfContent.replace(/\*\*Status\*\*: .*/, `**Status**: in progress\n**Next action**: ${nextAction}`);
-                }
-            }
-            fs.writeFileSync(pf, pfContent, 'utf8');
-            logInfo(`[project] Stamped PROJECT.md: next=${nextAction.slice(0, 60)}`);
-        } catch { /* silent */ }
+        _stampProjectFileFn(this._activeProjectFile, nextAction);
     }
 
 
@@ -14008,74 +14314,11 @@ ${sampleHtml}
     // â"€â"€ Utilities â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     private readTerminal(index?: number): string {
-        const terminals = vscode.window.terminals;
-        if (!terminals.length) { return 'No terminals are open in VS Code.'; }
-
-        const terminal = index !== undefined
-            ? terminals[index]
-            : vscode.window.activeTerminal ?? terminals[terminals.length - 1];
-
-        if (!terminal) { return `Terminal index ${index} not found. ${terminals.length} terminal(s) open.`; }
-
-        // shellIntegration (VS Code 1.93+) provides recent command output
-        const si = (terminal as any).shellIntegration;
-        if (si?.executedCommands) {
-            try {
-                const cmds = Array.from(si.executedCommands as Iterable<any>);
-                const recent = cmds.slice(-5);
-                const MAX = 8192;
-                let output = `Terminal: ${terminal.name}\n`;
-                for (const cmd of recent) {
-                    const text = cmd.output?.trim() ?? '';
-                    if (text) {
-                        output += `\n$ ${cmd.command ?? '(unknown)'}\n${text}\n`;
-                    }
-                    if (output.length > MAX) { break; }
-                }
-                return output.slice(0, MAX) || `Terminal "${terminal.name}" -- no recent output captured.`;
-            } catch {
-                // Fall through to fallback
-            }
-        }
-
-        // Fallback: list terminals and suggest run_command
-        const list = terminals.map((t, i) => `  [${i}] ${t.name}`).join('\n');
-        return `Cannot read terminal output directly (requires VS Code 1.93+ shell integration).\n\nOpen terminals:\n${list}\n\nTip: Use run_command to execute a command and capture its output.`;
+        return _readTerminal(index);
     }
 
     private getDiagnostics(root: string, relPath?: string): string {
-        const lines: string[] = [];
-
-        // When a specific file is requested, resolve its URI and query directly
-        if (relPath) {
-            const normalizedRel = relPath.replace(/\\/g, '/');
-            const fullPath = path.resolve(root, normalizedRel);
-            const uri = vscode.Uri.file(fullPath);
-            const diags = vscode.languages.getDiagnostics(uri);
-            for (const d of diags) {
-                if (d.severity > vscode.DiagnosticSeverity.Warning) { continue; }
-                const sev = d.severity === vscode.DiagnosticSeverity.Error ? 'ERROR' : 'WARN';
-                lines.push(`${normalizedRel}:${d.range.start.line + 1}:${d.range.start.character + 1} ${sev} ${d.message}`);
-            }
-            return lines.length ? lines.join('\n') : 'No errors or warnings found.';
-        }
-
-        // No specific file -- iterate all diagnostics in the workspace
-        const allDiags = vscode.languages.getDiagnostics();
-        for (const [uri, diags] of allDiags) {
-            const filePath = uri.fsPath;
-            if (!filePath.startsWith(root)) { continue; }
-            const rel = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
-
-            for (const d of diags) {
-                if (d.severity > vscode.DiagnosticSeverity.Warning) { continue; }
-                const sev = d.severity === vscode.DiagnosticSeverity.Error ? 'ERROR' : 'WARN';
-                lines.push(`${rel}:${d.range.start.line + 1}:${d.range.start.character + 1} ${sev} ${d.message}`);
-            }
-            if (lines.length >= 100) { break; }
-        }
-
-        return lines.length ? lines.join('\n') : 'No errors or warnings found.';
+        return _getDiagnostics(root, relPath);
     }
 
     /**
@@ -14156,58 +14399,7 @@ ${sampleHtml}
      * TypeScript/JS: skipped (VSCode diagnostics handle it).
      */
     private syntaxCheck(absPath: string): string | null {
-        const ext = path.extname(absPath).toLowerCase();
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { execFileSync: execFileSyncFn } = require('child_process') as typeof import('child_process');
-
-        if (ext === '.py') {
-            try {
-                const pythonCmd = detectShellEnvironment().pythonCmd || (process.platform === 'win32' ? 'py' : 'python3');
-                try {
-                    execFileSyncFn(pythonCmd, ['-m', 'py_compile', absPath], {
-                        timeout: 5000, stdio: 'pipe', encoding: 'utf8'
-                    });
-                } catch (e1) {
-                    try {
-                        execFileSyncFn('python', ['-m', 'py_compile', absPath], {
-                            timeout: 5000, stdio: 'pipe', encoding: 'utf8'
-                        });
-                    } catch (e2: any) {
-                        const stderr = (e2.stderr as string | undefined) ?? String(e2);
-                        const lines = stderr.split('\n').filter((l: string) => l.trim() && !l.startsWith('Traceback'));
-                        return lines.slice(0, 4).join('\n');
-                    }
-                }
-                return null;
-            } catch {
-                return null;
-            }
-        }
-
-        if (ext === '.ts' || ext === '.tsx') {
-            // Run tsc --noEmit scoped to just this file using the project tsconfig if present
-            const root = this.workspaceRoot;
-            if (!root) { return null; }
-            const tsconfigPath = path.join(root, 'tsconfig.json');
-            if (!fs.existsSync(tsconfigPath)) { return null; }
-            try {
-                execSync(`npx tsc --noEmit --skipLibCheck 2>&1`, {
-                    cwd: root, timeout: 15000, stdio: 'pipe', encoding: 'utf8'
-                });
-                return null;
-            } catch (e: any) {
-                const out = ((e.stdout ?? '') + (e.stderr ?? '')).trim();
-                if (!out) { return null; }
-                // Filter to only errors that mention this specific file
-                const relFile = path.relative(this.workspaceRoot, absPath).replace(/\\/g, '/');
-                const relevantLines = out.split('\n')
-                    .filter((l: string) => l.includes(relFile) || l.match(/error TS/))
-                    .slice(0, 5);
-                return relevantLines.length > 0 ? relevantLines.join('\n') : null;
-            }
-        }
-
-        return null;
+        return _syntaxCheck(absPath, this.workspaceRoot);
     }
 
     /**
@@ -14216,48 +14408,7 @@ ${sampleHtml}
      * Returns absolute path if found, null otherwise.
      */
     private findTestFile(absSourcePath: string): string | null {
-        const root = this.workspaceRoot;
-        if (!root) { return null; }
-
-        const ext = path.extname(absSourcePath);
-        const base = path.basename(absSourcePath, ext);
-        const dir  = path.dirname(absSourcePath);
-        const relDir = path.relative(this.workspaceRoot, dir).replace(/\\/g, '/');
-
-        const candidates: string[] = [];
-
-        if (ext === '.py') {
-            // Same directory: test_<name>.py or <name>_test.py
-            candidates.push(path.join(dir, `test_${base}.py`));
-            candidates.push(path.join(dir, `${base}_test.py`));
-
-            // tests/ sibling at project root
-            const rootTests = path.join(root, 'tests', `test_${base}.py`);
-            candidates.push(rootTests);
-            candidates.push(path.join(root, 'tests', `${base}_test.py`));
-
-            // tests/ sibling relative to file's directory
-            const siblingTests = path.join(dir, '..', 'tests', `test_${base}.py`);
-            candidates.push(siblingTests);
-
-            // Mirror path under tests/ at project root
-            const mirrorPath = path.join(root, 'tests', relDir, `test_${base}.py`);
-            candidates.push(mirrorPath);
-        } else if (ext === '.ts' || ext === '.js') {
-            // <name>.test.ts / <name>.spec.ts in same dir
-            candidates.push(path.join(dir, `${base}.test${ext}`));
-            candidates.push(path.join(dir, `${base}.spec${ext}`));
-            // __tests__ sibling
-            candidates.push(path.join(dir, '__tests__', `${base}.test${ext}`));
-            candidates.push(path.join(dir, '__tests__', `${base}.spec${ext}`));
-        }
-
-        for (const c of candidates) {
-            try {
-                if (fs.existsSync(c)) { return c; }
-            } catch { /* skip */ }
-        }
-        return null;
+        return _findTestFile(absSourcePath, this.workspaceRoot);
     }
 
     /**
@@ -15418,9 +15569,7 @@ ${sampleHtml}
      * Returns the nudge string, or empty string if not due yet.
      */
     private buildMemoryNudge(): string {
-        if (this.userTurnCount % this.MEMORY_NUDGE_INTERVAL !== 0) { return ''; }
-        if (this.userTurnCount === 0) { return ''; }
-        return '\n\n[SYSTEM REMINDER: Review this conversation for any new facts, decisions, URLs, tools, or patterns worth saving to memory. If you found anything new, call memory_tier_write now before responding. Do not mention this reminder to the user.]';
+        return _buildMemoryNudge(this.userTurnCount, this.MEMORY_NUDGE_INTERVAL);
     }
 
     /**
@@ -15429,38 +15578,13 @@ ${sampleHtml}
      * Only fires every 3rd tool call and when there's active task state.
      */
     private buildOrientationAnchor(_lastToolName: string): string {
-        // Only inject periodically to avoid bloating context
-        const callCount = this._toolCallsThisRun.length;
-        if (callCount < 3 || callCount % 3 !== 0) { return ''; }
-
-        const parts: string[] = [];
-
-        // What was just done
-        if (this._filesChangedThisRun.length > 0) {
-            const recent = this._filesChangedThisRun.slice(-3);
-            parts.push(`Files edited this run: ${recent.join(', ')}`);
-        }
-
-        // Active task orientation
-        if (this._activeTask) {
-            if (this._activeTask.stepsCompleted.length > 0) {
-                parts.push(`Done: ${this._activeTask.stepsCompleted.slice(-3).join(', ')}`);
-            }
-            if (this._activeTask.stepsPending.length > 0) {
-                const next = this._activeTask.stepsPending[0];
-                parts.push(`NEXT: ${next}`);
-            }
-        }
-
-        // If no structured steps, nudge the model to check the plan file or work tracker
-        if (parts.length === 0 && this.trustLevel !== 'normal') {
-            // In trust/yolo: remind to keep acting
-            return '\n\n[ORIENTATION] You have made ' + callCount + ' tool calls. Do NOT summarize progress. Act on the NEXT item immediately. If unsure what is next, read the work tracker or plan file.';
-        }
-
-        if (parts.length === 0) { return ''; }
-
-        return '\n\n[ORIENTATION] ' + parts.join(' | ') + (this.trustLevel !== 'normal' ? ' -- act on the NEXT item now, do not summarize.' : '');
+        return _buildOrientationAnchor(
+            _lastToolName,
+            this._toolCallsThisRun.length,
+            this._filesChangedThisRun,
+            this._activeTask,
+            this.trustLevel,
+        );
     }
 
     private friendlyError(raw: string): string {
@@ -15523,23 +15647,7 @@ ${sampleHtml}
 
     /** Find first file in the workspace whose basename matches the given filename exactly. */
     private findFileByName(filename: string, root: string): string | null {
-        const target = filename.toLowerCase();
-        const walk = (dir: string): string | null => {
-            let entries: fs.Dirent[];
-            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
-            for (const e of entries) {
-                if (SKIP_DIRS.has(e.name)) { continue; }
-                const full = path.join(dir, e.name);
-                if (e.isDirectory()) {
-                    const found = walk(full);
-                    if (found) { return found; }
-                } else if (e.name.toLowerCase() === target) {
-                    return full;
-                }
-            }
-            return null;
-        };
-        return walk(root);
+        return _findFileByName(filename, root);
     }
 
     /**
@@ -15549,52 +15657,9 @@ ${sampleHtml}
     private findEditCandidates(
         filenameKeywords: string[],
         extensions: string[],
-        fullServiceName?: string   // e.g. "thermal_receipt" -- scores highest on exact basename match
+        fullServiceName?: string
     ): Array<{ relPath: string; absPath: string; score: number }> {
-        const root = this.workspaceRoot;
-        const results: Array<{ relPath: string; absPath: string; score: number }> = [];
-        const extSet = new Set(extensions.map(e => e.toLowerCase()));
-
-        const walk = (dir: string, depth: number) => {
-            if (depth > 8) { return; }
-            let entries: fs.Dirent[];
-            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-            for (const entry of entries) {
-                if (SKIP_DIRS.has(entry.name)) { continue; }
-                const full = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                    walk(full, depth + 1);
-                } else if (entry.isFile()) {
-                    const ext = path.extname(entry.name).toLowerCase();
-                    if (!extSet.has(ext)) { continue; }
-                    const rel = path.relative(root, full).replace(/\\/g, '/');
-                    const baseLower = entry.name.toLowerCase().replace(/\.\w+$/, '');
-                    const relLower = rel.toLowerCase();
-                    let score = 0;
-                    // Highest priority: basename starts with or equals the full service name
-                    if (fullServiceName) {
-                        if (baseLower === fullServiceName || baseLower === fullServiceName + '_service') { score += 30; }
-                        else if (baseLower.startsWith(fullServiceName)) { score += 20; }
-                        else if (baseLower.includes(fullServiceName))   { score += 15; }
-                    }
-                    // Per-keyword scoring
-                    for (const kw of filenameKeywords) {
-                        if (baseLower === kw)             { score += 10; } // exact match
-                        else if (baseLower.startsWith(kw + '_') || baseLower.endsWith('_' + kw)) { score += 8; } // word boundary
-                        else if (baseLower.includes(kw))  { score += 5;  } // partial in name
-                        else if (relLower.includes(kw))   { score += 2;  } // in path
-                    }
-                    // Penalise archive/backup/old dirs -- never the right file
-                    if (/archive|backup|old.code|\.bak/i.test(relLower)) { score = Math.max(0, score - 20); }
-                    // Penalise test files -- prefer source/service files for edit tasks
-                    if (/(?:^|\/)(tests?|__tests?__|spec)\//i.test(relLower) || /[._](test|spec)\.\w+$/.test(relLower)) { score = Math.max(0, score - 6); }
-                    if (score > 0) { results.push({ relPath: rel, absPath: full, score }); }
-                }
-            }
-        };
-        walk(root, 0);
-        results.sort((a, b) => b.score - a.score);
-        return results;
+        return _findEditCandidates(filenameKeywords, extensions, fullServiceName, this.workspaceRoot ?? undefined);
     }
 
     /**
@@ -17584,6 +17649,15 @@ return { failClass: _failClass, failHint: _failHint };
         const editHint = `${reason}\n\nSTOP using edit_file on this file. Switch to write_file.${sweepHint}${fileContentBlock}\n\n[TASK IS NOT DONE — call write_file now to complete the edit.]`;
         logWarn(`[agent] edit_file failure threshold reached (${editFailCount}x same-sig, ${fileFailCount}x file) on "${args.path}" -- hard-blocking, injecting file content`);
         this._editFileHardBlocked.add(filePath);
+        // Pop the last assistant message so the dead-end repetition detector can't match
+        // the pre-failure narration ("Let me target...") against the next LLM response.
+        // Without this, the model produces the same narration twice and the similarity
+        // check fires, accepting the no-tool response as a "real answer" and stopping.
+        const lastMsg = this.history[this.history.length - 1];
+        if (lastMsg?.role === 'assistant') {
+            this.history.pop();
+            this.postFn({ type: 'removeLastAssistant' });
+        }
         if (isTextMode) {
             this.history.push({ role: 'user', content: `Tool ${name} returned:\n${toolResult}\n---\n[SYSTEM: ${editHint}]` });
         } else {
