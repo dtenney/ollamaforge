@@ -8092,7 +8092,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             nudge = 'Command completed. Call the next tool NOW -- do not stop to ask permission or summarize.';
                         }
                     } else if (name === 'edit_file') {
-                        const editFailed = toolResult.toLowerCase().includes('not found') || toolResult.toLowerCase().includes('error') || toolResult.toLowerCase().includes('failed');
+                        // Check for actual edit failure — NOT generic words like "error" which appear
+                        // in diagnostic output appended to successful edits ("ERROR foo.ts:12:5 ...").
+                        // Only the specific failure phrases from the edit_file handler count as failure.
+                        const editFailed = /old_string not found|edit_file.*failed|FAILED.*old_string|not found in|BLOCKED|cancelled by user/i.test(toolResult)
+                            && !toolResult.startsWith('Edited:')
+                            && !toolResult.startsWith('Overwrote:');
                         if (this._mergeMode) {
                             if (!editFailed) {
                                 this._mergeEditedSinceLastDelete = true;
