@@ -1653,7 +1653,10 @@ export class Agent {
     private readonly MAX_EDIT_SIGNATURE_CACHE = 300;
     /** Track total edit_file failures per file path regardless of old_string variation */
     private _failedEditByFile = new Map<string, number>();
-    private readonly MAX_FILE_EDIT_FAILURES = 2;
+    private readonly MAX_FILE_EDIT_FAILURES = 3;
+    /** Files where edit_file is soft-blocked after first failure -- model must use edit_file_at_line.
+     *  Cleared when edit_file_at_line or write_file succeeds on the file. */
+    private _editFileLineBlocked = new Set<string>();
     /** Files where edit_file is hard-blocked after too many failures -- model must use write_file */
     private _editFileHardBlocked = new Set<string>();
     /** Track the new_string of the last successful edit per file -- used to detect revert-and-redo spirals.
@@ -2861,6 +2864,7 @@ export class Agent {
             }
         }
         this._perFileEditCounts.clear();       // Reset per-file edit counts (BUG-02: was carrying across runs)
+        this._editFileLineBlocked.clear();     // Reset soft-block — fresh start each user message
         this._mergeMode = false;               // Reset merge mode — must not bleed into next task
         this._mergeEditedSinceLastDelete = false;
         this._mergeFileReadCounts.clear();     // Stale read counts cause premature merge-guard blocks
@@ -9570,9 +9574,14 @@ If the code looks correct, respond with exactly: OK`;
 
                 if (!rel)       { throw new Error('path is required'); }
 
-                // Soft-redirect: if this file has had too many edit_file failures, suggest write_file
+                // Hard-block: too many failures — must use write_file
                 if (!forceOverwrite && this._editFileHardBlocked.has(rel.replace(/\\/g, '/'))) {
                     return `[BLOCKED] edit_file is disabled for "${rel}" after repeated failures.\n\nDo this NOW:\n1. Call read_file with path="${rel}"\n2. Apply your change to the content you receive\n3. Call write_file with path="${rel}" and the complete updated file\n\nDo NOT call edit_file on this file again.`;
+                }
+                // Soft-block: first old_string failure on this file — switch to edit_file_at_line
+                if (!forceOverwrite && this._editFileLineBlocked.has(rel.replace(/\\/g, '/'))) {
+                    const lineHint = `edit_file already failed on "${rel}" due to old_string mismatch. Switch to edit_file_at_line — it uses line numbers and never fails on whitespace.\n\nSteps:\n1. Use the line numbers from the error message above (or call shell_read to get them)\n2. Call edit_file_at_line with path="${rel}", start_line=<N>, end_line=<M>, new_content=<replacement>\n\nDo NOT retry edit_file on this file.`;
+                    return `[BLOCKED] ${lineHint}`;
                 }
 
                 // Validated-source-file guard: if this file was successfully compiled/exported this
@@ -9951,6 +9960,10 @@ If the code looks correct, respond with exactly: OK`;
                 this._recordFileOp({ path: rel, originalContent: original, action: 'edited' });
                 this._readOnlyTurnsSinceLastEdit = 0;
                 this._editsThisRun++; this._totalEditsThisSession++; this._taskPhase = 'acting';
+                // Successful edit: reset per-file failure counters so future failures start fresh.
+                { const relNorm = rel.replace(/\\/g, '/');
+                  this._failedEditByFile.delete(relNorm);
+                  this._editFileLineBlocked.delete(relNorm); }
                 // Track new_string and old_string for revert-spiral detection
                 this._trackEditStrings(rel.replace(/\\/g, '/'), newString, oldString);
                 // Editing a validated file means the content changed -- clear the validation
@@ -10562,6 +10575,7 @@ if errors:
                         this._lastWrittenFilePath = rel;
                         this._writtenPathsThisSession.add(rel.replace(/\\/g, '/'));
                         this._editFileHardBlocked.delete(rel.replace(/\\/g, '/')); // Lift edit block -- write_file succeeded
+                        this._editFileLineBlocked.delete(rel.replace(/\\/g, '/'));
                         const scpTarget = `HOST:/tmp/${path.basename(rel)}`;
                         return `File written and validated: ${rel} (${content.split('\n').length} lines) ✓ py_compile passed\n\n[NEXT STEP -- do this NOW]: run_command: "scp ./${rel} ${scpTarget}" then run_command: "ssh HOST python3 /tmp/${path.basename(rel)}" — check DEPLOYMENT.md or session context for the correct user@host before running${priorContentNote}${newFileDirNote}`;
                     }
@@ -14823,6 +14837,9 @@ ${sampleHtml}
         this._recordFileOp({ path: rel2, originalContent: original2, action: 'edited' });
         this.postFn({ type: 'fileChanged', path: rel2, action: 'edited' });
         if (!this._filesChangedThisRun.includes(rel2)) { this._filesChangedThisRun.push(rel2); }
+        // Clear soft-block — edit_file_at_line succeeded, so edit_file is unblocked for this file
+        this._editFileLineBlocked.delete(rel2.replace(/\\/g, '/'));
+        this._failedEditByFile.delete(rel2.replace(/\\/g, '/'));
         const editResult3 = action === 'insert'
             ? `Inserted ${newLines.length} line(s) at line ${startLine} in ${rel2}`
             : `Replaced lines ${startLine}-${endLine} with ${newLines.length} line(s) in ${rel2}`;
@@ -17619,9 +17636,13 @@ return { failClass: _failClass, failHint: _failHint };
     const filePath = String(args.path ?? '').replace(/\\/g, '/');
     const fileFailCount = (this._failedEditByFile.get(filePath) ?? 0) + 1;
     this._failedEditByFile.set(filePath, fileFailCount);
+    // On the FIRST failure for a file, soft-block edit_file and redirect to edit_file_at_line.
+    // The error message already contains line numbers — the model can switch immediately.
+    if (fileFailCount === 1 && !this._editFileHardBlocked.has(filePath)) {
+        this._editFileLineBlocked.add(filePath);
+        logWarn(`[agent] edit_file failed once on "${filePath}" — soft-blocking, redirecting to edit_file_at_line`);
+    }
     // After repeated failures on the same file, hard-block edit_file and steer toward write_file.
-    // The proactive file-content injection in the edit_file recovery below gives the model
-    // ground truth on first failure -- so we only escalate after genuine repeated failure.
     const shouldEscalate = editFailCount >= this.MAX_SAME_EDIT_FAILURES || fileFailCount >= this.MAX_FILE_EDIT_FAILURES;
     if (shouldEscalate) {
         const sweepHint = this._isSweepTask
