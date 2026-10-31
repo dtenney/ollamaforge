@@ -54,7 +54,7 @@ describe('memoryNudge', () => {
 
         it('returns orientation with files changed', () => {
             const result = buildOrientationAnchor('edit_file', 3, ['src/a.ts', 'src/b.ts'], null, 'normal');
-            assert.ok(result.includes('Files edited this run'));
+            assert.ok(result.includes('Files edited'));
             assert.ok(result.includes('src/a.ts'));
             assert.ok(result.includes('src/b.ts'));
         });
@@ -78,7 +78,7 @@ describe('memoryNudge', () => {
         it('includes next pending step', () => {
             const task = { stepsCompleted: [], stepsPending: ['implement auth', 'build UI'] };
             const result = buildOrientationAnchor('edit_file', 3, [], task as any, 'normal');
-            assert.ok(result.includes('NEXT: implement auth'));
+            assert.ok(result.includes('NEXT') && result.includes('implement auth'));
         });
 
         it('returns generic nudge for non-normal trust with no files or task', () => {

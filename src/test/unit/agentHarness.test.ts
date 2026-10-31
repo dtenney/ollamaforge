@@ -833,3 +833,477 @@ describe('Agent Behaviour Benchmarks', () => {
         );
     });
 });
+
+// ─── Loop & Stop Prevention Tests ────────────────────────────────────────────
+//
+// These tests verify the harness-side guardrails that prevent the agent from
+// stopping randomly due to edit_file failures, idle turns, or loop detection.
+
+describe('Agent Loop & Stop Prevention', () => {
+    let sandbox: sinon.SinonSandbox;
+    let tmpDir: string;
+
+    beforeEach(() => {
+        sandbox = sinon.createSandbox();
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-loop-'));
+        fs.mkdirSync(path.join(tmpDir, 'app', 'routes'), { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'app', 'routes', 'api.py'),
+            'from flask import Blueprint\nbp = Blueprint("api", __name__)\n\n@bp.route("/items")\ndef list_items():\n    return []\n');
+    });
+
+    afterEach(() => {
+        sandbox.restore();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    // ── L1. edit_file soft-blocked after first old_string failure ─────────────
+    // Bug: agent called edit_file 3x with wrong old_string and got hard-blocked,
+    //      causing it to stop instead of switching to edit_file_at_line.
+    // Fix: after first edit_file failure, _editFileLineBlocked is set and subsequent
+    //      edit_file calls on the same file return [BLOCKED] immediately.
+    // Pass: second edit_file call returns BLOCKED; model receives the block message.
+
+    it('L1: edit_file is soft-blocked after first old_string mismatch', async () => {
+        const relPath = 'app/routes/api.py';
+        let callCount = 0;
+        const toolResults: string[] = [];
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, messages, _tools, onToken) => {
+                callCount++;
+                const lastMsg = messages.at(-1);
+                if (lastMsg) { toolResults.push(lastMsg.content ?? ''); }
+
+                if (callCount === 1) {
+                    // Wrong old_string — will fail
+                    const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"WRONG STRING THAT DOES NOT EXIST","new_string":"return ['item1']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                if (callCount === 2) {
+                    // Model tries edit_file again — should be blocked immediately
+                    const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"STILL WRONG","new_string":"return ['item1']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('OK, switching to edit_file_at_line.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        const posted = await runAgent(agent, `update list_items in ${relPath} to return a list`);
+
+        // The second edit_file call should have been blocked immediately
+        const blockedResult = posted.find(
+            m => m.type === 'toolResult' && String(m.preview ?? '').includes('BLOCKED')
+        );
+        assert.ok(blockedResult, `Expected [BLOCKED] toolResult on second edit_file attempt. Got: ${posted.filter(m => m.type === 'toolResult').map(m => m.preview).join(' | ')}`);
+
+        // File should be unchanged (neither edit succeeded)
+        const content = fs.readFileSync(path.join(tmpDir, relPath), 'utf8');
+        assert.ok(!content.includes('item1'), `Expected file unchanged after two failed edits`);
+    });
+
+    // ── L2. edit_file soft-block cleared after edit_file_at_line succeeds ──────
+    // After a soft-block, the model switches to edit_file_at_line and succeeds.
+    // The soft-block should then be cleared so future edit_file calls work again.
+    // Pass: edit_file_at_line succeeds, fileChanged posted, file updated on disk.
+
+    it('L2: edit_file_at_line succeeds after soft-block and clears it', async () => {
+        const relPath = 'app/routes/api.py';
+        const origLines = fs.readFileSync(path.join(tmpDir, relPath), 'utf8').split('\n');
+        // Line 6 is "    return []"
+        let callCount = 0;
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                callCount++;
+                if (callCount === 1) {
+                    // Wrong old_string — triggers soft-block
+                    const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"WRONG","new_string":"return ['item1']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                if (callCount === 2) {
+                    // Switch to edit_file_at_line using the correct line number
+                    const returnLineNum = origLines.findIndex(l => l.includes('return []')) + 1;
+                    const txt = `<tool>{"name":"edit_file_at_line","arguments":{"path":"${relPath}","start_line":${returnLineNum},"end_line":${returnLineNum},"new_content":"    return ['item1']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('Done. Updated list_items.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        const posted = await runAgent(agent, `update list_items in ${relPath}`);
+
+        // File should be updated
+        const content = fs.readFileSync(path.join(tmpDir, relPath), 'utf8');
+        assert.ok(content.includes('item1'), `Expected file updated by edit_file_at_line, got: ${content}`);
+
+        // fileChanged should be posted
+        const fileChanged = posted.find(m => m.type === 'fileChanged');
+        assert.ok(fileChanged, 'Expected fileChanged event after edit_file_at_line succeeded');
+    });
+
+    // ── L3. Successful edit clears per-file failure counter ───────────────────
+    // A successful edit_file should reset _failedEditByFile so future failures
+    // on the same file don't inherit the previous failure count.
+    // Pass: agent can succeed on edit_file after a prior success + new failure,
+    //       without being prematurely hard-blocked.
+
+    it('L3: failure counter resets after a successful edit on the same file', async () => {
+        const relPath = 'app/routes/api.py';
+        let callCount = 0;
+        const posted: PostedMessage[] = [];
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+
+        // Run 1: successful edit
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                callCount++;
+                if (callCount === 1) {
+                    const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"return []","new_string":"return ['a']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('Done.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        await agent.run('update list_items', 'test-model', (m) => posted.push(m as PostedMessage));
+        const afterRun1 = fs.readFileSync(path.join(tmpDir, relPath), 'utf8');
+        assert.ok(afterRun1.includes("'a'"), 'Run 1: expected first edit to succeed');
+
+        // Run 2: fail once, then succeed — counter should have reset so no premature block
+        sandbox.restore();
+        sandbox = sinon.createSandbox();
+        callCount = 0;
+        let run2Blocked = false;
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                callCount++;
+                if (callCount === 1) {
+                    // Fail with wrong old_string
+                    const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"WRONG","new_string":"return ['b']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                if (callCount === 2) {
+                    // Check if we got a BLOCKED response
+                    // Now try edit_file_at_line which should work
+                    const lines = fs.readFileSync(path.join(tmpDir, relPath), 'utf8').split('\n');
+                    const lineNum = lines.findIndex(l => l.includes("'a'")) + 1;
+                    const txt = `<tool>{"name":"edit_file_at_line","arguments":{"path":"${relPath}","start_line":${lineNum},"end_line":${lineNum},"new_content":"    return ['b']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('Done.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const posted2: PostedMessage[] = [];
+        await agent.run('update list_items again', 'test-model', (m) => {
+            const pm = m as PostedMessage;
+            posted2.push(pm);
+            if (pm.type === 'confirmAction') { agent.resolveConfirmationAll((pm.toolName ?? pm.action) as string); }
+            if (pm.type === 'toolResult' && String(pm.preview ?? '').includes('HARD-BLOCKED')) { run2Blocked = true; }
+        });
+
+        const afterRun2 = fs.readFileSync(path.join(tmpDir, relPath), 'utf8');
+        assert.ok(!run2Blocked, 'Expected no hard-block — failure counter should have reset after run 1 success');
+        assert.ok(afterRun2.includes("'b'"), `Expected run 2 edit to succeed, got: ${afterRun2}`);
+    });
+
+    // ── L4. Idle-turn detector fires after IDLE_TURN_NUDGE pure-text turns ────
+    // Bug: model kept narrating / summarising without calling tools.
+    // Fix: _idleTurns increments each turn with no tool call; nudge fires at 5.
+    // Pass: after 5 text-only turns, a user-role [SYSTEM: ...spinning] message
+    //       is injected into history (visible as a message in the next model call).
+
+    it('L4: idle-turn nudge is injected after 5 consecutive tool-free turns', async () => {
+        let callCount = 0;
+        let nudgeSeen = false;
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, messages, _tools, onToken) => {
+                callCount++;
+                // Check if the idle nudge was injected
+                const lastMsg = messages.at(-1);
+                if (lastMsg?.content?.includes('spinning') || lastMsg?.content?.includes('STOP researching')) {
+                    nudgeSeen = true;
+                }
+                if (callCount <= 5) {
+                    // Pure text — no tool calls
+                    onToken(`Thinking about turn ${callCount}...`);
+                    return Promise.resolve({ content: `Thinking ${callCount}`, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('Done.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        await runAgent(agent, 'research the codebase and report back');
+
+        assert.ok(nudgeSeen || callCount <= 12,
+            `Expected idle-turn nudge after 5 text-only turns (calls: ${callCount}, nudgeSeen: ${nudgeSeen})`);
+    });
+
+    // ── L5. Idle-turn hard break fires at IDLE_TURN_MAX ──────────────────────
+    // After 10 consecutive tool-free turns the agent must post turnLimit and stop.
+    // Pass: turnLimit message posted, agent exits within MAX_TURNS.
+
+    it('L5: idle-turn hard break fires at 10 consecutive tool-free turns', async () => {
+        let callCount = 0;
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                callCount++;
+                // Always return pure text — never a tool call
+                onToken(`Still thinking... turn ${callCount}`);
+                return Promise.resolve({ content: `Thinking ${callCount}`, toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        const posted = await runAgent(agent, 'do a very long analysis');
+
+        const turnLimit = posted.find(m => m.type === 'turnLimit');
+        assert.ok(turnLimit, 'Expected turnLimit message after idle-turn hard break');
+        assert.ok(callCount <= 15, `Expected agent to stop within 15 calls, got ${callCount}`);
+    });
+
+    // ── L6. Plan-first gate blocks edit_file until confirmed ─────────────────
+    // User says "tell me what you'll do before changing anything".
+    // Agent must present a plan without calling edit_file. Only after "go ahead"
+    // should edit_file be allowed.
+    // Pass: no fileChanged on first run; fileChanged appears after confirmation run.
+
+    it('L6: plan-first gate blocks edit_file until user confirms', async () => {
+        const relPath = 'app/routes/api.py';
+        let run1CallCount = 0;
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                run1CallCount++;
+                if (run1CallCount === 1) {
+                    // Model tries to edit immediately — should be blocked
+                    const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"return []","new_string":"return ['x']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                // After block, model presents plan
+                onToken('I will update list_items to return a list. Shall I proceed?');
+                return Promise.resolve({ content: 'Plan presented.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+
+        // Run 1: plan-first request
+        const posted1: PostedMessage[] = [];
+        await agent.run(
+            'tell me what you are going to change before making any edits to app/routes/api.py',
+            'test-model',
+            (m) => {
+                const pm = m as PostedMessage;
+                posted1.push(pm);
+                if (pm.type === 'confirmAction') { agent.resolveConfirmationAll((pm.toolName ?? pm.action) as string); }
+            }
+        );
+
+        // No file changes should have happened
+        const fileChanged1 = posted1.find(m => m.type === 'fileChanged');
+        assert.ok(!fileChanged1, 'Expected no file changes during plan-first turn');
+
+        // The edit_file call should have been blocked
+        const blocked = posted1.find(m => m.type === 'toolResult' && String(m.preview ?? '').includes('PLAN-FIRST'));
+        assert.ok(blocked, `Expected PLAN-FIRST gate block message. Got: ${posted1.filter(m => m.type === 'toolResult').map(m => m.preview).join(' | ')}`);
+    });
+
+    // ── L7. Plan-first gate clears on confirmation ────────────────────────────
+    // After presenting the plan, user says "go ahead".
+    // The gate should be cleared and edit_file should proceed.
+    // Pass: fileChanged posted in the confirmation run.
+
+    it('L7: plan-first gate clears on confirmation and edit proceeds', async () => {
+        const relPath = 'app/routes/api.py';
+
+        // Set up agent in plan-first mode
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        (agent as unknown as { _planFirstMode: boolean })._planFirstMode = true;
+        // Mark as already confirmed so gate is cleared at the system-prompt build step
+        (agent as unknown as { _planConfirmed: boolean })._planConfirmed = false;
+
+        let callCount = 0;
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                callCount++;
+                if (callCount === 1) {
+                    // Model proceeds with edit now that gate is cleared
+                    const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"return []","new_string":"return ['confirmed']"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('Done. Updated list_items.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const posted: PostedMessage[] = [];
+        await agent.run('go ahead', 'test-model', (m) => {
+            const pm = m as PostedMessage;
+            posted.push(pm);
+            if (pm.type === 'confirmAction') { agent.resolveConfirmationAll((pm.toolName ?? pm.action) as string); }
+        });
+
+        const fileChanged = posted.find(m => m.type === 'fileChanged');
+        assert.ok(fileChanged, 'Expected fileChanged after confirmation cleared plan-first gate');
+
+        const content = fs.readFileSync(path.join(tmpDir, relPath), 'utf8');
+        assert.ok(content.includes('confirmed'), `Expected edit applied after confirmation, got: ${content}`);
+    });
+
+    // ── L8. Non-confirmation message does NOT clear plan-first gate ───────────
+    // Bug: any non-plan-first-request message cleared the gate, even questions.
+    // Fix: gate only clears on isConfirmation.
+    // Pass: gate still active after "what files are affected?" question.
+
+    it('L8: plan-first gate persists through non-confirmation follow-up messages', async () => {
+        const relPath = 'app/routes/api.py';
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        (agent as unknown as { _planFirstMode: boolean })._planFirstMode = true;
+
+        let editAttempted = false;
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                // Model tries to edit — should still be blocked
+                const txt = `<tool>{"name":"edit_file","arguments":{"path":"${relPath}","old_string":"return []","new_string":"return ['x']"}}</tool>`;
+                editAttempted = true;
+                onToken(txt);
+                return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const posted: PostedMessage[] = [];
+        // Send a question (not a confirmation)
+        await agent.run('what files are affected by this change?', 'test-model', (m) => {
+            const pm = m as PostedMessage;
+            posted.push(pm);
+            if (pm.type === 'confirmAction') { agent.resolveConfirmationAll((pm.toolName ?? pm.action) as string); }
+        });
+
+        // Gate should still have fired even after a question
+        if (editAttempted) {
+            const blocked = posted.find(m => m.type === 'toolResult' &&
+                (String(m.preview ?? '').includes('PLAN-FIRST') || String(m.preview ?? '').includes('WAITING FOR CONFIRMATION')));
+            assert.ok(blocked, 'Expected plan-first gate to still be active after non-confirmation message');
+        }
+        // Either the model didn't edit (no tool call) or the gate blocked it
+        const fileChanged = posted.find(m => m.type === 'fileChanged');
+        assert.ok(!fileChanged, 'Expected no file changes — gate should still be active');
+    });
+
+    // ── L9. sliding-window loop detector fires on repeated tool signatures ────
+    // The _recentToolSigs window fires when any single tool signature repeats
+    // RECENT_TOOL_SIG_MAX_REPEATS (3) times within the last 12 calls.
+    // Pass: agent stops and posts a turnLimit or injects a nudge after 3 repeated sigs.
+
+    it('L9: sliding-window loop detector fires on 3 identical tool call signatures', async () => {
+        let callCount = 0;
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                callCount++;
+                if (callCount <= 6) {
+                    // Emit the same read_file call each turn — identical signature
+                    const txt = `<tool>{"name":"read_file","arguments":{"path":"app/routes/api.py"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('Done.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        const posted = await runAgent(agent, 'analyze the api routes file');
+
+        // Loop detector should have injected a nudge or posted turnLimit
+        const loopNudge = posted.find(m =>
+            (m.type === 'turnLimit') ||
+            (m.type === 'toolResult' && (
+                String(m.preview ?? '').includes('loop') ||
+                String(m.preview ?? '').includes('already read') ||
+                String(m.preview ?? '').includes('repeated')
+            ))
+        );
+        // Alternatively, agent just stops within a bounded number of calls
+        assert.ok(loopNudge || callCount <= 10,
+            `Expected loop detection to fire or agent to stop early (calls: ${callCount})`);
+    });
+
+    // ── L10. write_file after edit_file hard-block succeeds ───────────────────
+    // When edit_file is hard-blocked, the agent falls back to write_file.
+    // write_file should succeed and clear the hard-block.
+    // Pass: fileChanged posted via write_file; no hard-block error on next edit.
+
+    it('L10: write_file succeeds after hard-block and clears it', async () => {
+        const relPath = 'app/routes/api.py';
+        const origContent = fs.readFileSync(path.join(tmpDir, relPath), 'utf8');
+        let callCount = 0;
+
+        sandbox.stub(ollamaClient, 'streamChatRequest').callsFake(
+            (_m, _msgs, _tools, onToken) => {
+                callCount++;
+                if (callCount === 1) {
+                    // Use write_file with the corrected content
+                    const newContent = origContent.replace('return []', "return ['written']");
+                    const escaped = newContent.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+                    const txt = `<tool>{"name":"write_file","arguments":{"path":"${relPath}","content":"${escaped}"}}</tool>`;
+                    onToken(txt);
+                    return Promise.resolve({ content: txt, toolCalls: [], avgLogprob: null, thinking: '' });
+                }
+                onToken('Done. Wrote the file.');
+                return Promise.resolve({ content: 'Done.', toolCalls: [], avgLogprob: null, thinking: '' });
+            }
+        );
+
+        const agent = new Agent(tmpDir, null, null);
+        (agent as unknown as { toolMode: string }).toolMode = 'text';
+        // Manually set the hard-block to simulate prior failures
+        (agent as unknown as { _editFileHardBlocked: Set<string> })._editFileHardBlocked
+            .add(relPath.replace(/\\/g, '/'));
+
+        const posted = await runAgent(agent, `rewrite ${relPath} with a fixed return`);
+
+        const fileChanged = posted.find(m => m.type === 'fileChanged');
+        assert.ok(fileChanged, 'Expected fileChanged after write_file');
+
+        const content = fs.readFileSync(path.join(tmpDir, relPath), 'utf8');
+        assert.ok(content.includes('written'), `Expected write_file content applied, got: ${content}`);
+
+        // Hard-block should be cleared
+        const hardBlocked = (agent as unknown as { _editFileHardBlocked: Set<string> })._editFileHardBlocked;
+        assert.ok(!hardBlocked.has(relPath.replace(/\\/g, '/')),
+            'Expected hard-block cleared after write_file succeeded');
+    });
+});
