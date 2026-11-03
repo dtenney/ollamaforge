@@ -141,11 +141,16 @@ function pushInputHistory(text) {
 }
 
 promptEl.addEventListener('keydown', (e) => {
-    // Only activate when mention dropdown is hidden
+    // Only activate when both dropdowns are hidden
     if (mentionDropdown.style.display !== 'none') { return; }
+    if (slashDropdown.style.display !== 'none') { return; }
     if (e.key === 'ArrowUp' && inputHistory.length && inputHistoryIdx !== 0) {
-        // Only hijack ArrowUp when navigating history (idx >= 0) or input is empty
-        if (inputHistoryIdx === -1 && promptEl.value !== '') { return; }
+        // Hijack ArrowUp when:
+        //   (a) already navigating history (idx >= 0), OR
+        //   (b) input is empty, OR
+        //   (c) cursor is on the first line of the textarea (single-line content)
+        const cursorOnFirstLine = promptEl.value.slice(0, promptEl.selectionStart).indexOf('\n') === -1;
+        if (inputHistoryIdx === -1 && !cursorOnFirstLine) { return; }
         e.preventDefault();
         if (inputHistoryIdx === -1) { inputHistoryDraft = promptEl.value; inputHistoryIdx = inputHistory.length; }
         if (inputHistoryIdx > 0) {
@@ -180,6 +185,16 @@ const SLASH_COMMANDS = {
     '/refactor': { label: '/refactor', desc: 'Refactor for clarity and maintainability', prompt: 'Refactor the following code to improve readability, maintainability, and performance. Show the changes.\n\n' },
     '/optimize': { label: '/optimize', desc: 'Optimize for performance',                prompt: 'Optimize the following code for performance. Explain the improvements.\n\n' },
     '/context':  { label: '/context',  desc: 'Generate or update AGENTS.md project context file', prompt: 'Scan this project and generate (or update) an AGENTS.md file in the workspace root. The file should include:\n1. One-paragraph project description (what it does, tech stack)\n2. Directory structure overview (key folders and their purpose)\n3. Coding conventions you can infer from reading the code (naming, error handling, return formats, DB patterns, etc.)\n4. Key domains/modules — one line each explaining what each major file or group of files does\n5. Any constraints or rules the agent should follow when making changes\n\nSteps:\n- Read the root directory listing\n- Read package.json or requirements.txt to identify the stack\n- Sample 3-5 representative source files to infer conventions\n- If AGENTS.md already exists, read it first and update rather than replace\n- Write the final file to AGENTS.md in the project root\n\nBe specific and factual — only write what you can confirm from the code, not guesses.' },
+    '/test-harness': { label: '/test-harness', desc: 'Run the agent harness test suite and report results', prompt: 'Run the agent harness test suite by executing: npm run test:harness\n\nUse run_command to execute it in the workspace root. Show the full output. If any tests fail, summarize which tests failed and why. If all tests pass, confirm the count of passing tests.' },
+    '/plan':     { label: '/plan',     desc: 'Create a step-by-step plan before making any edits', prompt: 'Before making any changes, create a detailed step-by-step plan for the following task. List each step clearly, identify which files will be affected, and note any risks or dependencies. Do NOT make any edits yet — just output the plan and wait for confirmation.\n\nTask: ' },
+    '/commit':   { label: '/commit',   desc: 'Stage changes and commit with a generated message',  prompt: 'Run git status to see what has changed, then run git diff to review the changes. Write a concise, accurate commit message following the project\'s existing commit style (check recent git log). Then stage the relevant files and create the commit. Show me the final commit message before committing and wait for my approval.' },
+    '/build':    { label: '/build',    desc: 'Run the project build and report any errors',        prompt: 'Run the project build using run_command. Check package.json for the correct build script (likely "npm run build" or "npm run compile"). Show the full output. If there are errors, identify the root cause and suggest fixes. If the build succeeds, confirm it.' },
+    '/status':   { label: '/status',   desc: 'Show git status, recent commits, and test results',  prompt: 'Give me a quick project status report:\n1. Run git status — list modified, staged, and untracked files\n2. Run git log --oneline -10 — show the 10 most recent commits\n3. Run npm test (or the equivalent test script from package.json) — show pass/fail summary\n\nPresent the results clearly and flag anything that needs attention.' },
+    '/health':   { label: '/health',   desc: 'Run stack health check: lint, build, and tests',     prompt: 'Run a full stack health check:\n1. Lint — run the lint script from package.json (e.g. npm run lint)\n2. Build — run the build/compile script\n3. Tests — run the test suite\n\nRun each step with run_command, show the output, and give a final summary: which checks passed, which failed, and what needs fixing.' },
+    '/debug':    { label: '/debug',    desc: 'Analyze recent errors and suggest root causes',       prompt: 'Help me debug the current problem:\n1. Read any recent error output or logs (check .ollamaforge/agent.log or agent-errors.log if present)\n2. Read the relevant source files around the error\n3. Identify the root cause — be specific about what is failing and why\n4. Propose a fix with a clear explanation\n\nDo not make changes yet — explain the diagnosis first.' },
+    '/memory':   { label: '/memory',   desc: 'Show what is stored in memory tiers',                prompt: 'Show me a summary of what is currently stored in memory. Use the memory_tier_read tool to read tiers 0, 1, and 2. For each tier, list the key facts stored. If a tier is empty, say so. Keep the output concise — one line per fact where possible.' },
+    '/remember': { label: '/remember', desc: 'Save something important to memory',                 prompt: 'Save the following to memory using the memory_tier_write tool. Choose the appropriate tier:\n- Tier 0: critical facts that must always be available (e.g. API keys location, core constraints)\n- Tier 1: essential framework/stack facts (e.g. "we use Vitest not Jest")\n- Tier 2: project conventions and preferences (e.g. naming rules, patterns to follow)\n\nFact to remember: ' },
+    '/dream':    { label: '/dream',    desc: 'Analyze this session and propose new rules/context',  prompt: 'Run a dream cycle analysis on this session:\n1. Review the conversation history for recurring patterns, mistakes made, corrections given, and useful facts discovered\n2. Propose 3-5 concrete rules or facts that should be added to .ollamaforge/context.md to improve future sessions\n3. For each proposal, explain why it would help\n4. Ask for my approval before writing anything to context.md' },
 };
 
 const slashDropdown = document.createElement('div');

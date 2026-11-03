@@ -795,6 +795,7 @@
     /* ── Command output block ────────────────────────────────────────────── */
     .cmd-block {
       display: block;
+      position: relative;
       margin: 4px 14px;
       border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.25));
       border-left: 3px solid #e5c07b;
@@ -858,6 +859,7 @@
       line-height: 1.45;
       background: var(--vscode-terminal-background, rgba(0,0,0,0.2));
       color: var(--vscode-terminal-foreground, #ccc);
+      border-radius: 0 0 4px 4px;
     }
     .cmd-output .stderr { color: var(--vscode-terminal-ansiBrightRed, #f48771); }
 

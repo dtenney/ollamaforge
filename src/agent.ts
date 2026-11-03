@@ -1810,6 +1810,7 @@ export class Agent {
     private _stagedEdits: Array<{ id: number; path: string; oldString: string; newString: string; destructive: boolean }> = [];
     private _stagedEditSeq = 0;
     private _responseFingerprints: string[] = []; // rolling list of response fingerprints for loop detection
+    private _textOnlyFingerprints: string[] = []; // tracks repeated near-identical responses regardless of tool used
     /** Current execution phase -- drives stall thresholds without task-keyword matching.
      *  RESEARCH: agent is gathering info (read-only tools, no edits yet)
      *  ACTING:   agent has made at least one edit/write/run_command
@@ -2900,6 +2901,7 @@ export class Agent {
         // Reset loop-detection fingerprints on genuine user messages, but NOT on auto-continuations.
         if (!_isAutoContinuation) {
             this._responseFingerprints = [];
+            this._textOnlyFingerprints = [];
             this._recentToolSigs = [];         // Also reset sliding-window tool-sig loop detector
         }
         // NOTE: do NOT seed _totalEditsThisSession from history on session restore.
@@ -2913,8 +2915,12 @@ export class Agent {
         if (this._writtenPathsThisSession.size === 0) {
             for (const m of this.history) {
                 if (m.role === 'user' && typeof m.content === 'string') {
-                    const match = m.content.match(/File written(?:(?: and validated)?)?: ([^\s(]+)/);
-                    if (match) this._writtenPathsThisSession.add(match[1].replace(/\\/g, '/'));
+                    // "File written: path" from write_file results
+                    const writeMatch = m.content.match(/File written(?:(?: and validated)?)?: ([^\s(]+)/);
+                    if (writeMatch) this._writtenPathsThisSession.add(writeMatch[1].replace(/\\/g, '/'));
+                    // "Edited: path" from edit_file / edit_file_at_line results
+                    const editMatch = m.content.match(/^Edited: ([^\s(]+)/m);
+                    if (editMatch) this._writtenPathsThisSession.add(editMatch[1].replace(/\\/g, '/'));
                 }
             }
         }
@@ -3424,6 +3430,18 @@ export class Agent {
         // Arm the gate on a plan-first request; keep it armed until the user confirms.
         // _planConfirmed is set to true at the isConfirmation check above (line ~2681).
         if (isPlanFirstRequest) {
+            this._planFirstMode = true;
+            this._planConfirmed = false;
+        }
+
+        // Auto-arm plan-first for complex tasks where small models tend to drift:
+        // multi-file restructures, refactors, migrations, and multi-feature requests.
+        // Skipped when the user is confirming/continuing, or plan-first is already armed.
+        const isComplexAutoTask = !isConfirmation && !this._planFirstMode
+            && (isMultiFileRestructure
+                || /\b(refactor|migrate|restructure|overhaul|rewrite|reorganize|rearchitect)\b/i.test(userMessage))
+            && !isPlanTask && !isCreativeTask;
+        if (isComplexAutoTask) {
             this._planFirstMode = true;
             this._planConfirmed = false;
         }
@@ -4230,8 +4248,11 @@ ${hints.join('\n')}`;
         // These are authorized continuation tasks that legitimately need more turns.
         const isAuthorizedContinuation = isConfirmation && this._filesChangedThisRun.length === 0
             && this.history.filter(m => m.role === 'tool').length > 5; // prior run had real work
+        // Small models get 8 turns for simple tasks, but multi-file refactors and sweep tasks
+        // legitimately need more — raise their ceiling so they don't hit the limit mid-task.
+        const _smallModelTurns = (isSweepTask || isAuthorizedContinuation || isMultiFileRestructure || isMultiFeatureRequest) ? 40 : 8;
         const MAX_TURNS = configuredMax > 0 ? configuredMax
-            : (isSweepTask || isAuthorizedContinuation) ? 80 : this._mergeMode ? 80 : (this._isSmallModel ? 8 : (isPlanTask || isCreativeTask) ? 80 : 60);
+            : (isSweepTask || isAuthorizedContinuation || isMultiFileRestructure || isMultiFeatureRequest) ? 80 : this._mergeMode ? 80 : (this._isSmallModel ? _smallModelTurns : (isPlanTask || isCreativeTask) ? 80 : 60);
         this.modeSwitchRetries = 0;
         let loopExhausted = true;
         let legitimateStopFired = false; // set when isLegitimateStop breaks the loop — suppresses multi-task auto-advance
@@ -8884,7 +8905,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 // file edits/writes this session, it is executing a task, not answering a question.
                 && this._editsThisRun === 0
                 && this._writtenPathsThisSession.size === 0;
-            const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession;
+            // If the agent's last message ends with a question, it is waiting for user input —
+            // not at a turn limit. Suppress the card entirely so the user just answers naturally.
+            const endsWithQuestion = /\?\s*$/.test(lastAssistantText.trimEnd());
+            const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession || endsWithQuestion;
             if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
                 this._earlyCompactionStalls = 0; // real progress breaks the stall streak
@@ -9216,11 +9240,27 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         const textSig = displayContent.trim().slice(0, !firstTool ? 200 : 100).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 |]/g, '');
         const fingerprint = `${toolSig}|${textSig}`;
         const fpThreshold = (!firstTool && displayContent.trim().length > 300) ? 2 : noveltyStallThreshold;
-        if (fingerprint.replace(/[| ]/g, '').length > 8) {
-            this._responseFingerprints.push(fingerprint);
-            if (this._responseFingerprints.length > 20) { this._responseFingerprints.shift(); }
-            const fpCount = this._responseFingerprints.filter(f => f === fingerprint).length;
-            if (fpCount >= fpThreshold && this.autoRetryCount < this.effectiveMaxRetries) {
+
+        // Text-only fingerprint: tracks near-identical response bodies regardless of which tool was called.
+        // Catches the pattern: agent runs different SSH commands each turn but outputs the same explanation.
+        // Use first 120 chars of the response body — enough to detect repetition without false positives.
+        const textOnlySig = displayContent.trim().slice(0, 120).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 ]/g, '');
+        if (textOnlySig.length > 20) {
+            this._textOnlyFingerprints.push(textOnlySig);
+            if (this._textOnlyFingerprints.length > 20) { this._textOnlyFingerprints.shift(); }
+        }
+        const textOnlyCount = textOnlySig.length > 20 ? this._textOnlyFingerprints.filter(f => f === textOnlySig).length : 0;
+        // If the model has output the same response 3+ times with different tool calls, it's stuck.
+        const textOnlyStall = textOnlyCount >= 3 && this.autoRetryCount < this.effectiveMaxRetries;
+
+        if (fingerprint.replace(/[| ]/g, '').length > 8 || textOnlyStall) {
+            if (!textOnlyStall) {
+                this._responseFingerprints.push(fingerprint);
+                if (this._responseFingerprints.length > 20) { this._responseFingerprints.shift(); }
+            }
+            const fpCount = textOnlyStall ? textOnlyCount : this._responseFingerprints.filter(f => f === fingerprint).length;
+            const effectiveThreshold = textOnlyStall ? 3 : fpThreshold;
+            if (fpCount >= effectiveThreshold && this.autoRetryCount < this.effectiveMaxRetries) {
                 const toolName = firstTool?.function.name ?? '';
                 const recentResults = this.history
                     .filter(m => (m.role === 'tool' || (m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('Tool '))))
@@ -9235,16 +9275,20 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     && displayContent.trim().length < 120
                     && /\?\s*$/.test(displayContent.trim())
                     && !/\b(?:let me|i will|i'll|i should|i need to)\b/i.test(displayContent);
-                if (resultsChanging || lastResultIsError || isConversationalReply) {
+                // Text-only stall bypasses the resultsChanging exception — the response is identical
+                // even though the tool results differ, so resultsChanging is not a valid excuse here.
+                if (!textOnlyStall && (resultsChanging || lastResultIsError || isConversationalReply)) {
                     logInfo(`[agent] Novelty fingerprint matched ${fpCount}x but results are changing or conversational (resultsChanging=${resultsChanging}, newError=${lastResultIsError}, conversational=${isConversationalReply}) — allowing retry`);
                 } else {
                     this.autoRetryCount++;
-                    logWarn(`[agent] Novelty stall: fingerprint matched ${fpCount}x (threshold=${noveltyStallThreshold}) with no progress (turn=${turn}, tool=${toolName || 'text'})`);
+                    logWarn(`[agent] Novelty stall: fingerprint matched ${fpCount}x (threshold=${effectiveThreshold}, textOnlyStall=${textOnlyStall}) with no progress (turn=${turn}, tool=${toolName || 'text'})`);
                     this.history.pop();
                     const toolCallHint = isTextMode ? ' Output ONLY a <tool> block now — no explanation, no narration.' : ' Call the tool now — do not describe what you are going to do.';
-                    const noveltyNudge = toolName
-                        ? `[system: You have repeated the same action (${toolName}) ${fpCount} times and the result is not changing. Take a DIFFERENT approach — if you have been reading the same file, use write_file or edit_file NOW. If a command keeps failing, try a different approach or tell the user what is blocking you. One different action — do it now.]`
-                        : `[system: You have described the same plan ${fpCount} times without calling any tool. STOP describing and ACT. Call the tool that makes the change RIGHT NOW.${toolCallHint}]`;
+                    const noveltyNudge = textOnlyStall
+                        ? `[system: You have given the same answer ${fpCount} times in a row (using different verification commands each time). The fact is already confirmed. STOP re-verifying. Either ask the user what to do next, or proceed to the next step of the task.]`
+                        : toolName
+                            ? `[system: You have repeated the same action (${toolName}) ${fpCount} times and the result is not changing. Take a DIFFERENT approach — if you have been reading the same file, use write_file or edit_file NOW. If a command keeps failing, try a different approach or tell the user what is blocking you. One different action — do it now.]`
+                            : `[system: You have described the same plan ${fpCount} times without calling any tool. STOP describing and ACT. Call the tool that makes the change RIGHT NOW.${toolCallHint}]`;
                     this.history.push({ role: 'user', content: noveltyNudge });
                     post({ type: 'removeLastAssistant' });
                     return true;
@@ -9877,11 +9921,11 @@ If the code looks correct, respond with exactly: OK`;
                     let embeddedContent = '';
                     try {
                         const allLines = fs.readFileSync(full, 'utf8').split('\n');
-                        const MAX_EMBED = 300; // raised from 150 — plans/markdown files can be long
+                        const MAX_EMBED = 600; // raised — plans/markdown audit files can exceed 300 lines
                         const embedLines = allLines.slice(0, MAX_EMBED);
                         embeddedContent = `\n\nFULL FILE CONTENT (${rel}, ${allLines.length} lines):\n` +
                             embedLines.map((l, i) => `${String(i + 1).padStart(4, ' ')}: ${l}`).join('\n') +
-                            (allLines.length > MAX_EMBED ? `\n... (${allLines.length - MAX_EMBED} more lines -- use shell_read if needed)` : '');
+                            (allLines.length > MAX_EMBED ? `\n... (${allLines.length - MAX_EMBED} more lines, starting at line ${MAX_EMBED + 1}) — use edit_file_at_line with start_line=${MAX_EMBED + 1} to target lines in the tail` : '');
                     } catch { /* ignore */ }
                     throw new Error(
                         `edit_file failed -- old_string not found anywhere in ${rel}.\n\n` +
@@ -11916,26 +11960,45 @@ if errors:
                     if (catWriteMatch) {
                         const catTarget = catWriteMatch[1].replace(/\\/g, '/');
                         logWarn(`[agent] Blocked cat > shell write to "${catTarget}" — unreliable on Windows, use write_file`);
-                        return `[BLOCKED: cat > cannot reliably write source files on Windows]\n\nUsing \`cat > file << 'EOF'\` on Windows Git Bash truncates or corrupts the file because heredocs in non-interactive shells don't work reliably.\n\nTo write "${catTarget}", use write_file instead:\n  write_file path="${catTarget}" content="<full file content>"\n\nDo NOT use cat, echo, or shell redirects to write source code files.`;
+                        let catContentHint = '';
+                        try {
+                            const catFull = path.isAbsolute(catTarget) ? catTarget : path.join(this.workspaceRoot, catTarget.replace(/\//g, path.sep));
+                            if (fs.existsSync(catFull)) {
+                                const catLines = fs.readFileSync(catFull, 'utf8').split('\n');
+                                const catNumbered = catLines.slice(0, 400).map((l, i) => `${String(i+1).padStart(4,' ')}: ${l}`).join('\n');
+                                catContentHint = `\n\nCURRENT FILE CONTENT (${catTarget}, ${catLines.length} lines):\n${catNumbered}` +
+                                    (catLines.length > 400 ? `\n... (${catLines.length - 400} more lines)` : '');
+                            }
+                        } catch { /* non-fatal */ }
+                        return `[BLOCKED: cat > cannot reliably write source files on Windows]\n\nUsing \`cat > file << 'EOF'\` on Windows Git Bash truncates or corrupts the file because heredocs in non-interactive shells don't work reliably.\n\nCall write_file NOW:\n  path="${catTarget}"\n  content=<full file content with your changes applied>${catContentHint}\n\nDo NOT use cat, echo, or shell redirects to write source code files.`;
                     }
 
-                    // Block ALL python3 -c file writes (pathlib.write_text, open().write, etc.).
+                    // Block python3 -c file writes (pathlib.write_text, open().write, etc.).
                     // These fail on Windows Git Bash due to quote-nesting in long strings, and
                     // write_file handles encoding, escaping, and syntax-checking correctly.
-                    const py3WriteMatch = cmd.match(/python3?\s+-c\s+["'][\s\S]*?(?:\.write_text\s*\(|\.write\s*\(|open\s*\([^)]*['"w]['"]\)\.write)/i)
-                        // Also catch pathlib short form: pathlib.Path('...').write_text(...)
-                        ?? cmd.match(/python3?\s+-c\s+["'][\s\S]*?pathlib/i);
+                    // Regex must require both python3 -c AND a clear file-write operation to avoid
+                    // false positives on print()/sys.stdout.write() or other non-file writes.
+                    const py3WriteMatch = cmd.match(/python3?\s+-c\s+["'][\s\S]*?(?:\.write_text\s*\(|open\s*\([^)]*['"][wa]['"][^)]*\)\s*(?:as\s+\w+\s*:)?[\s\S]*?\.write\s*\()/i)
+                        // pathlib.Path('...').write_text(...) short form
+                        ?? cmd.match(/python3?\s+-c\s+["'][\s\S]*?pathlib\.Path\s*\([^)]+\)\.write_(?:text|bytes)\s*\(/i);
                     if (py3WriteMatch) {
                         // Extract the target filename if we can
                         const py3Target = cmd.match(/(?:pathlib\.Path|open)\s*\(\s*['"]([^'"]+)['"]/)?.[1]?.replace(/\\/g, '/') ?? 'the file';
                         logWarn(`[agent] Blocked python3 -c file write to "${py3Target}" — use write_file instead`);
-                        return `[BLOCKED: python3 -c cannot reliably write files on Windows Git Bash]\n\nQuote-nesting in long -c strings causes truncation or corruption on Git Bash. write_file handles escaping and encoding correctly.\n\nUse write_file instead:\n  write_file path="${py3Target}" content="<full file content>"\n\nDo NOT use python3 -c, echo, cat, or any shell redirect to write files.`;
-                    }
-                    const shellWriteMatch = cmd.match(/python3?\s+-c\s+["'].*open\s*\(\s*['"]([^'"]+\.(?:py|ts|js|sh|bash|rb|go|json|yaml|yml|md|txt))['"].*[,\s].*['"w]['"].*write\s*\(/i);
-                    if (shellWriteMatch) {
-                        const shellWriteTarget = shellWriteMatch[1].replace(/\\/g, '/');
-                        logWarn(`[agent] Blocked python3 -c shell write of "${shellWriteTarget}" — use write_file instead`);
-                        return `[BLOCKED: python3 -c cannot reliably write files on Windows Git Bash]\n\nUse write_file instead:\n  write_file path="${shellWriteTarget}" content="<full file content>"\n\nDo NOT use python3 -c, echo, cat, or any shell redirect to write files.`;
+                        // Embed existing file content so the model can call write_file immediately
+                        let py3ContentHint = '';
+                        if (py3Target && py3Target !== 'the file') {
+                            try {
+                                const py3Full = path.isAbsolute(py3Target) ? py3Target : path.join(this.workspaceRoot, py3Target.replace(/\//g, path.sep));
+                                if (fs.existsSync(py3Full)) {
+                                    const py3Lines = fs.readFileSync(py3Full, 'utf8').split('\n');
+                                    const py3Numbered = py3Lines.slice(0, 400).map((l, i) => `${String(i+1).padStart(4,' ')}: ${l}`).join('\n');
+                                    py3ContentHint = `\n\nCURRENT FILE CONTENT (${py3Target}, ${py3Lines.length} lines — use this as the base for your write_file call):\n${py3Numbered}` +
+                                        (py3Lines.length > 400 ? `\n... (${py3Lines.length - 400} more lines)` : '');
+                                }
+                            } catch { /* non-fatal */ }
+                        }
+                        return `[BLOCKED: python3 -c cannot reliably write files on Windows Git Bash]\n\nQuote-nesting in long -c strings causes truncation or corruption on Git Bash. write_file handles escaping and encoding correctly.\n\nCall write_file NOW:\n  path="${py3Target}"\n  content=<full file content with your changes applied>${py3ContentHint}\n\nDo NOT use python3 -c, echo, cat, or any shell redirect to write files.`;
                     }
                 }
 
