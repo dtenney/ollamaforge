@@ -12008,10 +12008,12 @@ if errors:
                 // Pattern: any "command > /tmp/file" or "command >> /tmp/file" redirection
                 // where the target is a plain /tmp/ path (not a remote scp target like HOST:/tmp/).
                 // We rewrite the path in-place and inject a nudge so the agent uses read_file correctly.
+                // SKIP for ssh/scp/sftp — remote /tmp/ is valid and must not be rewritten.
                 {
+                    const isRemoteSsh = /^\s*(ssh|scp|sftp)\b/i.test(cmd);
                     const tmpRedirectRe = /(?<![:\w])>>\s*(\/tmp\/[\w.\-]+)/g;
                     const tmpRedirectRe2 = /(?<![:\w])>\s*(\/tmp\/[\w.\-]+)/g;
-                    let tmpFixed = cmd
+                    let tmpFixed = isRemoteSsh ? cmd : cmd
                         .replace(tmpRedirectRe, (m, file) => m.replace(`/tmp/${path.basename(file)}`, `.ollamaforge/tmp/${path.basename(file)}`))
                         .replace(tmpRedirectRe2, (m, file) => m.replace(`/tmp/${path.basename(file)}`, `.ollamaforge/tmp/${path.basename(file)}`));
                     if (tmpFixed !== cmd) {
@@ -12023,7 +12025,11 @@ if errors:
                     }
                     // Also rewrite bare /tmp/ in read_file-style paths that slipped into the command arg
                     // e.g. "wc -l /tmp/tree_output.txt" after a prior redirect was already rewritten
-                    if (/(?<![:\w])\/tmp\/[\w.\-]+/.test(cmd)) {
+                    // SKIP for ssh/scp/sftp commands — /tmp/ on a remote host is perfectly valid
+                    // and rewriting it produces "/.ollamaforge/tmp/" which the remote shell resolves
+                    // from root, causing "No such file or directory" errors.
+                    const isRemoteCmd = /^\s*(ssh|scp|sftp)\b/i.test(cmd);
+                    if (!isRemoteCmd && /(?<![:\w])\/tmp\/[\w.\-]+/.test(cmd)) {
                         cmd = cmd.replace(/(?<![:\w])(\/tmp\/)([\w.\-]+)/g, (m, _prefix, file) => `.ollamaforge/tmp/${file}`);
                         logWarn(`[run_command] Auto-redirected bare /tmp/ path in command: ${cmd}`);
                     }
