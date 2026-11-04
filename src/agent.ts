@@ -898,10 +898,17 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
         
         let args: Record<string, unknown>;
         if (parsed.arguments !== undefined) {
-            args = parsed.arguments;
+            // Some models return arguments as a JSON string rather than a parsed object.
+            // Parse it here so the rest of the pipeline always gets an object.
+            if (typeof parsed.arguments === 'string') {
+                try { args = JSON.parse(parsed.arguments as unknown as string); }
+                catch { args = {}; }
+            } else {
+                args = parsed.arguments;
+            }
         } else {
             const { name, ...rest } = parsed;
-            args = rest;
+            args = rest as Record<string, unknown>;
         }
 
         // Recover degenerate args: model sometimes emits one key whose value contains
@@ -952,7 +959,17 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
             if (p.startsWith('\\"') && p.endsWith('\\"')) { p = p.slice(2, -2).trim(); }
             // Handle plain surrounding single or double quotes
             if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) { p = p.slice(1, -1).trim(); }
-            args = { ...args, path: p };
+            // Discard path values that look like narration (contain spaces and no valid path chars).
+            // These are model reasoning sentences that leaked into the path argument, e.g.
+            // "Let me read the auth.py" or "From the auth.py". A real path never has spaces
+            // unless it's quoted (handled above). If it has spaces, clear it so the
+            // missing-arg recovery or workspace listing fires instead of the wrong path.
+            if (p.includes(' ') && !p.startsWith('/') && !p.match(/^[A-Za-z]:\\/)) {
+                logWarn(`[parseTextToolCalls] Discarding narration path: "${p.slice(0, 60)}"`);
+                p = '';
+            }
+            if (p) { args = { ...args, path: p }; }
+            else { const { path: _p, ...rest2 } = args; args = rest2; }
         }
 
         const callId = `${parsed.name}_${JSON.stringify(args)}`;
@@ -5225,9 +5242,12 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                             // Try to infer path from thinking block (quoted filename or filename with known extension)
                             const thinkingText = result.thinking ?? '';
                             const fileMatch =
-                                thinkingText.match(/"([^"]+\.(?:txt|md|pdf|pptx|docx|py|ts|js|json|yaml|yml|csv|sh))"/) ||
-                                thinkingText.match(/'([^']+\.(?:txt|md|pdf|pptx|docx|py|ts|js|json|yaml|yml|csv|sh))'/) ||
-                                thinkingText.match(/\b([\w][\w\s\-]*\.(?:txt|md|pdf|pptx|docx|py|ts|js|json|yaml|yml|csv|sh))\b/);
+                                thinkingText.match(/"([^"]+\.(?:txt|md|pdf|pptx|docx|py|ts|js|json|yaml|yml|csv|sh|html|htm|css|toml|ini|cfg|conf))"/) ||
+                                thinkingText.match(/'([^']+\.(?:txt|md|pdf|pptx|docx|py|ts|js|json|yaml|yml|csv|sh|html|htm|css|toml|ini|cfg|conf))'/) ||
+                                // No spaces in filenames — [\w\-./]* only. The old [\w\s\-]* pattern
+                                // matched sentences like "Let me read the auth.py" as a "filename",
+                                // injecting the full sentence as the path argument.
+                                thinkingText.match(/\b([\w][\w.\-/]*\.(?:txt|md|pdf|pptx|docx|py|ts|js|json|yaml|yml|csv|sh|html|htm|css|toml|ini|cfg|conf))\b/);
                             if (fileMatch) {
                                 const inferredPath = fileMatch[1].trim();
                                 logInfo(`[agent] Patching empty-args ${rcName} with path inferred from thinking: "${inferredPath}"`);
