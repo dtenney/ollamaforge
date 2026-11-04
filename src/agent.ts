@@ -8882,6 +8882,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 // (not idle narration) — including them prevents the no-write stall counter
                 // from firing on legitimate research-then-write tasks.
                 || t.name === 'search_files' || t.name === 'find_files'
+                // gather_context is a parallel multi-file read — using it is active investigation,
+                // not idle looping. Counts as progress so deep-research tasks (e.g. "write tests
+                // for X") don't hit the consecutive-no-write stall while reading the codebase.
+                || t.name === 'gather_context'
             );
             // Q&A detection: run used ONLY lookup/read tools (no state changes) — treat as a
             // complete answer regardless of how many web pages were fetched. This prevents a
