@@ -2531,9 +2531,10 @@ export class Agent {
             this.postFn({ type: 'autoApproved', action, detail });
             return Promise.resolve(true);
         }
-        // If this tool was approved via trust level or "Accept All", skip the UI prompt
-        if (toolName && this._isToolApproved(toolName)) {
-            logInfo(`[agent] Auto-approved: ${toolName} (trusted=${this._trustedTools.has(toolName)})`);
+        // If this tool was approved via trust level or "Accept All", skip the UI prompt.
+        // Normal mode: also check _approvedCommandStrings (exact command string approval).
+        if (toolName && (this._isToolApproved(toolName) || this._isCommandApproved(toolName))) {
+            logInfo(`[agent] Auto-approved: ${toolName} (trusted=${this._trustedTools.has(toolName)}, cmd=${this._isCommandApproved(toolName)})`);
             this.postFn({ type: 'autoApproved', action, detail });
             return Promise.resolve(true);
         }
