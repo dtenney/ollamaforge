@@ -10006,27 +10006,35 @@ If the code looks correct, respond with exactly: OK`;
                 }
 
                 // Import hallucination check (hedgemony-inspired three-valued resolver)
-                if (rel.endsWith('.py')) {
+                // Skip for test files and filter workspace-local packages (same logic as write_file).
+                const _isTestFileEdit = /(?:^|[\\/])tests?[\\/]/.test(rel) || /[\\/]test_[^/\\]+\.py$/.test(rel) || rel.endsWith('_test.py');
+                if (rel.endsWith('.py') && !_isTestFileEdit) {
                     try {
                         const envEdit = detectShellEnvironment();
                         const pyCmdEdit = envEdit.pythonCmd || 'python3';
                         const importReport = validatePythonImports(newContent, pyCmdEdit);
                         if (importReport.hasMissing) {
-                            if (original !== undefined) {
-                                fs.writeFileSync(full, original, 'utf8');
-                            }
-                            let warning = formatImportWarning(importReport, rel);
-                            if (getConfig().registryCheck) {
-                                const pkgs = importReport.missing.filter(m => m.classification === 'PACKAGE').map(m => m.module);
-                                if (pkgs.length > 0) {
-                                    const results = await Promise.all(pkgs.map(p => probeRegistry(p, 'pypi')));
-                                    const missing = results.filter(r => r.exists === false);
-                                    if (missing.length > 0) {
-                                        warning += '\n\n' + formatRegistryWarning(results, rel);
+                            const workspaceDirsEdit = this.workspaceRoot
+                                ? new Set(fs.readdirSync(this.workspaceRoot, { withFileTypes: true })
+                                    .filter(d => d.isDirectory()).map(d => d.name.toLowerCase()))
+                                : new Set<string>();
+                            const reallyMissingEdit = importReport.missing.filter(m => {
+                                const topLevel = m.module.split('.')[0].toLowerCase();
+                                return !workspaceDirsEdit.has(topLevel);
+                            });
+                            if (reallyMissingEdit.length > 0) {
+                                if (original !== undefined) { fs.writeFileSync(full, original, 'utf8'); }
+                                let warning = formatImportWarning({ ...importReport, missing: reallyMissingEdit, hasMissing: true }, rel);
+                                if (getConfig().registryCheck) {
+                                    const pkgs = reallyMissingEdit.filter(m => m.classification === 'PACKAGE').map(m => m.module);
+                                    if (pkgs.length > 0) {
+                                        const results = await Promise.all(pkgs.map(p => probeRegistry(p, 'pypi')));
+                                        const missing = results.filter(r => r.exists === false);
+                                        if (missing.length > 0) { warning += '\n\n' + formatRegistryWarning(results, rel); }
                                     }
                                 }
+                                return warning;
                             }
-                            return warning;
                         }
                     } catch { /* non-fatal -- import check is best-effort */ }
                 }
@@ -10609,27 +10617,47 @@ if errors:
                         } catch { /* ignore AST check errors -- py_compile will catch syntax issues */ }
 
                         // Import hallucination check (hedgemony-inspired three-valued resolver)
-                        try {
+                        // Skip for test files: they always import from the project under test,
+                        // which is not installed in the extension's Python environment and would
+                        // be incorrectly flagged as "missing". The validator only knows about
+                        // globally-installed packages, not workspace-local project packages.
+                        const isTestFile = /(?:^|[\\/])tests?[\\/]/.test(rel) || /[\\/]test_[^/\\]+\.py$/.test(rel) || rel.endsWith('_test.py');
+                        if (!isTestFile) try {
                             const env3 = detectShellEnvironment();
                             const pyCmd3 = env3.pythonCmd || 'python3';
                             const importReport = validatePythonImports(content, pyCmd3);
                             if (importReport.hasMissing) {
-                                if (doBackup && originalContent) {
-                                    fs.writeFileSync(full, originalContent, 'utf8');
-                                }
-                                let warning = formatImportWarning(importReport, rel);
-                                // Rec #4: opt-in registry probe for PACKAGE-class misses
-                                if (getConfig().registryCheck) {
-                                    const pkgs = importReport.missing.filter(m => m.classification === 'PACKAGE').map(m => m.module);
-                                    if (pkgs.length > 0) {
-                                        const results = await Promise.all(pkgs.map(p => probeRegistry(p, 'pypi')));
-                                        const missing = results.filter(r => r.exists === false);
-                                        if (missing.length > 0) {
-                                            warning += '\n\n' + formatRegistryWarning(results, rel);
+                                // Filter out local project packages: any module whose top-level name
+                                // matches a directory in the workspace root (e.g. "app", "src", "lib").
+                                // These are NOT installed packages and cannot be found by find_spec.
+                                const workspaceDirs = this.workspaceRoot
+                                    ? new Set(fs.readdirSync(this.workspaceRoot, { withFileTypes: true })
+                                        .filter(d => d.isDirectory())
+                                        .map(d => d.name.toLowerCase()))
+                                    : new Set<string>();
+                                const reallyMissing = importReport.missing.filter(m => {
+                                    const topLevel = m.module.split('.')[0].toLowerCase();
+                                    return !workspaceDirs.has(topLevel);
+                                });
+                                if (reallyMissing.length > 0) {
+                                    const filteredReport = { ...importReport, missing: reallyMissing, hasMissing: true };
+                                    if (doBackup && originalContent) {
+                                        fs.writeFileSync(full, originalContent, 'utf8');
+                                    }
+                                    let warning = formatImportWarning(filteredReport, rel);
+                                    // Rec #4: opt-in registry probe for PACKAGE-class misses
+                                    if (getConfig().registryCheck) {
+                                        const pkgs = reallyMissing.filter(m => m.classification === 'PACKAGE').map(m => m.module);
+                                        if (pkgs.length > 0) {
+                                            const results = await Promise.all(pkgs.map(p => probeRegistry(p, 'pypi')));
+                                            const missing2 = results.filter(r => r.exists === false);
+                                            if (missing2.length > 0) {
+                                                warning += '\n\n' + formatRegistryWarning(results, rel);
+                                            }
                                         }
                                     }
+                                    return warning;
                                 }
-                                return warning;
                             }
                         } catch { /* non-fatal -- import check is best-effort */ }
 
