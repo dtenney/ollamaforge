@@ -8961,12 +8961,22 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             // If there was real work in progress (files changed) or the model was mid-correction,
             // auto-queue a continuation rather than waiting for the user to type "keep going".
             if (canAutoContinue) {
-                // Build a clean continuation prompt. For file ops, name the file.
-                // For shell commands (which may contain quotes/paths), just say "keep going".
-                const isFileOp = lastToolCall && ['read_file', 'edit_file', 'write_file', 'shell_read'].includes(lastToolCall.name);
-                const continuePrompt = (isFileOp && lastToolCall?.path)
+                // Build a clean continuation prompt. For file read/edit ops, name the file.
+                // For shell_read the "path" is the full shell command string — don't include that
+                // in the prompt as the model will misinterpret it.
+                const isFileOp = lastToolCall && ['read_file', 'edit_file', 'write_file'].includes(lastToolCall.name);
+                let continuePrompt = (isFileOp && lastToolCall?.path)
                     ? `keep going from ${lastToolCall.path}`
                     : 'keep going';
+                // When the last response was empty/thinking-only (model ran out of turns mid-research
+                // before writing anything), remind the model what it was supposed to do next.
+                // This prevents the model from producing another empty response on continuation.
+                if (!lastAssistantText.trim() && this._editsThisRun === 0) {
+                    const originalTask = (this._originalTaskMessage || this._currentTaskMessage || '').trim();
+                    if (originalTask.length > 20) {
+                        continuePrompt = `keep going — the task is: ${originalTask.slice(0, 200)}`;
+                    }
+                }
                 post({ type: 'continueTask', prompt: continuePrompt, model: this.currentModel });
             }
         }
