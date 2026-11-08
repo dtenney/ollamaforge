@@ -1387,6 +1387,20 @@ function finalizeMessage() {
     }
     cleanRaw = cleanRaw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     cleanRaw = cleanRaw.replace(/<antThinking>[\s\S]*?<\/antThinking>/gi, '').trim();
+    // Strip any unclosed <think> or <antThinking> block at the tail (stream interrupted mid-thinking).
+    // Move the partial content into finalThinking so it appears in the collapsed block, not in chat.
+    const openThinkFinalIdx = cleanRaw.toLowerCase().lastIndexOf('<think>');
+    if (openThinkFinalIdx !== -1 && cleanRaw.toLowerCase().indexOf('</think>', openThinkFinalIdx) === -1) {
+        const unclosedThink = cleanRaw.slice(openThinkFinalIdx + '<think>'.length).trim();
+        if (unclosedThink) { finalThinking += (finalThinking ? '\n\n' : '') + unclosedThink; }
+        cleanRaw = cleanRaw.slice(0, openThinkFinalIdx).trim();
+    }
+    const openAntThinkFinalIdx = cleanRaw.toLowerCase().lastIndexOf('<antthinking>');
+    if (openAntThinkFinalIdx !== -1 && cleanRaw.toLowerCase().indexOf('</antthinking>', openAntThinkFinalIdx) === -1) {
+        const unclosedAntThink = cleanRaw.slice(openAntThinkFinalIdx + '<antthinking>'.length).trim();
+        if (unclosedAntThink) { finalThinking += (finalThinking ? '\n\n' : '') + unclosedAntThink; }
+        cleanRaw = cleanRaw.slice(0, openAntThinkFinalIdx).trim();
+    }
     // Strip Claude-format tool XML blocks (including invoke with attributes like <invoke name="...">)
     cleanRaw = cleanRaw.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, '').trim();
     cleanRaw = cleanRaw.replace(/<invoke(?:\s[^>]*)?>[\s\S]*?<\/invoke>/gi, '').trim();

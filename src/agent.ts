@@ -1205,7 +1205,7 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
         // If no single-line JSON found, try to find multi-line JSON object
         if (calls.length === 0) {
             // Look for a JSON object that contains "name" field
-            const jsonMatch = text.match(/\{[\s\S]*--name"\s*:\s*"[^"]+"[\s\S]*?\}/g);
+            const jsonMatch = text.match(/\{[\s\S]*"name"\s*:\s*"[^"]+"[\s\S]*?\}/g);
             if (jsonMatch) {
                 for (const match of jsonMatch) {
                     try {
@@ -1379,7 +1379,7 @@ function stripToolBlocks(text: string): string {
     result = result.replace(/<tooljson>[\s\S]*/gi, '');
 
     // Remove markdown code blocks containing tool calls first
-    result = result.replace(/```(?:json)?\s*\n?\s*\{[\s\S]*--name"[\s\S]*?\}\s*\n?```/gi, '');
+    result = result.replace(/```(?:json)?\s*\n?\s*\{[\s\S]*"name"[\s\S]*?\}\s*\n?```/gi, '');
     
     // Remove XML format using bracket counting (more robust than regex)
     let pos = 0;
@@ -1938,6 +1938,7 @@ export class Agent {
     private _toolCallsThisRun: ToolCallRecord[] = [];
     /** Counts consecutive auto-continue runs where no write_file/edit_file was called. Reset when a file is written. */
     private _consecutiveNoWriteRuns: number = 0;
+    private _consecutiveEmptyPathReads: number = 0;
     /** Counts consecutive runs where context compaction fired before any edits (turn <= 1, editsThisRun == 0).
      *  Two such consecutive runs means the session overhead alone exhausts the context budget — an unrecoverable loop. */
     private _earlyCompactionStalls: number = 0;
@@ -2818,6 +2819,7 @@ export class Agent {
         this.autoRetryCount = 0;      // Reset auto-retry counter for each new user message
         this._consecutiveAborts = 0;  // Reset abort streak counter
         this._consecutiveNoWriteRuns = 0; // Reset no-write streak for each new user message
+        this._consecutiveEmptyPathReads = 0; // Reset empty-path read_file loop counter
         this.memoryWritesThisResponse = 0; // Reset rate limiter for this response
         this._emptyMemoryWriteCount = 0;   // Reset empty-content retry counter
         this._nativeRecoverySuppressCount = 0; // Reset native-recovery suppression counter
@@ -2891,6 +2893,9 @@ export class Agent {
         // _recentToolSigs reset deferred to after _isAutoContinuation is declared below
         this.consecutiveFailures = 0;          // Reset consecutive failure counter (BUG-09: stale across runs)
         this.consecutiveRepeats = 0;           // Reset consecutive repeat counter (BUG-09: stale across runs)
+        this.consecutiveSameToolCalls = 0;     // Reset same-tool loop detector (stale state causes false triggers)
+        this.lastToolName = '';                // Reset same-tool name tracker
+        this.lastContextLevel = 'safe';        // Reset context-warning level so warnings re-arm each turn
         this._unparsedToolTurns = 0;           // Reset unparsed-tool-output loop counter (OLLAMA_LOOP_BUG)
         this._preDraftRecoveryAttempts = 0;    // Reset pre-draft recovery counter
         this._historyPoisonReverts = 0;        // Reset history-poisoning revert counter
@@ -5512,7 +5517,7 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                         });
                         if (singleLine) return true;
                         // Check multi-line JSON with "name" field
-                        const multiLine = content.match(/\{[\s\S]*--name"\s*:\s*"[^"]+"[\s\S]*?\}/);
+                        const multiLine = content.match(/\{[\s\S]*"name"\s*:\s*"[^"]+"[\s\S]*?\}/);
                         if (multiLine) {
                             try {
                                 const parsed = JSON.parse(multiLine[0]);
@@ -7489,6 +7494,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 // ── End no-progress detector ──────────────────────────────────
 
                 let toolResult: string;
+                let _missingArgHandled = false; // set true when handleMissingArg already pushed to history
                 try {
                     toolResult = await this.executeTool(name, args, toolId);
                     logInfo(`Tool ${name} OK -- ${toolResult.length} chars`);
@@ -7835,6 +7841,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     // Missing required argument: inject a corrective hint so the model retries correctly.
                     if (/\b(path|command) is required\b|\bmissing required (arg|argument|param|parameter)\b/i.test(toolResult)) {
                         toolResult = await this.handleMissingArg(name, toolResult, toolId, args, isTextMode, post);
+                        _missingArgHandled = true; // handleMissingArg already pushed to history; skip the outer push
                     }
 
                     // Track edit_file failures per (path, old_string) to catch repeated identical failures.
@@ -8621,10 +8628,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     const _answerSuffix = _answerAlreadyGiven
                         ? '\n\n[ANSWER COMPLETE: You already provided a full answer to the user before this tool call. Do NOT continue investigating — only respond further if this tool result reveals an error in what you said. Otherwise, stop now.]'
                         : '';
-                    this.history.push({
-                        role: 'user',
-                        content: `Tool ${name} returned:\n${toolResultForHistory}\n---\n${nudge}${deferredReminder}${this.buildOrientationAnchor(name)}${_answerSuffix}`,
-                    });
+                    if (!_missingArgHandled) {
+                        this.history.push({
+                            role: 'user',
+                            content: `Tool ${name} returned:\n${toolResultForHistory}\n---\n${nudge}${deferredReminder}${this.buildOrientationAnchor(name)}${_answerSuffix}`,
+                        });
+                    }
                 } else {
                     // Track large read results (native tool mode — same logic as text-mode path above)
                     if (_isThinkingModel && (name === 'read_file' || name === 'shell_read')) {
@@ -8693,7 +8702,9 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     if (_answerAlreadyGiven) {
                         toolResultForHistory += '\n\n[ANSWER COMPLETE: You already provided a full answer to the user before this tool call. Do NOT continue investigating — only respond further if this tool result reveals an error in what you said. Otherwise, stop now.]';
                     }
-                    this.history.push({ role: 'tool', content: toolResultForHistory });
+                    if (!_missingArgHandled) {
+                        this.history.push({ role: 'tool', content: toolResultForHistory });
+                    }
                 }
             }
             // History-poisoning recovery: if every write-tool in the batch hard-failed,
@@ -8711,11 +8722,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 logWarn(`[agent] History-poisoning recovery: reverted ${poisonedCount} failed tool result(s) from history (revert #${this._historyPoisonReverts})`);
                 const failedNames = callsToExecute.map(tc => tc.function.name).join(', ');
                 const recoveryMsg = `[SYSTEM: All tool calls in this batch failed (${failedNames}). The error results have been removed from history to prevent context poisoning. Diagnose the root cause: re-read the relevant file(s) with shell_read to confirm paths and content, then retry with corrected arguments. Do NOT repeat the same tool calls without first verifying the input.]`;
-                if (isTextMode) {
-                    this.history.push({ role: 'user', content: recoveryMsg });
-                } else {
-                    this.history.push({ role: 'tool', content: recoveryMsg });
-                }
+                // Always use role:'user' here: history was just sliced back to historySnapshotLen
+                // (which ends with the user message that started this turn), so a role:'tool'
+                // push would be invalid role-ordering in both text and native mode.
+                this.history.push({ role: 'user', content: recoveryMsg });
             } else if (batchToolsSucceeded > 0) {
                 this._historyPoisonReverts = 0; // reset on any success
             }
@@ -8993,8 +9003,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     ? lastMsg.content.slice(0, 600)
                     : '';
             }
-            const nextStep = this._pendingPlanSteps[0];
-            const remaining = this._pendingPlanSteps.length;
+            const nextStep = this._pendingPlanSteps[0]; // peek — shift() happens inside the recursive run() entry gate
+            const remaining = this._pendingPlanSteps.length - 1; // subtract current step (not yet dequeued here)
             logInfo(`[multi-plan] Step complete -- auto-advancing to next: ${nextStep.relPath} (${remaining} remaining)`);
             post({ type: 'planProgress', step: nextStep, remaining });
             // Enqueue the next run as a microtask so the current call stack unwinds first.
@@ -11004,15 +11014,24 @@ if errors:
                 }
                 if (!rfPathRaw) {
                     // No path given — the model doesn't know what to read yet.
-                    // Return a directory listing of the workspace root so the model
-                    // can pick the right file without looping.
+                    this._consecutiveEmptyPathReads++;
+                    if (this._consecutiveEmptyPathReads >= 2) {
+                        // Stuck in a loop — stop returning the workspace listing and
+                        // force the model to use search_files or ask the user instead.
+                        this._consecutiveEmptyPathReads = 0;
+                        this.consecutiveFailures++;
+                        logWarn(`[read_file] Stuck: empty-path read_file called ${this._consecutiveEmptyPathReads + 2}+ times. Steering away.`);
+                        return `[read_file] STOP: You have called read_file without a path argument multiple times. Do NOT call read_file again without a specific path. Instead: use search_files to locate the file you need, or use memory_search to recall relevant paths from memory, or ask the user which file to read.`;
+                    }
+                    // First empty-path call — return a directory listing so the model can pick.
                     const rfRootEntries = fs.readdirSync(this.workspaceRoot, { withFileTypes: true });
                     const rfDirLines = rfRootEntries
                         .sort((a, b) => (a.isDirectory() ? 0 : 1) - (b.isDirectory() ? 0 : 1) || a.name.localeCompare(b.name))
                         .map(e => `${e.isDirectory() ? 'd' : 'f'} ${e.name}`)
                         .join('\n');
-                    return `[read_file] No path given — here is the workspace root listing (d=directory, f=file):\n${rfDirLines}\n\nCall read_file again with {"path": "relative/path/to/file"} for the specific file you want.`;
+                    return `[read_file] No path given — here is the workspace root listing (d=directory, f=file):\n${rfDirLines}\n\nCall read_file again with {"path": "relative/path/to/file"} for the specific file you want. If the file is not in this list, use search_files to find it.`;
                 }
+                this._consecutiveEmptyPathReads = 0; // reset on a valid path
                 const rfResolved = await this.resolvePathWithPolicy(rfPathRaw, 'read_file');
                 if ('blocked' in rfResolved) { return rfResolved.blocked; }
                 const rfPath: string = rfResolved.path;
@@ -17688,24 +17707,24 @@ return { failClass: _failClass, failHint: _failHint };
         try {
             const recoveredResult = await this.executeTool('read_file', { path: autoRecoveredPath }, `${toolId}_recovered`);
             toolResult = recoveredResult;
-            // Replace the failed error result with the recovered file content
+            // Push the recovered result as a new history entry (do NOT replace the assistant message).
             const recoveredMsg = `[Auto-recovered read_file for "${autoRecoveredPath}"]\n${recoveredResult}`;
-            this.history[this.history.length - 1] = isTextMode
+            this.history.push(isTextMode
                 ? { role: 'user', content: `Tool read_file returned:\n${recoveredMsg}` }
-                : { role: 'tool', content: recoveredMsg };
+                : { role: 'tool', content: recoveredMsg });
             post({ type: 'toolResult', id: toolId, name: 'read_file', success: true, preview: `(auto-recovered: ${autoRecoveredPath})` });
             this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1);
         } catch {
             const missingHint = `[SYSTEM: Your "read_file" tool call was missing the "path" argument. Include "path" with the file path to read. Example: <tool>{"name":"read_file","arguments":{"path":"${autoRecoveredPath}"}}</tool>]`;
-            this.history[this.history.length - 1] = isTextMode
+            this.history.push(isTextMode
                 ? { role: 'user', content: missingHint }
-                : { role: 'tool', content: missingHint };
+                : { role: 'tool', content: missingHint });
         }
     } else {
         const missingHint = `[SYSTEM: Your "${name}" tool call was missing the "${missingArg}" argument and did not execute. You must include ${argList}. Retry NOW with a complete, non-empty tool call. Example: <tool>{"name":"${name}","arguments":{"${missingArg}":"<value>"}}</tool>]`;
-        this.history[this.history.length - 1] = isTextMode
+        this.history.push(isTextMode
             ? { role: 'user', content: missingHint }
-            : { role: 'tool', content: missingHint };
+            : { role: 'tool', content: missingHint });
     }
         logWarn(`[agent] Missing-arg on "${name}" (${missingArg}) -- consecutiveFailures rolled back, hint injected`);
         return toolResult;
