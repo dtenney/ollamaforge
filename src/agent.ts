@@ -8940,10 +8940,28 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 // file edits/writes this session, it is executing a task, not answering a question.
                 && this._editsThisRun === 0
                 && this._writtenPathsThisSession.size === 0;
+            // Research-answer detection: agent ran many read/lookup/SSH commands to investigate a
+            // question, produced a comprehensive answer, and made no file writes. This catches the
+            // "Tell me about X" pattern where the agent spends 10+ turns reading/SSHing then writes
+            // a full summary — the <= 8 turn cap in isPureQA would miss this, causing auto-continue
+            // to fire and the agent to re-summarize the same answer repeatedly.
+            // Guard: response must be substantial (>600 chars) and the run must be purely
+            // investigative (no file writes this run or this session) and end with factual prose
+            // (not a planning narration, not a mid-task status note ending in a verb/colon).
+            // Inline planning-narration check for the post-loop context (isPlanningNarration is
+            // scoped to the per-turn loop above and is not available here).
+            const _postLoopPlanningNarration = /^(?:let me |i(?:'ll| will) (?:check|look|explore|read|find|search|examine|review|start|begin|now)|looking (?:at|for|into)|checking |searching |reading |exploring )/i.test(lastAssistantText.trim());
+            const isResearchAnswer = lastAssistantText.length > 600
+                && this._editsThisRun === 0
+                && this._writtenPathsThisSession.size === 0
+                && !_postLoopPlanningNarration
+                // The response must look like a final answer, not a mid-task status.
+                // Mid-task notes typically end with a colon, a verb phrase, or "let me".
+                && !/(?::\s*$|let me\b|\bnow\s+(?:check|read|run|look|see|try|fetch|grab|pull)\b)/i.test(lastAssistantText.trimEnd());
             // If the agent's last message ends with a question, it is waiting for user input —
             // not at a turn limit. Suppress the card entirely so the user just answers naturally.
             const endsWithQuestion = /\?\s*$/.test(lastAssistantText.trimEnd());
-            const looksFinished = hasCompletionLanguage || isPureQA || userDismissedSession || endsWithQuestion;
+            const looksFinished = hasCompletionLanguage || isPureQA || isResearchAnswer || userDismissedSession || endsWithQuestion;
             if (madeProgressThisRun) {
                 this._consecutiveNoWriteRuns = 0;
                 this._earlyCompactionStalls = 0; // real progress breaks the stall streak
