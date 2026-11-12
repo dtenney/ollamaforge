@@ -2949,10 +2949,16 @@ export class Agent {
                 }
             }
         }
-        // Phase tracker: reset to 'research' for new tasks, but keep the current phase for short
+        // Phase tracker: reset for new tasks, but keep the current phase for short
         // confirmations ("continue", "yes", "--) so the tighter acting/verifying threshold stays in effect.
+        // For tasks that clearly involve editing/moving/creating/fixing code or UI, start in
+        // 'acting' phase immediately so the tighter read-saturation threshold (3 turns) applies
+        // from the first turn instead of the loose 'research' threshold (8 turns). This prevents
+        // the agent spiralling through 8+ read-only turns on a task where it should just edit.
         if (!isConfirmation) {
-            this._taskPhase = 'research';
+            const isEditIntent = /\b(shrink|move|add|remove|delete|fix|update|change|rename|refactor|create|make|convert|replace|reorder|resize|restructur|reorgani[sz]|rewrit|extract|split|merge|migrate|deploy|install|bump|upgrade|downgrade)\b/i.test(userMessage)
+                && !/\b(what|how|why|when|where|which|tell me|explain|describe|show me|list|find|search|look|check|review|audit|analys|analyz|inspect|read|summarize|summarise)\b/i.test(userMessage);
+            this._taskPhase = isEditIntent ? 'acting' : 'research';
         }
         // If it's a confirmation and we're still in 'research' (never made edits last run), stay in research.
         this._preflightWriteGateFired = false; // Reset pre-flight write gate
@@ -9278,10 +9284,10 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 } catch { /* ignore */ }
             }
             const readNudge = this._taskPhase === 'acting'
-                ? `[system: You have read ${this._readOnlyTurnsSinceLastEdit} times without making changes. The file content is below — use write_file or edit_file NOW. Do NOT read again.]${fileInject}`
+                ? `[system: You have read ${this._readOnlyTurnsSinceLastEdit} times without making any edits. STOP reading. If you have found what you need, make the edit NOW with edit_file or write_file. If you have NOT found it after ${this._readOnlyTurnsSinceLastEdit} reads, use search_files with a targeted pattern to locate it in one call — do NOT read more files blindly. The file content is below if applicable.]${fileInject}`
                 : this._taskPhase === 'verifying'
                 ? `[system: You have verified ${this._readOnlyTurnsSinceLastEdit} times without finding anything to fix. Verification is DONE. Write your summary to the user now and STOP. Do NOT read any more files.]`
-                : `[system: You have read ${this._readOnlyTurnsSinceLastEdit} files without acting. You have enough context. Call write_file, edit_file, or run_command — or write your final answer. Do NOT read more files.]`;
+                : `[system: You have read ${this._readOnlyTurnsSinceLastEdit} files without acting. If you have enough context, make the edit NOW with edit_file or write_file. If you are still searching, use search_files with a specific pattern to find what you need in one call rather than reading files one at a time. Do NOT read more files blindly.]`;
             this.history.push({ role: 'user', content: readNudge });
             post({ type: 'removeLastAssistant' });
             return true;
