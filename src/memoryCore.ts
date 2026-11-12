@@ -1279,16 +1279,30 @@ export class TieredMemoryManager {
      * Returns false (not duplicate) if Qdrant/embeddings are unavailable.
      */
     async isSemanticDuplicate(content: string, threshold: number = 0.85): Promise<boolean> {
+        return (await this.findSemanticDuplicate(content, threshold)) !== null;
+    }
+
+    /**
+     * Like isSemanticDuplicate but returns the matching entry so callers can
+     * include the existing content in rejection messages (lets the agent decide
+     * whether to delete-and-rewrite a stale fact vs skip a genuine duplicate).
+     */
+    async findSemanticDuplicate(content: string, threshold: number = 0.85): Promise<{ id: string; content: string; tier: number } | null> {
         if (!this.qdrantClient || !this.embeddingService) {
-            return false;
+            return null;
         }
         try {
             const embedding = await this.embeddingService.generateEmbedding(content);
             const results = await this.qdrantClient.search(embedding, 1, undefined, threshold);
-            return results.length > 0;
+            if (results.length === 0) { return null; }
+            const hit = results[0];
+            const id = String(hit.id ?? hit.payload?.memoryId ?? '');
+            const existingContent = String(hit.payload?.content ?? '');
+            const tier = Number(hit.payload?.tier ?? -1);
+            return { id, content: existingContent, tier };
         } catch (error) {
             logWarn(`[memory] Semantic dedup check failed (skipping): ${toErrorMessage(error)}`);
-            return false;
+            return null;
         }
     }
 

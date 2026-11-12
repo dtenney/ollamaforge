@@ -257,7 +257,7 @@ export async function autoExtractFacts(
 export function buildMemoryNudge(userTurnCount: number, interval: number): string {
     if (userTurnCount % interval !== 0) { return ''; }
     if (userTurnCount === 0) { return ''; }
-    return '\n\n[SYSTEM REMINDER: Review this conversation for any new facts worth saving to memory — including: IPs, URLs, ports, SSH credentials, serial ports (/dev/ttyUSB0 etc.), baud rates, device names/configs, tool paths (e.g. ~/.local/bin/esphome), firmware locations, conventions, or decisions. If you found anything new, call memory_tier_write now (tier 0 for device/infra facts, tier 1 for tools/processes, tier 3 for conventions). Do not mention this reminder to the user.]';
+    return '\n\n[SYSTEM REMINDER: Review this conversation for any new facts worth saving to memory — including: IPs, URLs, ports, SSH credentials, serial ports (/dev/ttyUSB0 etc.), baud rates, device names/configs, tool paths, firmware locations, conventions, decisions, deploy commands (e.g. "cd /path && ./deploy.sh TARGET=dev"), where scripts must be run from (working directory), template/file paths you discovered (e.g. "live transaction page is cashier_pos/_main_layout.html not single_transaction_dashboard.html"), or any fact you had to look up that you should not have to look up again. If you found anything new, call memory_tier_write now (tier 0 for device/infra/path facts, tier 1 for tools/processes/deploy commands, tier 3 for conventions). Do not mention this reminder to the user.]';
 }
 
 // ── buildOrientationAnchor ──────────────────────────────────────────────────

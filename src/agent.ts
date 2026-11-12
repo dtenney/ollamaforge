@@ -4436,7 +4436,9 @@ IMPORTANT: Only critical infrastructure is shown above. You have MORE memories s
 - When given a vague business requirement (e.g. "allow decimals for X on the Y page") -> call memory_search("<X>") and memory_search("<Y page>") FIRST before looking at files
 Do NOT assume you have no memory -- check first.
 
-STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentioned in "## Your Persistent Memory" above -- compare them. If they contradict (e.g. memory says path X but file says path Y), you MUST correct it in the same response: call memory_list, find the stale id, call memory_delete, then call memory_tier_write with the correct value. Do this silently without telling the user.`;
+STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentioned in "## Your Persistent Memory" above -- compare them. If they contradict (e.g. memory says path X but file says path Y), you MUST correct it in the same response: call memory_list, find the stale id, call memory_delete, then call memory_tier_write with the correct value. Do this silently without telling the user.
+
+PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you should not need to look up again -- save them immediately without being asked. This includes: the correct template/file path for a live page (e.g. "transaction page renders cashier_pos/_main_layout.html"), the working directory a deploy script must run from, the exact deploy command (e.g. "cd /path && TARGET=dev ./deploy.sh"), or any structural fact about the project you discovered by reading files. Tier 0 for paths/servers, Tier 1 for commands/deploy steps.`;
         }
 
         // If Qdrant is offline, tell the model so it doesn't waste turns calling memory_search
@@ -12700,12 +12702,13 @@ if errors:
                 }
 
                 // Semantic dedup: reject if too similar to existing memory.
-                // If the full content is a dupe, try once with a truncated version -- the model
-                // often retries with identical content on rejection, so truncating breaks the loop.
+                // Returns the existing entry so the agent can compare and decide
+                // whether to delete-and-rewrite (correction) vs skip (genuine dupe).
                 try {
-                    const isDupe = await this.memory.isSemanticDuplicate(content, 0.80);
-                    if (isDupe) {
-                        // Try truncated version before giving up
+                    const dupeMatch = await this.memory.findSemanticDuplicate(content, 0.80);
+                    if (dupeMatch) {
+                        // Try truncated version before giving up — model often retries
+                        // with identical content on rejection, so truncating breaks the loop.
                         if (content.length > 300) {
                             const truncated = content.slice(0, 300).trimEnd() + '...';
                             const isDupeTrunc = await this.memory.isSemanticDuplicate(truncated, 0.80).catch(() => true);
@@ -12718,7 +12721,13 @@ if errors:
                             }
                         }
                         logInfo(`[memory] Semantic-deduped: "${content.slice(0, 60)}"`);
-                        return `Duplicate: a semantically similar entry already exists in memory. Entry not saved -- this is not an error.`;
+                        // Include the existing entry so the agent can tell whether this is a
+                        // genuine duplicate (skip) or a stale fact that needs correcting
+                        // (delete id="${dupeMatch.id}" then re-write with the new value).
+                        const existingSnip = dupeMatch.content.length > 120
+                            ? dupeMatch.content.slice(0, 120) + '...'
+                            : dupeMatch.content;
+                        return `Duplicate: a semantically similar entry already exists in memory (id="${dupeMatch.id}", tier=${dupeMatch.tier}): "${existingSnip}". Entry not saved. If your new value CORRECTS the existing one, call memory_delete with that id then call memory_tier_write again with the correct value.`;
                     }
                 } catch {
                     // Qdrant unavailable -- skip semantic check, allow save
