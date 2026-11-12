@@ -9329,9 +9329,17 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
     }
 
     /**
-     * Auto code-review: after any coding run that modified source files, inject
-     * a review pass asking the agent to check for bugs, inconsistencies, and
-     * race conditions before the loop exits. Fires exactly once per user message.
+     * Auto code-review: after a multi-file coding run, inject one review pass
+     * asking the agent to check for bugs, inconsistencies, and race conditions.
+     *
+     * Guards:
+     * - Only fires in trust/yolo mode (lower modes = user reviews manually)
+     * - Only fires when 2+ logic source files were changed (single-file trivial
+     *   edits and pure HTML/template-only changes are excluded)
+     * - HTML/HTM files only count toward the threshold, never trigger alone
+     * - Fires exactly once per user message (_codeReviewFiredThisRun)
+     * - Review prompt explicitly forbids reading files outside the changed set
+     *
      * Returns true if the caller should `continue` the loop.
      */
     private runCodeReview(
@@ -9342,19 +9350,30 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         if (!isLegitimateStop || isUserDismissal || this._codeReviewFiredThisRun) {
             return false;
         }
-        // Only fire when source files were changed this run.
-        const sourceFiles = this._filesChangedThisRun
-            .filter(f => /\.(ts|tsx|js|jsx|py|go|java|cs|cpp|c|rb|rs|php|swift|kt|html|htm)$/i.test(f));
-        if (sourceFiles.length === 0) {
+        // Only fire in trust/yolo — in other modes the user is already reviewing.
+        if (this.trustLevel !== 'trust' && this.trustLevel !== 'yolo') {
+            return false;
+        }
+        // Logic files: types where actual executable logic lives.
+        const logicFiles = this._filesChangedThisRun
+            .filter(f => /\.(ts|tsx|js|jsx|py|go|java|cs|cpp|c|rb|rs|php|swift|kt)$/i.test(f));
+        // HTML files count toward threshold but don't trigger alone (templates
+        // with inline <script> blocks are worth reviewing when logic files changed too).
+        const htmlFiles = this._filesChangedThisRun
+            .filter(f => /\.(html|htm)$/i.test(f));
+
+        // Require at least 2 logic-file changes — single-file trivial edits don't warrant a pass.
+        if (logicFiles.length < 2) {
             return false;
         }
         this._codeReviewFiredThisRun = true;
-        const fileList = sourceFiles.slice(0, 10).join(', ');
-        logInfo(`[code-review] Injecting auto review for ${sourceFiles.length} source file(s): ${fileList}`);
+        const reviewFiles = [...logicFiles, ...htmlFiles].slice(0, 10);
+        const fileList = reviewFiles.join(', ');
+        logInfo(`[code-review] Injecting auto review for ${reviewFiles.length} file(s): ${fileList}`);
         this.history.pop();
         this.history.push({
             role: 'user',
-            content: `[system: Before finishing, review the files you just changed (${fileList}) for bugs, inconsistencies, and race conditions. Check: off-by-one errors, unhandled edge cases, missing null/undefined guards, broken error paths, async/await issues, state mutations that could race, and anything that conflicts with existing code. If you find issues, fix them. If everything looks correct, write a brief confirmation and stop.]`
+            content: `[system: Before finishing, review ONLY the files you just changed (${fileList}) for bugs, inconsistencies, and race conditions. Do NOT read any files outside this list. Check: off-by-one errors, unhandled edge cases, missing null/undefined guards, broken error paths, async/await issues, state mutations that could race, and anything that conflicts with existing code. If you find issues, fix them. If everything looks correct, write a brief confirmation and stop.]`
         });
         post({ type: 'removeLastAssistant' });
         return true;
