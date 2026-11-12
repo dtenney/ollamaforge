@@ -114,6 +114,9 @@ function save(map: SystemMap): void {
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
+/** Return the current map without modifying it. */
+export function getMap(): SystemMap { return load(); }
+
 /**
  * Upsert a node. If a node with the same id already exists, merges metadata
  * and updates label/description/type if provided.

@@ -3105,26 +3105,36 @@ export class Agent {
             && !/\b(git|commit|branch|stash|merge)\b/i.test(userMessage) // exclude git moves
             && !/\b(ssh|scp|sftp|\.29|@\d+\.\d+|remote|server|host)\b/i.test(userMessage); // exclude remote/SSH moves
         if (isMoveQuery) {
-            // Extract a search keyword from the message -- prefer the object being moved
-            const moveKeywords = userMessage.match(/\b(database|db|file|folder|directory|service|server|table|schema)\b/i);
-            const searchTerm = moveKeywords?.[1]?.toLowerCase() ?? 'database';
+            // Extract a search keyword from the message -- prefer a specific noun over generic terms.
+            // "file" and "folder" are too broad and always return empty results; skip them in favour
+            // of more specific terms (database name, service name, etc.) extracted from the message.
+            const specificMatch = userMessage.match(/\b([a-z][a-z0-9_-]{3,})\b/gi)
+                ?.filter(w => !/^(the|this|that|with|from|into|move|rename|relocat|restructur|reorgani|migrat|file|files|folder|folders|directory|directories|please|want|need|should|would|could|will|just|also|then|when|where|after|before|and|for|not|but|are|can|has|have|does|did|its|our|your|their)$/i.test(w))
+                ?.[0]?.toLowerCase();
+            const searchTerm = specificMatch ?? 'service';
             try {
-                const { queryMap, formatMapAsText } = await import('./systemMap');
-                const mapResult = queryMap({ search: searchTerm });
-                const mapText = formatMapAsText(mapResult);
-                const alreadyHasMapContext = this.history.slice(-4).some(m =>
-                    m.role === 'user' && String(m.content).includes('[SYSTEM_MAP]')
-                );
-                if (!alreadyHasMapContext) {
-                    // Show as a visible system_map_query tool call in the webview
-                    const smqId = `t_smq_preflight_${Date.now()}`;
-                    post({ type: 'toolCall', id: smqId, name: 'system_map_query', args: { search: searchTerm } });
-                    post({ type: 'toolResult', id: smqId, name: 'system_map_query', success: true, preview: mapText.slice(0, 200) });
-                    this.history.push({
-                        role: 'user',
-                        content: `[SYSTEM_MAP] The system_map_query for "${searchTerm}" returned:\n\n${mapText}\n\nThis is your cross-workspace dependency map. You MUST reference this in your answer -- mention any nodes that list the thing being moved (e.g. db_path, path). Then proceed with code analysis.`,
-                    });
-                    logInfo(`[preflight] Injected system_map_query results for move query (search="${searchTerm}")`);
+                const { queryMap, formatMapAsText, getMap } = await import('./systemMap');
+                // Skip entirely if the map is empty -- no point showing a useless empty result
+                const rawMap = getMap();
+                if (rawMap.nodes.length === 0) {
+                    logInfo(`[preflight] system_map_query skipped — map is empty`);
+                } else {
+                    const mapResult = queryMap({ search: searchTerm });
+                    const mapText = formatMapAsText(mapResult);
+                    const alreadyHasMapContext = this.history.slice(-4).some(m =>
+                        m.role === 'user' && String(m.content).includes('[SYSTEM_MAP]')
+                    );
+                    if (!alreadyHasMapContext) {
+                        // Show as a visible system_map_query tool call in the webview
+                        const smqId = `t_smq_preflight_${Date.now()}`;
+                        post({ type: 'toolCall', id: smqId, name: 'system_map_query', args: { search: searchTerm } });
+                        post({ type: 'toolResult', id: smqId, name: 'system_map_query', success: true, preview: mapText.slice(0, 200) });
+                        this.history.push({
+                            role: 'user',
+                            content: `[SYSTEM_MAP] The system_map_query for "${searchTerm}" returned:\n\n${mapText}\n\nThis is your cross-workspace dependency map. You MUST reference this in your answer -- mention any nodes that list the thing being moved (e.g. db_path, path). Then proceed with code analysis.`,
+                        });
+                        logInfo(`[preflight] Injected system_map_query results for move query (search="${searchTerm}")`);
+                    }
                 }
             } catch (smErr) {
                 logInfo(`[preflight] system_map_query failed: ${toErrorMessage(smErr)}`);
