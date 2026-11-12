@@ -5885,15 +5885,21 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // Note: Trust/YOLO restriction removed — plan-review handoffs must stop in all modes.
                 const endsWithPhaseHandoff = /\b(say the word|let me know when(?: you(?:'re| are)? ready)?|when you(?:'re| are)? ready|just say (?:the word|go|next|yes)|give me the go.?ahead|say ['"]?next['"]?|is a separate effort|answer those and i'?ll|take a look and|ready for your review|ready to start phase|when you'?re? ready to proceed|ready to review)\b/i.test(resp);
 
-                // Plan-review stop: agent just wrote/edited a plans/*.md file and is explicitly
-                // handing it back for review (open questions, "take a look", "let me know").
-                // Without this the agent falls through the loop and starts Phase 1 on its own.
+                // Plan-review stop: fires when:
+                //   (a) agent just wrote/edited a plans/*.md file AND its response contains
+                //       review-handoff language ("take a look", "open questions", etc.), OR
+                //   (b) the user's task message asked to "review" the plan before resolving,
+                //       AND a plan file was written this run — stop regardless of what the
+                //       agent said next (it may have narrated "Now let me start implementing"
+                //       without asking permission, which none of the other checks catch).
                 const justWrotePlan = this._toolCallsThisRun.some(
                     tc => (tc.name === 'write_file' || tc.name === 'edit_file')
                         && /(?:^|\/)plans\/[^/]+\.md$/i.test(String(tc.path ?? ''))
                 );
+                const userAskedToReviewFirst = /\b(let(?:'s| me| us) review|so (?:we|i|you) can review|review(?:,| and) expand|review.*expand|and (?:we|i|you) (?:can |will )?review|review (?:it|the plan|this) (?:first|before)|review and resolv)\b/i.test(this._currentTaskMessage ?? '');
                 const waitingForPlanReview = justWrotePlan
-                    && /\b(open questions?|take a look|answer (?:those|them|these)|let me know|ready for your review|review (?:this|the) plan|start phase [1-9]|start on phase [1-9])\b/i.test(resp);
+                    && (/\b(open questions?|take a look|answer (?:those|them|these)|let me know|ready for your review|review (?:this|the) plan|start phase [1-9]|start on phase [1-9])\b/i.test(resp)
+                        || userAskedToReviewFirst);
 
                 // Completion language: model stated the task is done.
                 const hasCompletionLanguage = Agent.COMPLETION_LANGUAGE_RE.test(resp)
@@ -10568,7 +10574,7 @@ If the code looks correct, respond with exactly: OK`;
                     // do NOT adopt it — the done-gate would block the stop and force the agent
                     // to start implementing the checklist without user sign-off.
                     const _planRel = rel.replace(/\\/g, '/');
-                    const _isPlanDeliverable = /\b(let me review|for (me to |you to )?review|then (i|you|we|let me|we can|i can|we will) review|create.*then review|review it|review (the|this) (file|plan)|and then (let me|i will|we will|i can) review)\b/i.test(this._currentTaskMessage ?? '')
+                    const _isPlanDeliverable = /\b(let(?:'s| me| us) review|for (me to |you to |us to )?review|then (i|you|we|let me|we can|i can|we will) review|create.*then review|review it|review (the|this) (file|plan)|and then (let me|i will|we will|i can) review|so (?:we|i|you) can review|and (?:we|i|you) (?:can |will )?review|review(?:,| and) expand|review.*expand.*resolv)\b/i.test(this._currentTaskMessage ?? '')
                         || /\b(don'?t (start|implement|proceed|do it|begin)|create (the )?file (only|first|and stop|and wait)|just (create|write|make) (the )?(file|plan)|file (only|and stop|and wait|for review)|awaiting (review|sign.?off|approval)|review before (i |we )?(start|implement|proceed|build|make changes))\b/i.test(this._currentTaskMessage ?? '');
                     if (_planRel.startsWith('plans/') && _planRel.endsWith('.md') && !_isPlanDeliverable) {
                         this._activePlanFile = full;
