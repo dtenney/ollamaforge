@@ -9392,17 +9392,23 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
     }
 
     /**
-     * Deploy nudge: when the agent finishes a coding task (made edits, is about
-     * to stop) check whether the workspace has uncommitted or unpushed changes
-     * AND memory contains a deploy command. If so, inject a nudge telling the
-     * agent to commit, push, and deploy before stopping.
+     * Git/deploy nudge: after finishing a coding task, check the git state and
+     * inject the right nudge:
+     *
+     *   1. No git repo at all → suggest initialising one (ask the user, don't
+     *      auto-create — it's a one-time setup decision).
+     *   2. Repo exists, uncommitted/unpushed changes, memory has deploy info →
+     *      commit + push + deploy automatically.
+     *   3. Repo exists, uncommitted/unpushed changes, no deploy info in memory →
+     *      commit + push (local repo workflow).
+     *   4. Everything already committed and pushed → no nudge.
      *
      * Guards:
-     * - Only fires in trust/yolo mode
-     * - Only fires when source files were changed this run
-     * - Only fires when memory has deploy/SSH info (no memory = no nudge)
-     * - Only fires when git reports uncommitted or unpushed changes
-     * - Fires exactly once per user message
+     * - trust/yolo mode only
+     * - source files changed this run
+     * - user's message didn't already mention git/deploy
+     * - fires exactly once per user message
+     *
      * Returns true if the caller should `continue` the loop.
      */
     private async runDeployNudge(
@@ -9419,49 +9425,76 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         if (this._filesChangedThisRun.length === 0) {
             return false;
         }
-        // Check if the user's message already asked for git/deploy — no need to nudge
+        // Skip if the user's message already covered git/deploy
         const taskMsg = (this._currentTaskMessage ?? '').toLowerCase();
         if (/\b(git|push|deploy|commit|deploy\.sh)\b/.test(taskMsg)) {
             return false;
         }
-        // Check memory for deploy commands — only nudge if the project has a known deploy flow
-        if (!this.memory) { return false; }
-        let deployInfo = '';
-        try {
-            const hits = await this.memory.searchMemory('deploy push git commit', undefined, 2);
-            if (hits.length === 0) { return false; }
-            deployInfo = hits.map(h => h.content).join('\n');
-        } catch { return false; }
 
-        // Check git status — only nudge if there are uncommitted or unpushed changes
-        try {
-            const { execSync } = await import('child_process');
-            const gitStatus = execSync('git status --porcelain', {
-                cwd: this.workspaceRoot, timeout: 5000, encoding: 'utf8'
-            }).trim();
-            let gitLog = '';
-            try {
-                gitLog = execSync('git log @{u}.. --oneline', {
-                    cwd: this.workspaceRoot, timeout: 5000, encoding: 'utf8'
-                }).trim();
-            } catch { /* no upstream or no commits — treat as no unpushed */ }
-            const hasUncommitted = gitStatus.length > 0;
-            const hasUnpushed = gitLog.length > 0;
-            if (!hasUncommitted && !hasUnpushed) { return false; }
+        const { execSync } = await import('child_process');
 
+        // ── Case 1: no git repo ───────────────────────────────────────────────
+        let isGitRepo = false;
+        try {
+            execSync('git rev-parse --git-dir', {
+                cwd: this.workspaceRoot, timeout: 3000, stdio: 'ignore'
+            });
+            isGitRepo = true;
+        } catch { /* not a git repo */ }
+
+        if (!isGitRepo) {
             this._deployNudgeFiredThisRun = true;
-            const what = hasUncommitted ? 'uncommitted changes' : 'unpushed commits';
-            logInfo(`[deploy-nudge] Injecting deploy nudge — git has ${what}`);
+            logInfo('[deploy-nudge] No git repo found — suggesting init');
             this.history.pop();
             this.history.push({
                 role: 'user',
-                content: `[system: You have finished editing but there are ${what} in this workspace. Based on memory, this project has a deploy flow:\n\n${deployInfo}\n\nCommit the changes, push, and deploy to development now. Do not ask the user — just do it.]`
+                content: `[system: You just made code changes but this workspace has no git repository. Ask the user: "This project isn't tracked in git yet — would you like me to initialise a repository and make the first commit?" Then stop and wait for their answer. Do NOT initialise git without their confirmation.]`
             });
             post({ type: 'removeLastAssistant' });
             return true;
-        } catch {
-            return false;
         }
+
+        // ── Cases 2-4: repo exists — check for uncommitted/unpushed ─────────
+        let gitStatus = '';
+        let gitLog = '';
+        try {
+            gitStatus = execSync('git status --porcelain', {
+                cwd: this.workspaceRoot, timeout: 5000, encoding: 'utf8'
+            }).trim();
+        } catch { return false; }
+        try {
+            gitLog = execSync('git log @{u}.. --oneline', {
+                cwd: this.workspaceRoot, timeout: 5000, encoding: 'utf8'
+            }).trim();
+        } catch { /* no upstream configured — that's fine, still commit */ }
+
+        const hasUncommitted = gitStatus.length > 0;
+        const hasUnpushed = gitLog.length > 0;
+        if (!hasUncommitted && !hasUnpushed) { return false; }  // Case 4
+
+        // Check memory for a deploy command
+        let deployInfo = '';
+        if (this.memory) {
+            try {
+                const hits = await this.memory.searchMemory('deploy push git commit', undefined, 2);
+                deployInfo = hits.map(h => h.content).join('\n');
+            } catch { /* memory unavailable */ }
+        }
+
+        this._deployNudgeFiredThisRun = true;
+        const what = hasUncommitted ? 'uncommitted changes' : 'unpushed commits';
+        logInfo(`[deploy-nudge] Injecting git/deploy nudge — ${what}, deployInfo=${deployInfo.length > 0}`);
+        this.history.pop();
+
+        const nudgeContent = deployInfo.length > 0
+            // Case 2: repo + changes + deploy info
+            ? `[system: You have finished editing but there are ${what} in this workspace. Based on memory, this project has a deploy flow:\n\n${deployInfo}\n\nCommit the changes with a descriptive message, push, and deploy to development now. Do not ask the user — just do it.]`
+            // Case 3: repo + changes, no deploy info
+            : `[system: You have finished editing but there are ${what} in this workspace. Commit the changes with a descriptive message and push to the remote. If there is no remote configured, commit locally. Do not ask the user — just do it.]`;
+
+        this.history.push({ role: 'user', content: nudgeContent });
+        post({ type: 'removeLastAssistant' });
+        return true;
     }
 
     private checkNoveltyFingerprint(
