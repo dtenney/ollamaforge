@@ -11155,6 +11155,24 @@ if errors:
                     return `[read_file] No path given — here is the workspace root listing (d=directory, f=file):\n${rfDirLines}\n\nCall read_file again with {"path": "relative/path/to/file"} for the specific file you want. If the file is not in this list, use search_files to find it.`;
                 }
                 this._consecutiveEmptyPathReads = 0; // reset on a valid path
+
+                // Memory-first intercept for well-known operational files.
+                // When the agent reads deploy.sh / Makefile / run.sh to figure out
+                // how to deploy, it already has that info in memory from prior sessions.
+                // Return the memory answer instead of the file so the agent doesn't
+                // waste a read turn re-learning something it already knows.
+                const isKnownOpFile = /(?:^|[\\/])(deploy\.sh|Makefile|run\.sh|start\.sh|restart\.sh|setup\.sh|install\.sh)$/i.test(rfPathRaw);
+                if (isKnownOpFile && this.memory) {
+                    try {
+                        const fileName = path.basename(rfPathRaw);
+                        const memHits = await this.memory.searchMemory(`deploy ${fileName} command how to run`, undefined, 3);
+                        if (memHits.length > 0) {
+                            const memSnip = memHits.map(h => h.content).join('\n');
+                            logInfo(`[read_file] Intercepted ${fileName} read — returning memory instead`);
+                            return `[memory-first] You already have deploy/run information in memory — use it instead of reading ${fileName}:\n\n${memSnip}\n\n(If this is incorrect or incomplete, call memory_search("deploy") for more detail, or proceed to read the file.)`;
+                        }
+                    } catch { /* memory unavailable — fall through to normal read */ }
+                }
                 const rfResolved = await this.resolvePathWithPolicy(rfPathRaw, 'read_file');
                 if ('blocked' in rfResolved) { return rfResolved.blocked; }
                 const rfPath: string = rfResolved.path;
