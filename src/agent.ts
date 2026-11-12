@@ -1995,6 +1995,7 @@ export class Agent {
     private _projectNudgeLastTurn: number = -1;
     private _autoVerifyFiredThisRun: boolean = false;
     private _codeReviewFiredThisRun: boolean = false;
+    private _deployNudgeFiredThisRun: boolean = false;
     /** Async subagent handles -- keyed by handle string returned by delegate_task_async */
     private _asyncHandles: Map<string, Promise<string>> = new Map();
     /** Monotonic counter for async handle uniqueness -- never reused within an Agent instance */
@@ -2905,6 +2906,7 @@ export class Agent {
         this._focusedGrepInjectedThisTurn = false; // Reset focused-grep dedup flag
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
         this._codeReviewFiredThisRun = false;        // Reset code-review guard so it can fire once per user message
+        this._deployNudgeFiredThisRun = false;       // Reset deploy-nudge guard so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._preExecCache.clear();            // Reset pre-exec cache -- stale entries from prior run waste memory
         this._editContextInjected = false;     // Reset read-then-act flag
@@ -5970,6 +5972,10 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 }
 
                 if (this.runCodeReview(isLegitimateStop, isUserDismissal, post)) {
+                    continue;
+                }
+
+                if (await this.runDeployNudge(isLegitimateStop, isUserDismissal, post)) {
                     continue;
                 }
 
@@ -9383,6 +9389,79 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         });
         post({ type: 'removeLastAssistant' });
         return true;
+    }
+
+    /**
+     * Deploy nudge: when the agent finishes a coding task (made edits, is about
+     * to stop) check whether the workspace has uncommitted or unpushed changes
+     * AND memory contains a deploy command. If so, inject a nudge telling the
+     * agent to commit, push, and deploy before stopping.
+     *
+     * Guards:
+     * - Only fires in trust/yolo mode
+     * - Only fires when source files were changed this run
+     * - Only fires when memory has deploy/SSH info (no memory = no nudge)
+     * - Only fires when git reports uncommitted or unpushed changes
+     * - Fires exactly once per user message
+     * Returns true if the caller should `continue` the loop.
+     */
+    private async runDeployNudge(
+        isLegitimateStop: boolean,
+        isUserDismissal: boolean,
+        post: PostFn
+    ): Promise<boolean> {
+        if (!isLegitimateStop || isUserDismissal || this._deployNudgeFiredThisRun) {
+            return false;
+        }
+        if (this.trustLevel !== 'trust' && this.trustLevel !== 'yolo') {
+            return false;
+        }
+        if (this._filesChangedThisRun.length === 0) {
+            return false;
+        }
+        // Check if the user's message already asked for git/deploy — no need to nudge
+        const taskMsg = (this._currentTaskMessage ?? '').toLowerCase();
+        if (/\b(git|push|deploy|commit|deploy\.sh)\b/.test(taskMsg)) {
+            return false;
+        }
+        // Check memory for deploy commands — only nudge if the project has a known deploy flow
+        if (!this.memory) { return false; }
+        let deployInfo = '';
+        try {
+            const hits = await this.memory.searchMemory('deploy push git commit', undefined, 2);
+            if (hits.length === 0) { return false; }
+            deployInfo = hits.map(h => h.content).join('\n');
+        } catch { return false; }
+
+        // Check git status — only nudge if there are uncommitted or unpushed changes
+        try {
+            const { execSync } = await import('child_process');
+            const gitStatus = execSync('git status --porcelain', {
+                cwd: this.workspaceRoot, timeout: 5000, encoding: 'utf8'
+            }).trim();
+            let gitLog = '';
+            try {
+                gitLog = execSync('git log @{u}.. --oneline', {
+                    cwd: this.workspaceRoot, timeout: 5000, encoding: 'utf8'
+                }).trim();
+            } catch { /* no upstream or no commits — treat as no unpushed */ }
+            const hasUncommitted = gitStatus.length > 0;
+            const hasUnpushed = gitLog.length > 0;
+            if (!hasUncommitted && !hasUnpushed) { return false; }
+
+            this._deployNudgeFiredThisRun = true;
+            const what = hasUncommitted ? 'uncommitted changes' : 'unpushed commits';
+            logInfo(`[deploy-nudge] Injecting deploy nudge — git has ${what}`);
+            this.history.pop();
+            this.history.push({
+                role: 'user',
+                content: `[system: You have finished editing but there are ${what} in this workspace. Based on memory, this project has a deploy flow:\n\n${deployInfo}\n\nCommit the changes, push, and deploy to development now. Do not ask the user — just do it.]`
+            });
+            post({ type: 'removeLastAssistant' });
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     private checkNoveltyFingerprint(
