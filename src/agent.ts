@@ -1994,6 +1994,7 @@ export class Agent {
     /** Turn number when the project context was last injected — throttles re-injection */
     private _projectNudgeLastTurn: number = -1;
     private _autoVerifyFiredThisRun: boolean = false;
+    private _codeReviewFiredThisRun: boolean = false;
     /** Async subagent handles -- keyed by handle string returned by delegate_task_async */
     private _asyncHandles: Map<string, Promise<string>> = new Map();
     /** Monotonic counter for async handle uniqueness -- never reused within an Agent instance */
@@ -2903,6 +2904,7 @@ export class Agent {
         // the session so the same broken old_string doesn't retry indefinitely across user replies.
         this._focusedGrepInjectedThisTurn = false; // Reset focused-grep dedup flag
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
+        this._codeReviewFiredThisRun = false;        // Reset code-review guard so it can fire once per user message
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._preExecCache.clear();            // Reset pre-exec cache -- stale entries from prior run waste memory
         this._editContextInjected = false;     // Reset read-then-act flag
@@ -5865,11 +5867,21 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     && /\b(want me to|shall i|should i|would you like me to|do you want me to|ready for me to|can i go ahead|shall we|should we)\b.{0,120}\?\s*$/i.test(resp);
 
                 // Phase-handoff phrases: "say the word and I'll start Phase 3", "let me know when
-                // you're ready", "is a separate effort — say the word" etc.  The model uses these
-                // to hand back control even though it hasn't asked a question. In Trust/YOLO mode
-                // we intercept them the same way we intercept permission questions.
-                const endsWithPhaseHandoff = (this.trustLevel === 'trust' || this.trustLevel === 'yolo')
-                    && /\b(say the word|let me know when(?: you(?:'re| are)? ready)?|when you(?:'re| are)? ready|just say (?:the word|go|next|yes)|give me the go.?ahead|say ['"]?next['"]?|is a separate effort)\b/i.test(resp);
+                // you're ready", "answer those and I'll start Phase 1", etc.  The model uses these
+                // to hand back control even though it hasn't asked a question. These are ALWAYS a
+                // stop — the user needs to review / approve before work continues.
+                // Note: Trust/YOLO restriction removed — plan-review handoffs must stop in all modes.
+                const endsWithPhaseHandoff = /\b(say the word|let me know when(?: you(?:'re| are)? ready)?|when you(?:'re| are)? ready|just say (?:the word|go|next|yes)|give me the go.?ahead|say ['"]?next['"]?|is a separate effort|answer those and i'?ll|take a look and|ready for your review|ready to start phase|when you'?re? ready to proceed|ready to review)\b/i.test(resp);
+
+                // Plan-review stop: agent just wrote/edited a plans/*.md file and is explicitly
+                // handing it back for review (open questions, "take a look", "let me know").
+                // Without this the agent falls through the loop and starts Phase 1 on its own.
+                const justWrotePlan = this._toolCallsThisRun.some(
+                    tc => (tc.name === 'write_file' || tc.name === 'edit_file')
+                        && /(?:^|\/)plans\/[^/]+\.md$/i.test(String(tc.path ?? ''))
+                );
+                const waitingForPlanReview = justWrotePlan
+                    && /\b(open questions?|take a look|answer (?:those|them|these)|let me know|ready for your review|review (?:this|the) plan|start phase [1-9]|start on phase [1-9])\b/i.test(resp);
 
                 // Completion language: model stated the task is done.
                 const hasCompletionLanguage = Agent.COMPLETION_LANGUAGE_RE.test(resp)
@@ -5906,18 +5918,34 @@ STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentione
                     // to call yet another search tool, producing a loop of redundant searches + answers.
                     || (thisRunOnlyLookup && !toolCalls.length && turnHasText && resp.trim().length > 60 && !isPlanningNarration)
                     // Model tried to expand scope to a different task list — stop the current task.
-                    || isScopeEscape;
+                    || isScopeEscape
+                    // Model handed control back for review: "answer those and I'll start Phase 1",
+                    // "let me know when you're ready", "say the word", etc. — always a stop regardless
+                    // of trust mode. Previously these were only caught in Trust/YOLO and routed through
+                    // interceptPermissionSeeking as a proceed-nudge, which caused the agent to start
+                    // Phase 1 immediately after writing a plan file the user asked to review.
+                    || endsWithPhaseHandoff
+                    // Agent wrote/edited a plans/*.md file and is explicitly waiting for the user to
+                    // review open questions before proceeding. Without this the loop continues and the
+                    // agent starts Phase 1 on its own.
+                    || waitingForPlanReview;
                 // Reset stall budget when the model gives a real answer — it wasn't stalling,
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
                 if (isLegitimateStop) { this.autoRetryCount = 0; }
 
-                if (this.interceptPermissionSeeking(endsWithPermissionQuestion, endsWithPhaseHandoff, isTextMode, post)) {
+                // Phase-handoff is now a legitimate stop (above) — only pass permission questions
+                // to interceptPermissionSeeking, not phase-handoff phrases.
+                if (this.interceptPermissionSeeking(endsWithPermissionQuestion, false, isTextMode, post)) {
                     continue;
                 }
 
 
                 if (this.runSelfEvaluation(isLegitimateStop, hasCompletionLanguage, isUserDismissal, post)) {
+                    continue;
+                }
+
+                if (this.runCodeReview(isLegitimateStop, isUserDismissal, post)) {
                     continue;
                 }
 
@@ -9177,8 +9205,12 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
 
     /**
      * Trust/yolo permission-seeking intercept: in trust/yolo mode, if the agent
-     * ended its response with a permission-seeking question or a phase-handoff
-     * phrase, intercept and force it to continue immediately.
+     * ended its response with a permission-seeking question ("want me to?",
+     * "shall I?"), intercept and force it to continue immediately.
+     * Phase-handoff phrases ("say the word", "answer those and I'll start")
+     * are now handled as legitimate stops in isLegitimateStop — they are NOT
+     * routed here. The endsWithPhaseHandoff param is kept for callers but
+     * always passed as false.
      * Returns true if the caller should `continue` the loop.
      */
     private interceptPermissionSeeking(
@@ -9191,9 +9223,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             return false;
         }
         const toolCallHint2 = isTextMode ? ' Output only a <tool> block.' : ' Call the next tool now.';
-        const nudge = endsWithPhaseHandoff
-            ? `[system: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT wait for the user to say "the word" or give permission — proceed immediately to the next phase/step now.${toolCallHint2}]`
-            : `[system: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission or offer a choice — pick the next logical action and do it immediately.${toolCallHint2}]`;
+        const nudge = `[system: You are in ${this.trustLevel.toUpperCase()} mode. Do NOT ask for permission or offer a choice — pick the next logical action and do it immediately.${toolCallHint2}]`;
         // Keep the assistant's summary visible (streaming already rendered it) but append the
         // nudge as a user turn so the model proceeds without waiting for real user input.
         // Do NOT pop the history or call removeLastAssistant — the user already saw the response.
@@ -9278,6 +9308,38 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             }
         }
         return false;
+    }
+
+    /**
+     * Auto code-review: after any coding run that modified source files, inject
+     * a review pass asking the agent to check for bugs, inconsistencies, and
+     * race conditions before the loop exits. Fires exactly once per user message.
+     * Returns true if the caller should `continue` the loop.
+     */
+    private runCodeReview(
+        isLegitimateStop: boolean,
+        isUserDismissal: boolean,
+        post: PostFn
+    ): boolean {
+        if (!isLegitimateStop || isUserDismissal || this._codeReviewFiredThisRun) {
+            return false;
+        }
+        // Only fire when source files were changed this run.
+        const sourceFiles = this._filesChangedThisRun
+            .filter(f => /\.(ts|tsx|js|jsx|py|go|java|cs|cpp|c|rb|rs|php|swift|kt|html|htm)$/i.test(f));
+        if (sourceFiles.length === 0) {
+            return false;
+        }
+        this._codeReviewFiredThisRun = true;
+        const fileList = sourceFiles.slice(0, 10).join(', ');
+        logInfo(`[code-review] Injecting auto review for ${sourceFiles.length} source file(s): ${fileList}`);
+        this.history.pop();
+        this.history.push({
+            role: 'user',
+            content: `[system: Before finishing, review the files you just changed (${fileList}) for bugs, inconsistencies, and race conditions. Check: off-by-one errors, unhandled edge cases, missing null/undefined guards, broken error paths, async/await issues, state mutations that could race, and anything that conflicts with existing code. If you find issues, fix them. If everything looks correct, write a brief confirmation and stop.]`
+        });
+        post({ type: 'removeLastAssistant' });
+        return true;
     }
 
     private checkNoveltyFingerprint(
