@@ -221,7 +221,12 @@ export function streamChatRequest(
         numPredict?: number;
     }
 ): Promise<StreamResult> {
-    return new Promise((resolve, reject) => {
+    return new Promise((_resolve, _reject) => {
+        // Wrap resolve/reject so the idle-read timer (defined later) is always cleared.
+        // The timer is set up inside the response callback, so we store a ref in a closure var.
+        let _idleTimerRef: ReturnType<typeof setTimeout> | null = null;
+        const resolve: typeof _resolve = (v) => { if (_idleTimerRef) { clearTimeout(_idleTimerRef); _idleTimerRef = null; } _resolve(v); };
+        const reject: typeof _reject  = (e) => { if (_idleTimerRef) { clearTimeout(_idleTimerRef); _idleTimerRef = null; } _reject(e); };
         let destroyed = false; // local flag — survives stopRef.stop being cleared by retry logic
         const { hostname, port } = getEndpoint();
         const cfg = getConfig();
@@ -326,6 +331,23 @@ export function streamChatRequest(
                 let buf = '';
                 let resolved = false;
                 let thinkingStarted = false;
+
+                // Idle-read timeout: if no data arrives for 120s the stream has silently stalled.
+                // The socket-level timeout (600s) only fires if the connection drops — it won't
+                // catch a live connection that stopped sending tokens (e.g. Ollama hung mid-generation).
+                const IDLE_TIMEOUT_MS = 120_000;
+                const fireIdleTimeout = () => {
+                    if (!resolved && !destroyed) {
+                        destroyed = true;
+                        req.destroy();
+                        reject(new Error('Ollama stream idle timeout — no tokens received for 120s. The model may have hung. Please retry.'));
+                    }
+                };
+                _idleTimerRef = setTimeout(fireIdleTimeout, IDLE_TIMEOUT_MS);
+                const resetIdleTimer = () => {
+                    if (_idleTimerRef) { clearTimeout(_idleTimerRef); }
+                    _idleTimerRef = setTimeout(fireIdleTimeout, IDLE_TIMEOUT_MS);
+                };
                 let insideToolBlock = false; // suppress repetition detection inside <tool>...</tool>
                 // Logprob accumulation — Ollama returns per-token logprobs when logprobs:true is set
                 let logprobSum = 0;
@@ -483,6 +505,7 @@ export function streamChatRequest(
 
                 res.on('data', (chunk: Buffer) => {
                     if (stopRef.stop) { destroyed = true; req.destroy(); return; }
+                    resetIdleTimer(); // reset idle watchdog on every data chunk
                     buf += chunk.toString();
                     const lines = buf.split('\n');
                     buf = lines.pop() ?? '';
