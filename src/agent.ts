@@ -5975,7 +5975,7 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     continue;
                 }
 
-                if (await this.runDeployNudge(isLegitimateStop, isUserDismissal, post)) {
+                if (await this.runDeployNudge(isLegitimateStop, isUserDismissal, toolCalls.length === 0, post)) {
                     continue;
                 }
 
@@ -9414,9 +9414,13 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
     private async runDeployNudge(
         isLegitimateStop: boolean,
         isUserDismissal: boolean,
+        isTextOnlyTurn: boolean,
         post: PostFn
     ): Promise<boolean> {
-        if (!isLegitimateStop || isUserDismissal || this._deployNudgeFiredThisRun) {
+        // Fire on a legitimate stop OR on a text-only summary turn after edits
+        // (the agent says "I've updated the files" but _taskPhase='acting' blocks isLegitimateStop).
+        const shouldCheck = isLegitimateStop || (isTextOnlyTurn && this._filesChangedThisRun.length > 0);
+        if (!shouldCheck || isUserDismissal || this._deployNudgeFiredThisRun) {
             return false;
         }
         if (this.trustLevel !== 'trust' && this.trustLevel !== 'yolo') {
