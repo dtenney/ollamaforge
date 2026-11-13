@@ -324,6 +324,45 @@ Every script must print a structured summary as its last line: {"processed": N, 
 - Clean up /tmp scripts on remote hosts after the task is done.
 ` : '';
 
+    // ── Active-environment detection ──────────────────────────────────────────
+    // Look for an authoritative "active environment" declaration in two places:
+    //   1. .ollamaforge/context.md  — a line like:  Active environment: dev
+    //   2. DEPLOYMENT.md            — a line like:  active_env: dev
+    //                                    or section: ## Current Environment\ndev
+    // If found, inject a banner so the agent always knows what it's working on
+    // and cannot accidentally deploy to production during a development session.
+    let activeEnv: string | null = null;
+    if (workspaceRoot) {
+        // Check .ollamaforge/context.md first (highest authority)
+        try {
+            const ctxContent = fs.readFileSync(path.join(workspaceRoot, '.ollamaforge', 'context.md'), 'utf8');
+            const m = ctxContent.match(/^(?:active[\s_-]?env(?:ironment)?|current[\s_-]?env(?:ironment)?|target[\s_-]?env(?:ironment)?)\s*[:=]\s*(.+)/im);
+            if (m) { activeEnv = m[1].trim().toLowerCase(); }
+        } catch { /* no context.md */ }
+
+        // Fall back to DEPLOYMENT.md
+        if (!activeEnv) {
+            try {
+                const deployContent = fs.readFileSync(path.join(workspaceRoot, 'DEPLOYMENT.md'), 'utf8');
+                // Pattern 1: active_env: dev
+                const m1 = deployContent.match(/^(?:active[\s_-]?env(?:ironment)?|current[\s_-]?env(?:ironment)?|target[\s_-]?env(?:ironment)?)\s*[:=]\s*(.+)/im);
+                if (m1) { activeEnv = m1[1].trim().toLowerCase(); }
+                // Pattern 2: ## Current Environment\n<value>
+                if (!activeEnv) {
+                    const m2 = deployContent.match(/##\s*current\s+environment\s*\n+([^\n#]+)/i);
+                    if (m2) { activeEnv = m2[1].trim().toLowerCase(); }
+                }
+            } catch { /* no DEPLOYMENT.md */ }
+        }
+    }
+
+    const isProduction = activeEnv ? /\bprod(?:uction)?\b/.test(activeEnv) : false;
+    const envBannerBlock = activeEnv
+        ? isProduction
+            ? `\n⚠️ ACTIVE ENVIRONMENT: **PRODUCTION** — All actions in this session affect live production systems. Be careful. Only deploy, restart, or mutate data when you are certain. Always prefer reversible operations.`
+            : `\n🛠 ACTIVE ENVIRONMENT: **${activeEnv.toUpperCase()}** — This session targets the ${activeEnv} environment. Do NOT deploy to production, run production scripts, or touch production databases/servers unless the user explicitly says "deploy to production" or "target production" in this conversation.`
+        : `\n📌 ACTIVE ENVIRONMENT: **not declared** — No active environment has been set in DEPLOYMENT.md or .ollamaforge/context.md. Assume development/local. Do NOT deploy to production unless the user explicitly authorises it in this conversation. To set an environment, add a line like \`Active environment: dev\` to \`.ollamaforge/context.md\`.`;
+
     const searchCfg = getSearchConfig();
     const comfyCfg = getComfyUIConfig();
     const webSearchLine = searchCfg.url
@@ -335,7 +374,7 @@ Every script must print a structured summary as its last line: {"processed": N, 
         : '';
 
     return `You are an expert AI coding and systems assistant inside VS Code.
-Current date: ${dateStr}, ${timeStr}.${activeLanguage ? ` Active file: ${activeFile} (${activeLanguage}).` : ''}${workspaceInfo ? `\nWorkspace: ${workspaceRoot}` : ''}
+Current date: ${dateStr}, ${timeStr}.${activeLanguage ? ` Active file: ${activeFile} (${activeLanguage}).` : ''}${workspaceInfo ? `\nWorkspace: ${workspaceRoot}` : ''}${envBannerBlock}
 Always work from actual project files -- never answer from training data alone.
 
 ## Scope
@@ -393,6 +432,7 @@ Never pre-draft file content in your thinking -- decide what to write, then emit
 ## Staying on track
 **Confirmed plan = authorization for all steps.** When the user asks you to do something, you are authorized to do all the steps required to complete it — including build, compile, test, deploy, flash, restart services, install packages, run migrations, push to git, or execute any script that is a normal part of that workflow. Do NOT hand steps back to the user with "run this yourself" or "say the word and I'll do it" — just do it. Only stop for a genuine blocker: an unexpected error you cannot resolve, or information only the user can supply (a password, an account credential, a physical hardware identifier you cannot discover). The distinction is: **can the agent resolve this without the user?** If yes, resolve it. If no, ask once, concisely.
 **"Irreversible" does not mean "ask first."** Deploying, flashing firmware, restarting a service, running a migration, pushing a branch, overwriting a config — these are all reversible in context (you can reflash, rollback, revert). Do not treat them as requiring special permission beyond the user's original request. The only actions that require explicit confirmation are those that permanently destroy data with no recovery path: dropping a production database, wiping a disk, deleting backups, mass-deleting files. Everything else: just run it.
+**Production environment is off-limits by default.** Unless the active environment (see banner above) is explicitly "production", or the user says "deploy to production" / "run on production" / "target production" in THIS conversation: do NOT deploy to production servers, run scripts against production databases, restart production services, or modify production configuration. If the user's request is ambiguous (e.g. "deploy it" during a big release), deploy to development/staging ONLY and state clearly: "Deployed to [env] — say 'deploy to production' to push to prod." To permanently unlock production targeting, the user should add \`Active environment: production\` to \`.ollamaforge/context.md\`.
 **"Move X from A to B" is ambiguous — always ask first.** When the user says "move scripts/code/logic from X to Y" where X and Y are platform/service names (discord, matrix, slack, telegram, database names, service names) rather than filesystem paths, do NOT assume they mean a filesystem \`mv\` or directory rename. They almost certainly mean: update the code so it targets platform B instead of platform A (change imports, API calls, config). Before doing anything, ask: "Do you want me to (1) update the code so these scripts send to [B] instead of [A], or (2) physically move the files to a different directory?" One sentence, one question.
 **Batch, don't enumerate.** Never check items one at a time with repeated ls/find calls. Write one script that checks everything at once and prints a summary. If you are about to run the same command pattern a second time on a different item -- stop, write a loop, run it once.
 **Never write a numbered plan or mid-task status list.** Do not write "1. Search for X, 2. Search for Y..." or "Current progress: [x] item A, [ ] item B" in your response. Writing the plan or status causes a spiral. Instead: act on the next item immediately. Each tool call IS the plan step. Only produce a summary when ALL items are complete.

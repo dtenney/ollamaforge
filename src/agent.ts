@@ -9430,8 +9430,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             return false;
         }
         // Skip if the user's message already covered git/deploy
-        const taskMsg = (this._currentTaskMessage ?? '').toLowerCase();
-        if (/\b(git|push|deploy|commit|deploy\.sh)\b/.test(taskMsg)) {
+        const _taskMsgLower = (this._currentTaskMessage ?? '').toLowerCase();
+        if (/\b(git|push|deploy|commit|deploy\.sh)\b/.test(_taskMsgLower)) {
             return false;
         }
 
@@ -9494,18 +9494,44 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             }
         } catch { /* non-fatal */ }
 
+        // Detect active environment — check .ollamaforge/context.md first, then DEPLOYMENT.md
+        let activeEnv: string | null = null;
+        try {
+            const ctxContent = fs.readFileSync(path.join(this.workspaceRoot, '.ollamaforge', 'context.md'), 'utf8');
+            const m = ctxContent.match(/^(?:active[\s_-]?env(?:ironment)?|current[\s_-]?env(?:ironment)?|target[\s_-]?env(?:ironment)?)\s*[:=]\s*(.+)/im);
+            if (m) { activeEnv = m[1].trim().toLowerCase(); }
+        } catch { /* no context.md */ }
+        if (!activeEnv && deploymentMd) {
+            const m1 = deploymentMd.match(/^(?:active[\s_-]?env(?:ironment)?|current[\s_-]?env(?:ironment)?|target[\s_-]?env(?:ironment)?)\s*[:=]\s*(.+)/im);
+            if (m1) { activeEnv = m1[1].trim().toLowerCase(); }
+            if (!activeEnv) {
+                const m2 = deploymentMd.match(/##\s*current\s+environment\s*\n+([^\n#]+)/i);
+                if (m2) { activeEnv = m2[1].trim().toLowerCase(); }
+            }
+        }
+        const isProductionEnv = activeEnv ? /\bprod(?:uction)?\b/.test(activeEnv) : false;
+        const userExplicitlyTargetedProd = /\b(deploy to prod|push to prod|target prod|production deploy|deploy.*production|production.*deploy)\b/.test(_taskMsgLower);
+
         const deployContext = [deploymentMd, deployInfo].filter(Boolean).join('\n\n').trim();
 
         this._deployNudgeFiredThisRun = true;
         const what = hasUncommitted ? 'uncommitted changes' : 'unpushed commits';
-        logInfo(`[deploy-nudge] Injecting git/deploy nudge — ${what}, deployContext=${deployContext.length > 0}`);
+        logInfo(`[deploy-nudge] Injecting git/deploy nudge — ${what}, deployContext=${deployContext.length > 0}, activeEnv=${activeEnv ?? 'none'}`);
         this.history.pop();
 
+        // Production guard: if the active env is not production and the user didn't explicitly
+        // ask for a prod deploy this task, strip deploy instructions and only commit+push.
+        const deployAllowed = isProductionEnv || userExplicitlyTargetedProd;
+
         const nudgeContent = deployContext.length > 0
-            // Case 2: repo + changes + deploy context — give full context, careful instructions
-            ? `[system: You have finished editing but there are ${what} in this workspace.\n\nDeploy context from memory/DEPLOYMENT.md:\n${deployContext}\n\nSTEPS:\n1. Commit the changes with a descriptive message.\n2. Push to the remote.\n3. Deploy ONLY if the context above makes the exact command unambiguous (e.g. a known SSH command or remote script). If the deploy mechanism requires running a script on a remote server, SSH there and run it — do NOT run deploy.sh locally unless the context explicitly says to. If anything is unclear, stop after pushing and tell the user what you did and what the next deploy step is.]`
+            // Case 2: repo + changes + deploy context
+            ? deployAllowed
+                ? `[system: You have finished editing but there are ${what} in this workspace.\n\nDeploy context from memory/DEPLOYMENT.md:\n${deployContext}\n\nSTEPS:\n1. Commit the changes with a descriptive message.\n2. Push to the remote.\n3. Deploy ONLY if the context above makes the exact command unambiguous (e.g. a known SSH command or remote script). If the deploy mechanism requires running a script on a remote server, SSH there and run it — do NOT run deploy.sh locally unless the context explicitly says to. If anything is unclear, stop after pushing and tell the user what you did and what the next deploy step is.]`
+                : `[system: You have finished editing but there are ${what} in this workspace. The active environment is "${activeEnv ?? 'development'}" — do NOT deploy to production. STEPS:\n1. Commit the changes with a descriptive message.\n2. Push to the remote (${activeEnv ?? 'dev'} branch/remote only).\n3. If a dev/staging deploy is unambiguous from DEPLOYMENT.md, run it. Otherwise stop after pushing and tell the user: "Committed and pushed to ${activeEnv ?? 'dev'}. Say 'deploy to production' when you're ready to go live."]`
             // Case 3: repo + changes, no deploy info
-            : `[system: You have finished editing but there are ${what} in this workspace. Commit the changes with a descriptive message and push to the remote. If there is no remote configured, commit locally. After pushing, ask the user if they want to deploy.]`;
+            : deployAllowed
+                ? `[system: You have finished editing but there are ${what} in this workspace. Commit the changes with a descriptive message and push to the remote. If there is no remote configured, commit locally. After pushing, ask the user if they want to deploy.]`
+                : `[system: You have finished editing but there are ${what} in this workspace. The active environment is "${activeEnv ?? 'development'}" — do NOT deploy to production. Commit the changes with a descriptive message and push to the remote (${activeEnv ?? 'dev'} only). Tell the user: "Committed and pushed to ${activeEnv ?? 'dev'}. Say 'deploy to production' when you're ready to go live."]`;
 
         this.history.push({ role: 'user', content: nudgeContent });
         post({ type: 'removeLastAssistant' });
