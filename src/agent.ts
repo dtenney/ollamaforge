@@ -9480,21 +9480,32 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
         let deployInfo = '';
         if (this.memory) {
             try {
-                const hits = await this.memory.searchMemory('deploy push git commit', undefined, 2);
+                const hits = await this.memory.searchMemory('deploy push git commit', undefined, 3);
                 deployInfo = hits.map(h => h.content).join('\n');
             } catch { /* memory unavailable */ }
         }
 
+        // Also check DEPLOYMENT.md if present — it has authoritative SSH/command info
+        let deploymentMd = '';
+        try {
+            const deployMdPath = path.join(this.workspaceRoot, 'DEPLOYMENT.md');
+            if (fs.existsSync(deployMdPath)) {
+                deploymentMd = fs.readFileSync(deployMdPath, 'utf8').slice(0, 2000);
+            }
+        } catch { /* non-fatal */ }
+
+        const deployContext = [deploymentMd, deployInfo].filter(Boolean).join('\n\n').trim();
+
         this._deployNudgeFiredThisRun = true;
         const what = hasUncommitted ? 'uncommitted changes' : 'unpushed commits';
-        logInfo(`[deploy-nudge] Injecting git/deploy nudge — ${what}, deployInfo=${deployInfo.length > 0}`);
+        logInfo(`[deploy-nudge] Injecting git/deploy nudge — ${what}, deployContext=${deployContext.length > 0}`);
         this.history.pop();
 
-        const nudgeContent = deployInfo.length > 0
-            // Case 2: repo + changes + deploy info
-            ? `[system: You have finished editing but there are ${what} in this workspace. Based on memory, this project has a deploy flow:\n\n${deployInfo}\n\nCommit the changes with a descriptive message, push, and deploy to development now. Do not ask the user — just do it.]`
+        const nudgeContent = deployContext.length > 0
+            // Case 2: repo + changes + deploy context — give full context, careful instructions
+            ? `[system: You have finished editing but there are ${what} in this workspace.\n\nDeploy context from memory/DEPLOYMENT.md:\n${deployContext}\n\nSTEPS:\n1. Commit the changes with a descriptive message.\n2. Push to the remote.\n3. Deploy ONLY if the context above makes the exact command unambiguous (e.g. a known SSH command or remote script). If the deploy mechanism requires running a script on a remote server, SSH there and run it — do NOT run deploy.sh locally unless the context explicitly says to. If anything is unclear, stop after pushing and tell the user what you did and what the next deploy step is.]`
             // Case 3: repo + changes, no deploy info
-            : `[system: You have finished editing but there are ${what} in this workspace. Commit the changes with a descriptive message and push to the remote. If there is no remote configured, commit locally. Do not ask the user — just do it.]`;
+            : `[system: You have finished editing but there are ${what} in this workspace. Commit the changes with a descriptive message and push to the remote. If there is no remote configured, commit locally. After pushing, ask the user if they want to deploy.]`;
 
         this.history.push({ role: 'user', content: nudgeContent });
         post({ type: 'removeLastAssistant' });
