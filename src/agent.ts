@@ -11602,6 +11602,16 @@ if errors:
                         if (soleStr) { cmd = String(soleStr); logWarn(`[shell_read] Recovered 'command' from sole string arg: ${cmd.slice(0, 80)}`); }
                     }
                 }
+                // Double-JSON unwrap: model sometimes stuffs the full args JSON into the command field,
+                // e.g. args.command = '{"command": "ssh ..."}' — the JSON wasn't parsed, it's a raw string.
+                // Bash then receives '{command: ssh ...}' as the command and fails with "command not found".
+                if (cmd.trimStart().startsWith('{')) {
+                    try {
+                        const inner = JSON.parse(cmd);
+                        const unwrapped = String(inner.command ?? inner.cmd ?? '');
+                        if (unwrapped) { logWarn(`[shell_read] Double-JSON unwrap: extracted command from stringified args`); cmd = unwrapped; }
+                    } catch { /* not valid JSON — leave as-is */ }
+                }
                 if (!cmd) { throw new Error('command is required'); }
 
                 // Wave 1 security (1.1): shell_read is read-only by contract, but state-changing
@@ -12105,6 +12115,16 @@ if errors:
                         const soleStr = Object.values(args).find(v => typeof v === 'string' && (v as string).length > 2);
                         if (soleStr) { cmd = String(soleStr); logWarn(`[run_command] Recovered 'command' from sole string arg: ${cmd.slice(0, 80)}`); }
                     }
+                }
+                // Double-JSON unwrap: model sometimes stuffs the full args JSON into the command field,
+                // e.g. args.command = '{"command": "ssh ..."}' — the JSON wasn't parsed, it's a raw string.
+                // Bash then receives '{command: ssh ...}' as the command and fails with "command not found".
+                if (cmd.trimStart().startsWith('{')) {
+                    try {
+                        const inner = JSON.parse(cmd);
+                        const unwrapped = String(inner.command ?? inner.cmd ?? '');
+                        if (unwrapped) { logWarn(`[run_command] Double-JSON unwrap: extracted command from stringified args`); cmd = unwrapped; }
+                    } catch { /* not valid JSON — leave as-is */ }
                 }
                 if (!cmd) { throw new Error('command is required'); }
 
