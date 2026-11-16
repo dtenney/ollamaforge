@@ -6566,7 +6566,7 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // contains all other args as a collapsed JSON string, e.g.:
                 //   { "offset": "520, \"limit\": 130, \"path\": \"src/bot.js\"}" }
                 // Detect and repair this before the tool runs.
-                if (name === 'read_file' || name === 'shell_read' || name === 'write_file' || name === 'edit_file') {
+                if (name === 'read_file' || name === 'shell_read' || name === 'run_command' || name === 'write_file' || name === 'edit_file') {
                     const argKeys = Object.keys(args);
                     if (argKeys.length === 1) {
                         const soleKey = argKeys[0];
@@ -11593,6 +11593,15 @@ if errors:
             // â"€â"€ shell_read â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'shell_read': {
                 let cmd = String(args.command ?? '');
+                // Fallback: model sometimes emits {cmd: "..."} or the command as the sole string value
+                if (!cmd) {
+                    const alt = String(args.cmd ?? args.query ?? '');
+                    if (alt) { cmd = alt; logWarn(`[shell_read] Recovered 'command' from alt key (cmd/query): ${alt.slice(0, 80)}`); }
+                    else {
+                        const soleStr = Object.values(args).find(v => typeof v === 'string' && (v as string).length > 2);
+                        if (soleStr) { cmd = String(soleStr); logWarn(`[shell_read] Recovered 'command' from sole string arg: ${cmd.slice(0, 80)}`); }
+                    }
+                }
                 if (!cmd) { throw new Error('command is required'); }
 
                 // Wave 1 security (1.1): shell_read is read-only by contract, but state-changing
@@ -12088,6 +12097,15 @@ if errors:
             // â"€â"€ run_command â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'run_command': {
                 let cmd = String(args.command ?? '');
+                // Fallback: model sometimes emits {cmd: "..."} or the command as the sole string value
+                if (!cmd) {
+                    const alt = String(args.cmd ?? args.query ?? '');
+                    if (alt) { cmd = alt; logWarn(`[run_command] Recovered 'command' from alt key (cmd/query): ${alt.slice(0, 80)}`); }
+                    else {
+                        const soleStr = Object.values(args).find(v => typeof v === 'string' && (v as string).length > 2);
+                        if (soleStr) { cmd = String(soleStr); logWarn(`[run_command] Recovered 'command' from sole string arg: ${cmd.slice(0, 80)}`); }
+                    }
+                }
                 if (!cmd) { throw new Error('command is required'); }
 
                 // Wave 1 security (1.1): hard gate. If the most recent web content was
