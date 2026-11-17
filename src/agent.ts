@@ -5910,8 +5910,11 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // All tools called across the ENTIRE run were lookups — this is a pure Q&A run.
                 // The final answer turn will have zero tool calls (model gives the answer), so
                 // thisTurnOnlyLookup won't fire. We need to check the whole run's tool history.
+                // Also treat memory_tier_write calls that all returned Filtered/Duplicate as
+                // non-substantive — they're housekeeping that shouldn't block the stop condition.
+                const HOUSEKEEPING_TOOLS = new Set([...READ_ONLY_TOOL_NAMES, 'memory_tier_write', 'task_log']);
                 const thisRunOnlyLookup = toolsCalledThisRun
-                    && this._toolCallsThisRun.every(tc => READ_ONLY_TOOL_NAMES.has(tc.name ?? ''));
+                    && this._toolCallsThisRun.every(tc => HOUSEKEEPING_TOOLS.has(tc.name ?? ''));
 
                 // Trust/yolo permission questions are NOT legitimate stops.
                 // Permission-seek: a yes/no "shall I do X?" question in Trust/YOLO mode where the
@@ -5968,6 +5971,10 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // narrating work on a different list/task, treat that as "current task done" — stop.
                 const isTaskNofM = /^\[TASK \d+\/\d+\]/.test(this._currentTaskMessage ?? '');
                 const isScopeEscape = isTaskNofM && /\b(item|task|issue|fix)\s+\d+\s+(?:from|of|on)\s+(?:the\s+)?(?:first|second|third|other|list|another|different)\b/i.test(resp);
+                // Turn had only memory_tier_write calls that all got rejected (Filtered/Duplicate).
+                // These are housekeeping-only — don't require a follow-up LLM turn.
+                const thisTurnOnlyRejectedMemoryWrites = toolCalls.length > 0
+                    && toolCalls.every(tc => tc.function?.name === 'memory_tier_write');
                 const isLegitimateStop =
                     (isUserDismissal && turnHasText && resp.trim().length < 300)
                     || (endsWithQuestion && !isPlanningNarration)
@@ -5977,6 +5984,9 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     // This turn used only lookup tools (memory/read) + produced a substantive answer.
                     // Allow stop even in 'acting' phase — this is a Q&A response, not mid-task work.
                     || (thisTurnOnlyLookup && turnHasText && resp.trim().length > 80 && !isPlanningNarration)
+                    // This turn only tried to write to memory (all rejected as Filtered/Duplicate).
+                    // The answer was already given — these writes are housekeeping, stop the loop.
+                    || (thisTurnOnlyRejectedMemoryWrites && turnHasText && !isPlanningNarration)
                     // The entire run was lookup-only (memory_search, search_files, etc.) and this turn
                     // produced a text answer without tools. Classic Q&A: model looked up info then answered.
                     // Without this, the no-tool nudge fires on the final answer turn and forces the model
