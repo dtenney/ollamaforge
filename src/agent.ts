@@ -2553,6 +2553,16 @@ export class Agent {
         for (const t of toolNames) { this._trustedTools.add(t); }
     }
 
+    /** Seed previously-approved outside-workspace paths so the user isn't re-prompted across turns. */
+    seedApprovedOutsidePaths(paths: Iterable<string>): void {
+        for (const p of paths) { this._approvedOutsidePaths.add(p.toLowerCase()); }
+    }
+
+    /** Return the current set of approved outside-workspace paths (normalized lowercase) for persistence. */
+    getApprovedOutsidePaths(): ReadonlySet<string> {
+        return this._approvedOutsidePaths;
+    }
+
     /**
      * Clear ALL approvals — both session-persistent (_trustedTools, seeded by trust level
      * or "Accept All") and current-run temporary (_autoApprovedTools, per-turn batch).

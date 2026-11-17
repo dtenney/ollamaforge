@@ -399,6 +399,8 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
     private _pinnedFiles: string[] = [];
     /** Tool names permanently approved by the user — persisted across sessions. */
     private _persistentApprovals: Set<string> = new Set();
+    /** Outside-workspace file paths approved this session — carried across agent instances so user is not re-prompted per turn. */
+    private _approvedOutsidePaths: Set<string> = new Set();
     /** Current trust level — controls which tools are auto-approved without confirmation. */
     private _trustLevel: 'normal' | 'trust' | 'yolo' = 'normal';
     /** Listener for file saves to invalidate smart context import cache. */
@@ -1208,6 +1210,9 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
 
                     try {
                         await runTab.agent!.run(fullMessageWithPins, model, trackedPost);
+                        // Persist any newly-approved outside-workspace paths so the next turn's
+                        // agent instance doesn't re-prompt for the same files.
+                        this.syncApprovedOutsidePaths();
                         // Sync agent history and task state into session after run completes.
                         // Only clear pendingContinuation if the run finished WITHOUT an error —
                         // if an error was posted mid-run (e.g. network drop), pendingContinuation
@@ -2103,7 +2108,21 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
             agent.seedPersistentApprovals(approvals);
             logInfo(`[provider] Seeded ${approvals.size} approval(s) (trust=${this._trustLevel}): ${[...approvals].join(', ')}`);
         }
+        // Carry over outside-workspace path approvals from previous turns so the user
+        // is not re-prompted for the same file on offset/limit reads or across turns.
+        if (this._approvedOutsidePaths.size) {
+            agent.seedApprovedOutsidePaths(this._approvedOutsidePaths);
+        }
         return agent;
+    }
+
+    /** Sync approved outside-workspace paths back from the active agent after each run. */
+    private syncApprovedOutsidePaths(): void {
+        const active = this._tab.agent;
+        if (!active) { return; }
+        for (const p of active.getApprovedOutsidePaths()) {
+            this._approvedOutsidePaths.add(p);
+        }
     }
 
     // ── Session helpers ───────────────────────────────────────────────────────
@@ -2113,6 +2132,7 @@ export class OllamaAgentProvider implements vscode.WebviewViewProvider {
         const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
         this._tab.session = this.storage.createNew(model);
         this._tab.agent?.dispose();
+        this._approvedOutsidePaths.clear(); // New session — reset outside-path approvals
         this._tab.agent = this.makeAgent(root);
         if (root && !this._fileIndex.length) {
             indexWorkspaceFiles(root).then(idx => { this._fileIndex = idx; }).catch(() => {});
