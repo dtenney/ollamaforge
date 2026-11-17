@@ -2022,6 +2022,8 @@ export class Agent {
     private _deployNudgeFiredThisRun: boolean = false;
     /** Confirmed SSH user@host connections this run: host → { user, confirmedPaths } */
     private _confirmedSshHosts: Map<string, { user: string; paths: string[] }> = new Map();
+    /** Outside-workspace paths approved by the user this session (normalized lowercase) — never re-prompt for these */
+    private _approvedOutsidePaths: Set<string> = new Set();
     /** Async subagent handles -- keyed by handle string returned by delegate_task_async */
     private _asyncHandles: Map<string, Promise<string>> = new Map();
     /** Monotonic counter for async handle uniqueness -- never reused within an Agent instance */
@@ -9903,6 +9905,18 @@ If the code looks correct, respond with exactly: OK`;
             const name: string = parsed.name ?? '';
             if (!this._PREEXEC_ALLOWLIST.has(name)) { return; }
             const args = (parsed.arguments ?? parsed) as Record<string, unknown>;
+            // Skip pre-exec for outside-workspace paths that haven't been approved yet —
+            // we cannot show a confirmation dialog mid-stream. The main loop will handle
+            // the prompt properly after streaming completes.
+            if (name === 'read_file' && typeof args.path === 'string') {
+                const absPath = path.resolve(this.workspaceRoot, args.path as string);
+                const isInsideWs = absPath.toLowerCase().startsWith(this.workspaceRoot.toLowerCase());
+                const isPreApproved = this._approvedOutsidePaths.has(absPath.toLowerCase());
+                if (!isInsideWs && !isPreApproved) {
+                    logInfo(`[2.6] Skipping pre-exec for outside-workspace path (not yet approved): ${args.path}`);
+                    return;
+                }
+            }
             const key = `${name}::${JSON.stringify(args)}`;
             if (this._preExecCache.has(key)) { return; }
             logInfo(`[2.6] Pre-executing read-only tool mid-stream: ${name}`);
@@ -15536,7 +15550,18 @@ ${sampleHtml}
         }
     }
     private async resolvePathWithPolicy(rawPath: string, toolName: string): Promise<{ path: string } | { blocked: string }> {
-        return _resolvePathWithPolicy(rawPath, toolName, this.workspaceRoot, (action, message, label) => this.requestConfirmation(action, message, label));
+        const absolute = path.resolve(this.workspaceRoot, rawPath);
+        const normalizedKey = absolute.toLowerCase();
+        // If user already approved this outside-workspace path this session, skip the prompt.
+        if (this._approvedOutsidePaths.has(normalizedKey)) {
+            return { path: absolute };
+        }
+        const result = await _resolvePathWithPolicy(rawPath, toolName, this.workspaceRoot, (action, message, label) => this.requestConfirmation(action, message, label));
+        // Record approval so subsequent reads of the same path don't re-prompt.
+        if ('path' in result) {
+            this._approvedOutsidePaths.add(normalizedKey);
+        }
+        return result;
     }
 
     private safePath(root: string, rel: string): string {
