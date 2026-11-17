@@ -950,6 +950,30 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
             }
         }
 
+        // Double-JSON unwrap for command arg: model sometimes emits command as a stringified
+        // JSON object, e.g. command='{"command": "ssh user@host ..."}'. Bash then receives
+        // '{command:' as a literal string and fails with "command not found".
+        // Unwrap here (before executeTool) so it's fixed for all execution paths.
+        if (typeof args.command === 'string' && (args.command as string).trimStart().startsWith('{')) {
+            try {
+                const inner = JSON.parse(args.command as string);
+                const unwrapped = String(inner.command ?? inner.cmd ?? '');
+                if (unwrapped) {
+                    logWarn(`[addCall] Double-JSON unwrap: extracted command from stringified args`);
+                    args = { ...args, command: unwrapped };
+                }
+            } catch { /* not JSON — leave as-is */ }
+        }
+        // Also unwrap when command is an object (XML parser parsed the JSON value into an object)
+        if (args.command !== null && typeof args.command === 'object') {
+            const inner = args.command as Record<string, unknown>;
+            const unwrapped = String(inner.command ?? inner.cmd ?? '');
+            if (unwrapped) {
+                logWarn(`[addCall] Object-command unwrap: extracted command from nested object arg`);
+                args = { ...args, command: unwrapped };
+            }
+        }
+
         // Sanitize path arg: qwen3 sometimes emits "path": "\"README.md\""
         // (escaped quotes inside the JSON string value). Strip any surrounding
         // literal quote chars that survive JSON parsing so tools get a clean path.
@@ -1996,6 +2020,8 @@ export class Agent {
     private _autoVerifyFiredThisRun: boolean = false;
     private _codeReviewFiredThisRun: boolean = false;
     private _deployNudgeFiredThisRun: boolean = false;
+    /** Confirmed SSH user@host connections this run: host → { user, confirmedPaths } */
+    private _confirmedSshHosts: Map<string, { user: string; paths: string[] }> = new Map();
     /** Async subagent handles -- keyed by handle string returned by delegate_task_async */
     private _asyncHandles: Map<string, Promise<string>> = new Map();
     /** Monotonic counter for async handle uniqueness -- never reused within an Agent instance */
@@ -2907,6 +2933,7 @@ export class Agent {
         this._autoVerifyFiredThisRun = false;        // Reset auto-verify guard so it can fire once per user message
         this._codeReviewFiredThisRun = false;        // Reset code-review guard so it can fire once per user message
         this._deployNudgeFiredThisRun = false;       // Reset deploy-nudge guard so it can fire once per user message
+        this._confirmedSshHosts.clear();             // Reset confirmed SSH sessions each run
         this._filesAutoReadThisRun.clear();    // Reset per-run auto-read tracking
         this._preExecCache.clear();            // Reset pre-exec cache -- stale entries from prior run waste memory
         this._editContextInjected = false;     // Reset read-then-act flag
@@ -7717,6 +7744,17 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             logInfo(`[agent] 4.2 failure classified as ${_failClass} for ${name}`);
                         }
 
+                        // SSH auth failure — inject confirmed user@host from this run if available,
+                        // so the agent doesn't loop trying different wrong credentials.
+                        const isSshAuthFail = /Permission denied \(publickey|publickey.*password|ssh.*exit 255|Host key verification failed/i.test(toolResult);
+                        if (isSshAuthFail && this._confirmedSshHosts.size > 0) {
+                            const knownHosts = [...this._confirmedSshHosts.entries()]
+                                .map(([host, info]) => `  ${info.user}@${host}${info.paths.length ? ` (confirmed path: ${info.paths[0]})` : ''}`)
+                                .join('\n');
+                            toolResult += `\n\n[SSH CONTEXT] You have already confirmed working SSH access this session:\n${knownHosts}\nUse the exact user@host shown above. Do NOT guess a different username.`;
+                            logInfo(`[agent] SSH auth failure — injected ${this._confirmedSshHosts.size} confirmed host(s) as hint`);
+                        }
+
                         // D-Bus / Wayland session not available over SSH.
                         // Commands like "waydroid session start", "systemctl --user", or any
                         // GUI app launcher will fail with this error when run over SSH because
@@ -7823,6 +7861,43 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         this.consecutiveFailures = 0;
                         this.autoRetryCount = 0; // Reset stall-retry budget after each tool call
                         batchToolsSucceeded++;
+
+                        // SSH success tracking: detect user@host from a successful ssh/scp command,
+                        // record it this run, and auto-save to memory if not already known.
+                        if ((name === 'shell_read' || name === 'run_command') && !isToolErrorString) {
+                            const cmdForSsh = String(args.command ?? args.cmd ?? '');
+                            const sshHostMatch = cmdForSsh.match(/(?:^|\s)(?:ssh|scp|sftp|rsync)[^\s]*\s+(?:-\S+\s+)*([a-zA-Z0-9._-]+)@([\d.a-zA-Z-]+)/);
+                            if (sshHostMatch) {
+                                const sshUser = sshHostMatch[1];
+                                const sshHost = sshHostMatch[2];
+                                const existing = this._confirmedSshHosts.get(sshHost);
+                                if (!existing) {
+                                    // Extract any path from the output (first absolute path in result)
+                                    const pathMatch = toolResult.match(/\/(?:opt|home|var|srv|app|usr|tmp|etc)\/[^\s\n"']*/);
+                                    const confirmedPath = pathMatch ? pathMatch[0] : '';
+                                    this._confirmedSshHosts.set(sshHost, { user: sshUser, paths: confirmedPath ? [confirmedPath] : [] });
+                                    logInfo(`[ssh-track] Confirmed SSH: ${sshUser}@${sshHost}${confirmedPath ? ` path=${confirmedPath}` : ''}`);
+                                    // Auto-save to memory if memory available and not already known
+                                    if (this.memory) {
+                                        const memQuery = `SSH user host ${sshHost}`;
+                                        this.memory.searchMemory(memQuery, undefined, 2).then(hits => {
+                                            const alreadyKnown = hits.some(h => h.content.includes(sshHost) && h.content.includes(sshUser));
+                                            if (!alreadyKnown) {
+                                                const memContent = `SSH access: ${sshUser}@${sshHost}${confirmedPath ? ` — confirmed path: ${confirmedPath}` : ''} (confirmed working, keys set up)`;
+                                                this.memory!.addEntry(1, memContent, ['ssh', 'remote', sshHost])
+                                                    .then(() => logInfo(`[ssh-track] Auto-saved SSH info to memory: ${memContent}`))
+                                                    .catch((e: unknown) => logWarn(`[ssh-track] Failed to save SSH memory: ${e}`));
+                                            }
+                                        }).catch(() => { /* non-fatal */ });
+                                    }
+                                } else {
+                                    const pathMatch2 = toolResult.match(/\/(?:opt|home|var|srv|app|usr|tmp|etc)\/[^\s\n"']*/);
+                                    if (pathMatch2 && !existing.paths.includes(pathMatch2[0])) {
+                                        existing.paths.push(pathMatch2[0]);
+                                    }
+                                }
+                            }
+                        }
 
                         // PowerShell-in-bash detection: if the result contains "command not found" for a known
                         // PowerShell cmdlet, inject a hard correction so the model switches to bash equivalents.
