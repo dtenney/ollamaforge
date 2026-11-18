@@ -974,6 +974,36 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
             }
         }
 
+        // Collapsed write_file/edit_file repair: model sometimes stuffs both path and content
+        // into the path arg as a JSON fragment, e.g.:
+        //   path = '"SETUP.md", "content": "# heading\n..."'
+        //   path = '"src/foo.py", "old_string": "...", "new_string": "..."'
+        // Detect this by looking for ", "content": or ", "old_string": in the path value.
+        if (typeof args.path === 'string' && /,\s*\\?"(?:content|old_string|new_string|offset|limit)"/.test(args.path as string)) {
+            try {
+                // Strip leading/trailing whitespace and try to parse as a JSON object
+                const fragment = (args.path as string).trim();
+                const jsonStr = fragment.startsWith('{') ? fragment : `{${JSON.stringify('path')}: ${fragment.startsWith('"') ? fragment : `"${fragment}"`}}`;
+                const repaired = JSON.parse(jsonStr.endsWith('}') ? jsonStr : jsonStr + '}');
+                if (repaired && typeof repaired === 'object' && ('path' in repaired || 'content' in repaired || 'old_string' in repaired)) {
+                    logWarn(`[addCall] Repaired collapsed write/edit args from path fragment`);
+                    args = { ...args, ...repaired };
+                }
+            } catch {
+                // Try stripping the leading quote and re-parsing
+                try {
+                    let fragment = (args.path as string).trim();
+                    if (fragment.startsWith('"')) { fragment = fragment.slice(1); }
+                    const jsonStr = `{"path": ${fragment.startsWith('"') ? fragment : `"${fragment}`}`;
+                    const repaired = JSON.parse(jsonStr.endsWith('}') ? jsonStr : jsonStr + '"}');
+                    if (repaired && typeof repaired === 'object' && 'path' in repaired) {
+                        logWarn(`[addCall] Repaired collapsed write/edit args (strip-quote method)`);
+                        args = { ...args, ...repaired };
+                    }
+                } catch { /* leave as-is */ }
+            }
+        }
+
         // Sanitize path arg: qwen3 sometimes emits "path": "\"README.md\""
         // (escaped quotes inside the JSON string value). Strip any surrounding
         // literal quote chars that survive JSON parsing so tools get a clean path.
