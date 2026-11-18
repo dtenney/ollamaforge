@@ -6003,8 +6003,13 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 const isScopeEscape = isTaskNofM && /\b(item|task|issue|fix)\s+\d+\s+(?:from|of|on)\s+(?:the\s+)?(?:first|second|third|other|list|another|different)\b/i.test(resp);
                 // Turn had only memory_tier_write calls that all got rejected (Filtered/Duplicate).
                 // These are housekeeping-only — don't require a follow-up LLM turn.
-                const thisTurnOnlyRejectedMemoryWrites = toolCalls.length > 0
+                const thisTurnOnlyMemoryWrites = toolCalls.length > 0
                     && toolCalls.every(tc => tc.function?.name === 'memory_tier_write');
+                // Detect agent "greeting reset": model outputs a task-reset greeting like
+                // "Ready to help with X" or "What would you like to work on?" after completing
+                // work — this means it lost context and should stop, not loop again.
+                const isAgentGreetingReset = /\b(ready to help|what would you like(?: me)? to(?: work on| do|help)|how can i (?:help|assist)|what(?:'s| is) next|what would you like(?: to do)? next)\b/i.test(resp)
+                    && this._toolCallsThisRun.length > 0; // Only suppress if work was done this run
                 const isLegitimateStop =
                     (isUserDismissal && turnHasText && resp.trim().length < 300)
                     || (endsWithQuestion && !isPlanningNarration)
@@ -6014,9 +6019,12 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     // This turn used only lookup tools (memory/read) + produced a substantive answer.
                     // Allow stop even in 'acting' phase — this is a Q&A response, not mid-task work.
                     || (thisTurnOnlyLookup && turnHasText && resp.trim().length > 80 && !isPlanningNarration)
-                    // This turn only tried to write to memory (all rejected as Filtered/Duplicate).
-                    // The answer was already given — these writes are housekeeping, stop the loop.
-                    || (thisTurnOnlyRejectedMemoryWrites && turnHasText && !isPlanningNarration)
+                    // This turn only called memory_tier_write (success or rejected).
+                    // These writes are housekeeping — don't loop back for another LLM turn.
+                    || (thisTurnOnlyMemoryWrites && turnHasText && !isPlanningNarration)
+                    // Agent produced a task-reset greeting after doing work — it lost context
+                    // and thinks it's starting fresh. Stop rather than letting it loop.
+                    || isAgentGreetingReset
                     // The entire run was lookup-only (memory_search, search_files, etc.) and this turn
                     // produced a text answer without tools. Classic Q&A: model looked up info then answered.
                     // Without this, the no-tool nudge fires on the final answer turn and forces the model
