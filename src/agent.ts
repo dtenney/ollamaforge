@@ -6006,10 +6006,11 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 const thisTurnOnlyMemoryWrites = toolCalls.length > 0
                     && toolCalls.every(tc => tc.function?.name === 'memory_tier_write');
                 // Detect agent "greeting reset": model outputs a task-reset greeting like
-                // "Ready to help with X" or "What would you like to work on?" after completing
-                // work — this means it lost context and should stop, not loop again.
-                const isAgentGreetingReset = /\b(ready to help|what would you like(?: me)? to(?: work on| do|help)|how can i (?:help|assist)|what(?:'s| is) next|what would you like(?: to do)? next)\b/i.test(resp)
-                    && this._toolCallsThisRun.length > 0; // Only suppress if work was done this run
+                // "Ready to help with X" or "What would you like to work on?" after having
+                // done work this run. This means it lost task context mid-session.
+                // Instead of stopping silently, inject a correction so it snaps back.
+                const isAgentGreetingReset = /\b(ready to help(?: with)?|what would you like(?: me)? to(?: work on| do|help)|how can i (?:help|assist) (?:you )?(?:today|now)?[.?]?\s*$|what would you like(?: to do)? next[.?]?\s*$)\b/i.test(resp.trim())
+                    && this._toolCallsThisRun.length > 2; // Only trigger if substantial work was done
                 const isLegitimateStop =
                     (isUserDismissal && turnHasText && resp.trim().length < 300)
                     || (endsWithQuestion && !isPlanningNarration)
@@ -6022,9 +6023,7 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     // This turn only called memory_tier_write (success or rejected).
                     // These writes are housekeeping — don't loop back for another LLM turn.
                     || (thisTurnOnlyMemoryWrites && turnHasText && !isPlanningNarration)
-                    // Agent produced a task-reset greeting after doing work — it lost context
-                    // and thinks it's starting fresh. Stop rather than letting it loop.
-                    || isAgentGreetingReset
+                    // (isAgentGreetingReset is handled below with a correction injection, not a stop)
                     // The entire run was lookup-only (memory_search, search_files, etc.) and this turn
                     // produced a text answer without tools. Classic Q&A: model looked up info then answered.
                     // Without this, the no-tool nudge fires on the final answer turn and forces the model
@@ -6046,6 +6045,17 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // it was working. Without this, repeated text answers escalate autoRetryCount
                 // until the "stalled N times" threshold fires on a healthy conversation.
                 if (isLegitimateStop) { this.autoRetryCount = 0; }
+
+                // Greeting-reset correction: if the agent lost task context mid-session and
+                // output a fresh greeting ("Ready to help", "What would you like to work on?"),
+                // inject a system message telling it to resume — don't stop, don't loop silently.
+                if (isAgentGreetingReset && !isLegitimateStop) {
+                    const lastTools = this._toolCallsThisRun.slice(-5).map(tc => `${tc.name}(${String(tc.path ?? '').slice(0, 60)})`).join(', ');
+                    const resetCorrection = `[SYSTEM] You appear to have lost track of the current task. You were in the middle of work this session (recent tool calls: ${lastTools}). Do NOT greet the user or ask what they want to work on — you already know. Resume the task from where you left off. Check any open plan file or task notes, review recent tool results in context, and continue.`;
+                    this.history.push({ role: isTextMode ? 'user' : 'tool', content: resetCorrection });
+                    logWarn(`[agent] Greeting-reset detected — injecting task-resume correction`);
+                    continue;
+                }
 
                 // Phase-handoff is now a legitimate stop (above) — only pass permission questions
                 // to interceptPermissionSeeking, not phase-handoff phrases.
