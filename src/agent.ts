@@ -955,14 +955,28 @@ function parseTextToolCalls(text: string): OllamaToolCall[] {
         // '{command:' as a literal string and fails with "command not found".
         // Unwrap here (before executeTool) so it's fixed for all execution paths.
         if (typeof args.command === 'string' && (args.command as string).trimStart().startsWith('{')) {
+            const rawCmd = args.command as string;
+            let unwrapped = '';
+            // Try 1: direct JSON parse
             try {
-                const inner = JSON.parse(args.command as string);
-                const unwrapped = String(inner.command ?? inner.cmd ?? '');
-                if (unwrapped) {
-                    logWarn(`[addCall] Double-JSON unwrap: extracted command from stringified args`);
-                    args = { ...args, command: unwrapped };
+                const inner = JSON.parse(rawCmd);
+                unwrapped = String(inner.command ?? inner.cmd ?? '');
+            } catch {
+                // Try 2: strip trailing extra braces and re-parse (model emits '{"command":"..."}}'  with extra })
+                try {
+                    const stripped = rawCmd.replace(/\}+$/, '}');
+                    const inner = JSON.parse(stripped);
+                    unwrapped = String(inner.command ?? inner.cmd ?? '');
+                } catch {
+                    // Try 3: regex extraction — pull the value of "command" or "cmd" key directly
+                    const m = rawCmd.match(/"(?:command|cmd)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+                    if (m) { unwrapped = m[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\'); }
                 }
-            } catch { /* not JSON — leave as-is */ }
+            }
+            if (unwrapped) {
+                logWarn(`[addCall] Double-JSON unwrap: extracted command from stringified args`);
+                args = { ...args, command: unwrapped };
+            }
         }
         // Also unwrap when command is an object (XML parser parsed the JSON value into an object)
         if (args.command !== null && typeof args.command === 'object') {
@@ -11760,14 +11774,17 @@ if errors:
                     }
                 }
                 // Double-JSON unwrap: model sometimes stuffs the full args JSON into the command field,
-                // e.g. args.command = '{"command": "ssh ..."}' — the JSON wasn't parsed, it's a raw string.
+                // e.g. args.command = '{"command": "ssh ..."}' or '{"command": "..."}}'.
                 // Bash then receives '{command: ssh ...}' as the command and fails with "command not found".
                 if (cmd.trimStart().startsWith('{')) {
-                    try {
-                        const inner = JSON.parse(cmd);
-                        const unwrapped = String(inner.command ?? inner.cmd ?? '');
-                        if (unwrapped) { logWarn(`[shell_read] Double-JSON unwrap: extracted command from stringified args`); cmd = unwrapped; }
-                    } catch { /* not valid JSON — leave as-is */ }
+                    let _unwrapped = '';
+                    try { const _i = JSON.parse(cmd); _unwrapped = String(_i.command ?? _i.cmd ?? ''); } catch {
+                        try { const _i = JSON.parse(cmd.replace(/\}+$/, '}')); _unwrapped = String(_i.command ?? _i.cmd ?? ''); } catch {
+                            const _m = cmd.match(/"(?:command|cmd)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+                            if (_m) { _unwrapped = _m[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\'); }
+                        }
+                    }
+                    if (_unwrapped) { logWarn(`[shell_read] Double-JSON unwrap: extracted command`); cmd = _unwrapped; }
                 }
                 if (!cmd) { throw new Error('command is required'); }
 
@@ -12274,14 +12291,17 @@ if errors:
                     }
                 }
                 // Double-JSON unwrap: model sometimes stuffs the full args JSON into the command field,
-                // e.g. args.command = '{"command": "ssh ..."}' — the JSON wasn't parsed, it's a raw string.
-                // Bash then receives '{command: ssh ...}' as the command and fails with "command not found".
+                // e.g. args.command = '{"command": "python3 ..."}}'.
+                // Bash then receives '{command: ...}' as the command and fails with "command not found".
                 if (cmd.trimStart().startsWith('{')) {
-                    try {
-                        const inner = JSON.parse(cmd);
-                        const unwrapped = String(inner.command ?? inner.cmd ?? '');
-                        if (unwrapped) { logWarn(`[run_command] Double-JSON unwrap: extracted command from stringified args`); cmd = unwrapped; }
-                    } catch { /* not valid JSON — leave as-is */ }
+                    let _unwrapped = '';
+                    try { const _i = JSON.parse(cmd); _unwrapped = String(_i.command ?? _i.cmd ?? ''); } catch {
+                        try { const _i = JSON.parse(cmd.replace(/\}+$/, '}')); _unwrapped = String(_i.command ?? _i.cmd ?? ''); } catch {
+                            const _m = cmd.match(/"(?:command|cmd)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+                            if (_m) { _unwrapped = _m[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\'); }
+                        }
+                    }
+                    if (_unwrapped) { logWarn(`[run_command] Double-JSON unwrap: extracted command`); cmd = _unwrapped; }
                 }
                 if (!cmd) { throw new Error('command is required'); }
 
