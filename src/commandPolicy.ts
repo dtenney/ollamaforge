@@ -90,7 +90,7 @@ export function checkBuiltinBlock(cmd: string): BlockResult | null {
 const BUILTIN_CONFIRM: RegExp[] = [
     /\bgit\s+push\s+.*--force\b/i,                       // git push --force
     /\bgit\s+push\s+.*-f\b/i,                            // git push -f
-    /\bgit\s+push\s+.*--force-with-lease\b/i,            // git push --force-with-lease
+    /\bgit\s+push\s+.*--force-with-lease(?!-)/i,          // git push --force-with-lease (not --force-with-lease-ifcommit)
     /\bgit\s+reset\s+--hard\b/i,                         // git reset --hard
     /\bgit\s+clean\s+(-[a-z]*\s+)?-f/i,                  // git clean -f
     /\bpip3?\s+uninstall\b/i,                            // pip uninstall

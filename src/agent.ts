@@ -10150,7 +10150,11 @@ If the code looks correct, respond with exactly: OK`;
                 const wsSummaryFull = `${summary}\n\nHost environment: ${env.label} (shell: ${env.shell}, os: ${env.os})`;
                 const WS_SUMMARY_CAP = 6000;
                 if (wsSummaryFull.length > WS_SUMMARY_CAP) {
-                    return wsSummaryFull.slice(0, WS_SUMMARY_CAP) + `\n\n[Truncated — ${wsSummaryFull.length - WS_SUMMARY_CAP} chars omitted. Use find_files or shell_read for further exploration.]`;
+                    // Snap to last newline within the cap so we don't cut a line mid-way
+                    const cutPoint = wsSummaryFull.lastIndexOf('\n', WS_SUMMARY_CAP) > WS_SUMMARY_CAP - 200
+                        ? wsSummaryFull.lastIndexOf('\n', WS_SUMMARY_CAP)
+                        : WS_SUMMARY_CAP;
+                    return wsSummaryFull.slice(0, cutPoint) + `\n\n[Truncated — ${wsSummaryFull.length - cutPoint} chars omitted. Use find_files or shell_read for further exploration.]`;
                 }
                 return wsSummaryFull;
             }
@@ -13066,7 +13070,11 @@ if errors:
                 const memListFull = `Project memory notes:\n\n${this.memory.formatTiers([0, 1, 2, 3, 4, 5])}`;
                 const MEM_LIST_CAP = 4000;
                 if (memListFull.length > MEM_LIST_CAP) {
-                    return memListFull.slice(0, MEM_LIST_CAP) + `\n\n[Truncated — ${memListFull.length - MEM_LIST_CAP} chars omitted. Use memory_search for targeted queries or memory_tier_list to view specific tiers.]`;
+                    // Snap to last newline within the cap so we don't cut a line mid-way
+                    const cutPoint = memListFull.lastIndexOf('\n', MEM_LIST_CAP) > MEM_LIST_CAP - 200
+                        ? memListFull.lastIndexOf('\n', MEM_LIST_CAP)
+                        : MEM_LIST_CAP;
+                    return memListFull.slice(0, cutPoint) + `\n\n[Truncated — ${memListFull.length - cutPoint} chars omitted. Use memory_search for targeted queries or memory_tier_list to view specific tiers.]`;
                 }
                 return memListFull;
             }
