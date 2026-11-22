@@ -111,6 +111,9 @@ function copyDir(src, dst) {
         } else {
             try {
                 fs.copyFileSync(srcPath, dstPath);
+                // Force mtime sync (Windows may not update mtime when content is identical or file is locked)
+                const srcStat = fs.statSync(srcPath);
+                fs.utimesSync(dstPath, srcStat.atime, srcStat.mtime);
             } catch (e) {
                 if (e.code === 'EBUSY' || e.code === 'EPERM') {
                     skippedLocked++;
