@@ -6026,7 +6026,9 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     && this._toolCallsThisRun.length > 2; // Only trigger if substantial work was done
                 const isLegitimateStop =
                     (isUserDismissal && turnHasText && resp.trim().length < 300)
-                    || (endsWithQuestion && !isPlanningNarration)
+                    // endsWithQuestion is legitimate UNLESS it's a greeting reset ("what would you
+                    // like to work on?") — greeting resets must always trigger correction injection.
+                    || (endsWithQuestion && !isPlanningNarration && !isAgentGreetingReset)
                     || (hasCompletionLanguage && !isPlanningNarration)
                     // Text-only turn with no tools this run — model gave a standalone answer.
                     || (turnHasText && !isPlanningNarration && !toolsCalledThisRun && !(this._taskPhase === 'research' || this._taskPhase === 'acting'))
