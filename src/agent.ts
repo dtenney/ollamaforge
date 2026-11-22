@@ -3136,7 +3136,7 @@ export class Agent {
                                 cwd: this.workspaceRoot, timeout: 10000, encoding: 'utf8'
                             });
                             logInfo(`[agent] Auto-created branch: ${newBranch}`);
-                            post({ type: 'token', text: `\n[emoji] Working on branch \`${newBranch}\` (created from ${currentBranch}).\n\n` });
+                            post({ type: 'token', text: `\nWorking on branch \`${newBranch}\` (created from ${currentBranch}).\n\n` });
                         } catch (branchErr) {
                             // Branch creation failed (e.g. dirty working tree) -- just warn, don't block
                             logWarn(`[agent] Could not auto-create branch: ${toErrorMessage(branchErr)}`);
@@ -13191,7 +13191,7 @@ if errors:
                 if (tier === 0) {
                     const hasIP = /\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?)\.)(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){2}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/.test(content);
                     const hasURL = /https?:\/\/[^\s]+/.test(content);
-                    const hasPath = /^[\/~]|[A-Z]:\\/.test(content);
+                    const hasPath = /^[\/~]|[A-Z]:\\|\/etc\/|\/var\/|\/usr\/|\/home\/|\/tmp\//.test(content);
                     const hasPort = /(?:port\s*[:=]?\s*\d{2,5}|:\d{2,5}\b)/.test(content);
                     const hasCredential = /(?:key|token|password|secret|credential)/i.test(content);
                     // Also allow file path facts: entries mentioning a named file with extension
