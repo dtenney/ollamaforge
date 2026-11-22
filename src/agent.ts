@@ -50,7 +50,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'workspace_summary',
-            description: 'Get a full summary of the workspace: file tree, project type, key files (package.json, README), and recently modified files. Call this first to understand the project.',
+            description: 'Get the workspace file tree, project type, key files, and recently modified files.',
             parameters: { type: 'object', properties: {}, required: [] },
         },
     },
@@ -58,7 +58,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'edit_file',
-            description: 'Make a targeted edit to a file by replacing old_string with new_string. WARNING: If you have line numbers from a previous shell_read output, use edit_file_at_line instead -- it never fails on string matching. Use edit_file only when you have NO line numbers. The old_string must match exactly (including whitespace/indentation) -- never construct it from memory. For complete rewrites, set force_overwrite=true and old_string="". On success, returns the edited snippet (±4 lines) so you can verify the result without a follow-up read. new_string must not be empty (use a comment if intentionally removing code). Each edit requires user confirmation. BEFORE CALLING on a new task: confirm you have all required information (auth, URL format, data schema, credentials, pagination). If any assumption is unverifiable, ask the user first.',
+            description: 'Replace old_string with new_string in a file. old_string must match exactly (including whitespace). Use force_overwrite=true with old_string="" for full rewrites. Returns the edited snippet on success. Requires user confirmation.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -75,7 +75,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'write_file',
-            description: 'Write complete file content to disk. Use this instead of edit_file when: (1) creating a new file, (2) the file has broken syntax that prevents old_string matching, (3) doing a full rewrite of a small file (<150 lines). Does not require old_string. Requires user confirmation. For code/scripts: before calling, confirm you have all required information (auth mechanism, URL/endpoint format, data schema, pagination shape, file format). If any are unverifiable, ask the user first -- do not write placeholder code. For documentation, plans, or README files: proceed directly after reading the relevant files -- no pre-confirmation needed. If an existing file might already satisfy the request, ask the user whether to use it or write something new.',
+            description: 'Write complete file content to disk. Use for new files, broken files where old_string matching fails, or full rewrites of small files (<150 lines). Requires user confirmation.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -91,7 +91,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'edit_file_at_line',
-            description: 'PREFERRED edit tool when you have line numbers. After shell_read, you know exact line numbers -- use this instead of edit_file to avoid string-matching failures. Replaces lines start_line through end_line (1-based, inclusive) with new_content. To insert without replacing, set end_line = start_line - 1. No old_string needed -- never fails on whitespace.',
+            description: 'Replace lines start_line through end_line (1-based, inclusive) with new_content. No string matching — use when you have line numbers. Set end_line = start_line - 1 to insert without replacing.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -108,7 +108,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'read_file',
-            description: 'Read a file from disk. Native -- no shell, works identically on all platforms. Prefer this over shell_read+cat for reading files. Returns content with line numbers. Use offset/limit to read a specific range.',
+            description: 'Read a file from disk. Returns content with line numbers. Use offset/limit to read a specific range.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -124,7 +124,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'search_files',
-            description: 'Search file contents using a regex or literal pattern. Native -- no shell, no grep, works identically on all platforms. Returns matching lines with file path and line number. Use glob to restrict to file types.',
+            description: 'Search file contents using a regex or literal pattern. Returns matching lines with file path and line number. Use glob to restrict to file types.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -141,7 +141,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'find_files',
-            description: 'Find files matching a glob pattern. Native -- no shell, works identically on all platforms. Prefer this over shell_read+find/ls for locating files.',
+            description: 'Find files matching a glob pattern (e.g. "**/*.py", "src/**/*.ts").',
             parameters: {
                 type: 'object',
                 properties: {
@@ -156,7 +156,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'shell_read',
-            description: `Run a read-only shell command that does NOT modify files or state. No confirmation required. PREFER read_file/search_files/find_files for file operations -- use shell_read for: git log, git status, git diff, env, which, node -v, python --version, and other non-file commands. Do NOT use for commands that write, install, build, or delete.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH -- use bash commands only (find, grep, cat, ls). NEVER use PowerShell cmdlets (Get-ChildItem, Where-Object, Select-Object, Select-String, Get-Content, ForEach-Object) -- they will fail with "command not found".' : ''} Output is capped at ~24k chars. Result includes [CWD: ...] so you always know the working directory.`,
+            description: `Run a read-only shell command (no file/state modification). Use for git, env, which, version queries.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH — bash commands only. NEVER use PowerShell cmdlets.' : ''} Output capped at ~24k chars.`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -170,15 +170,7 @@ export const TOOL_DEFINITIONS = [
         type: 'function',
         function: {
             name: 'gather_context',
-            description: `Read 2--8 files IN PARALLEL and return all results in one turn. Use this instead of multiple sequential shell_read calls when you already know upfront which 3+ files you need.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH -- each command must use bash syntax (cat, grep, find), never PowerShell cmdlets.' : ''}
-QUICKEST USAGE: pass file paths directly as "files": ["path/a.py", "path/b.py", "path/c.py"]
-ADVANCED USAGE: pass shell commands as "commands": ["cat a.py", "grep -n def b.py"]
-WHEN TO USE:
-  - You have 3+ files whose paths are already resolved -> use gather_context (saves N-1 turns)
-  - You have 1--2 files -> use shell_read (simpler)
-  - The next file path depends on what you find in the current one -> use shell_read (sequential)
-  - You need a write/modify command -> use run_command
-Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
+            description: `Read 2–8 files in parallel in a single turn — saves N-1 Ollama round trips vs sequential reads. Use when you already know all file paths. Pass paths via "files" or read-only shell commands via "commands". Max 8 per call, output capped at 24k chars.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH — bash syntax only.' : ''}`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -204,7 +196,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'system_map_update',
-            description: 'Add or update a node or relationship in the cross-workspace system map (~/.ollamaforge/system-map.json). Use this when you learn something about the broader system -- a service, machine, workspace, or how they relate. This is long-term memory that persists across all workspaces and sessions.',
+            description: 'Add or update a node or relationship in the cross-workspace system map. Persists across all workspaces and sessions.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -235,7 +227,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'system_map_query',
-            description: 'Query the cross-workspace system map (~/.ollamaforge/system-map.json). Use this before making changes that touch infrastructure, SSH targets, inter-service boundaries, or when the user asks how the broader system fits together. Returns only the matching subgraph -- never the full map unless no filter is given.',
+            description: 'Query the cross-workspace system map. Use before changes that touch infrastructure, SSH targets, or inter-service boundaries.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -253,7 +245,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'system_map_visualize',
-            description: 'Write a Mermaid diagram of the cross-workspace system map to .ollamaforge/system-map.md and open it in VS Code. Use this when the user asks to see, draw, or visualize the system map. The file can be previewed with VS Code\'s built-in Markdown Preview (Ctrl+Shift+V).',
+            description: 'Write a Mermaid diagram of the system map to .ollamaforge/system-map.md and open it in VS Code.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -267,7 +259,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'run_command',
-            description: `Run a shell command. Use for any action step: building, testing, linting, deploying, flashing firmware, installing packages, running migrations, restarting services, pushing to git, running scripts, or any other command that advances the task. For read-only commands (git log, ls, cat, grep, etc.) prefer shell_read instead.${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH -- use bash/Unix commands. NEVER use PowerShell cmdlets (Get-ChildItem, Set-Content, etc.) for local operations -- use bash equivalents (find, cat, cp, mv, rm, mkdir). SSH/remote commands are fine as-is.' : ''} Run action commands directly — do not hand them back to the user. Only pause before permanently destructive operations with no recovery path (dropping a production database, wiping a disk, deleting backups). Result includes [CWD: ...] for orientation.`,
+            description: `Run a state-changing shell command (build, test, install, deploy, migrate, push, restart).${detectShellEnvironment().bashPath ? ' SHELL IS GIT BASH — bash/Unix commands only, no PowerShell cmdlets.' : ''} Result includes [CWD: ...].`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -281,7 +273,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_list',
-            description: 'List all saved project memory notes for this workspace. ALWAYS call this tool when user asks "what do you know", "what have you learned", or asks about project knowledge -- do not answer from conversation history alone.',
+            description: 'List all saved project memory notes for this workspace.',
             parameters: { type: 'object', properties: {}, required: [] },
         },
     },
@@ -289,7 +281,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_write',
-            description: 'Save a note to persistent project memory. Use this to store important facts, architectural decisions, known issues, or any context that should persist across conversations.',
+            description: 'Save a note to persistent project memory (auto-classifies tier). Use memory_tier_write for explicit tier control.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -304,7 +296,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_delete',
-            description: 'Delete a saved project memory note by its id. IMPORTANT: You MUST call memory_list FIRST to get the actual entry IDs -- do not guess or fabricate IDs.',
+            description: 'Delete a saved project memory note by id. Call memory_list first to get valid IDs.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -318,7 +310,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_search',
-            description: 'Search past memories using semantic similarity. Use this to find relevant past solutions, decisions, or context without loading all memories.',
+            description: 'Search memories by semantic similarity. Use for targeted lookups instead of loading all memories.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -334,7 +326,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_tier_write',
-            description: 'Save ONE atomic piece of information to a specific memory tier. When user provides multiple pieces of information, call this tool MULTIPLE TIMES (once per concept). Use appropriate tier: 0=critical (IPs, URLs, ports, paths, credentials, serial ports like /dev/ttyUSB0, baud rates, device names/configs, tool paths like ~/.local/bin/esphome, firmware locations), 1=essential (frameworks, tools, deployment processes, hosting), 2=operational (current work, bugs), 3=collaboration (conventions, workflows), 4=references (past solutions). IMPORTANT: Save device-specific facts (baud rate, serial port, flash method, device name) to tier 0 as soon as they are discovered — do not wait for the user to ask.',
+            description: 'Save one atomic fact to a specific memory tier. Tiers: 0=critical (IPs, URLs, ports, paths), 1=essential (frameworks, tools), 2=operational (current work), 3=conventions, 4=past solutions. One concept per call.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -350,7 +342,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_tier_list',
-            description: 'List memories from specific tiers. ALWAYS call this tool when user asks to see specific tier memories -- do not answer from conversation history alone. Use to view only relevant tier(s) instead of all memories.',
+            description: 'List memories from specific tiers only. Use instead of memory_list when you only need certain tiers.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -364,7 +356,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'memory_stats',
-            description: 'Get memory statistics showing entry count and token usage per tier.',
+            description: 'Show memory entry count and token usage per tier.',
             parameters: { type: 'object', properties: {}, required: [] },
         },
     },
@@ -372,7 +364,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'read_terminal',
-            description: 'Read recent output from VS Code integrated terminals. Use this when the user mentions terminal output, errors in their terminal, or when you need to see what a previously-run command produced.',
+            description: 'Read recent output from a VS Code integrated terminal.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -386,7 +378,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'get_diagnostics',
-            description: 'Get VS Code diagnostics (errors, warnings) for a file or the entire workspace. Use this after editing files to check if your changes introduced any problems, or when the user mentions errors in their code.',
+            description: 'Get VS Code errors and warnings for a file or the workspace. Omit path for all open files.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -400,7 +392,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'web_search',
-            description: 'Search the web using SearXNG. Use this to find examples, documentation, libraries, tutorials, current information, or product prices. Returns titles, URLs, and snippets. Requires SearXNG to be configured in settings (ollamaForge.search.url).\n\nFor product pricing: use engines="google shopping,bing shopping" to get structured price data directly in results without needing to fetch pages. For Amazon-specific results use query prefix "site:amazon.com". For AliExpress use "site:aliexpress.com".\n\n**Multi-source rule:** When answering a factual question, recommending a library/tool, explaining how something works, or giving guidance the user will act on — search at least 3 times with different query angles (e.g. official docs, a tutorial site, a forum/community discussion) before forming your answer. Fetch at least one source page with web_fetch to verify the detail is current. Do not rely on a single search result.',
+            description: 'Search the web via SearXNG. Returns titles, URLs, and snippets. For product pricing use engines="google shopping,bing shopping". Requires ollamaForge.search.url to be configured.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -416,7 +408,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'web_fetch',
-            description: 'Fetch a web page and return its content as plain text. Use this to read documentation, GitHub READMEs, or any URL the user provides. Strips HTML tags and returns readable text capped at 8000 chars.',
+            description: 'Fetch a URL and return its content as plain text, capped at 8000 chars.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -430,7 +422,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'deep_research',
-            description: 'Execute a structured deep research pipeline: fan-out web searches with multiple query angles → fetch top sources → extract key claims → cross-reference for corroboration/contradictions → produce a cited synthesis report. Use this INSTEAD of multiple individual web_search + web_fetch calls when the user asks to "research", "investigate", "find out about", or needs a thorough multi-source answer. Returns a formatted markdown report with inline citations and contradiction flags. Requires SearXNG to be configured.',
+            description: 'Multi-source research pipeline: fan-out searches → fetch sources → cross-reference → cited report. Use instead of multiple web_search+web_fetch calls for thorough research. Requires SearXNG.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -445,7 +437,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'use_skill',
-            description: 'Activate a named skill from the workspace skill library (.ollamaforge/skills/). When active, the agent injects the skill\'s prompt, restricts available tools to the skill\'s allowlist, and optionally switches to the skill\'s model. Pass skill name to activate, or empty string to deactivate. Use when the user asks to "use the X skill" or "switch to X mode".',
+            description: 'Activate a named skill from .ollamaforge/skills/. Pass skill name to activate or empty string to deactivate.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -459,7 +451,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'generate_image',
-            description: 'Generate an image from a text prompt using ComfyUI (SDXL). Returns the local file path of the saved PNG. Use this to create diagrams, illustrations, mockups, or visuals for reports. Requires ollamaForge.comfyui.url to be configured.',
+            description: 'Generate an image from a text prompt using ComfyUI (SDXL). Returns the saved PNG path. Requires ollamaForge.comfyui.url.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -477,7 +469,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'task_checkpoint',
-            description: 'Write a checkpoint to .ollamaforge/tasks/<task_id>/checkpoint.json so a long-running script can resume from where it left off if interrupted. Call this after every major stage or every ~1000 rows processed. Also appends a step entry to the task log.',
+            description: 'Write a resumable checkpoint for a long-running task. Call after each major stage or ~1000 rows.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -494,7 +486,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'task_report',
-            description: 'Generate an HTML summary report for a completed or validated task and open it in VS Code Simple Browser. Use this after the validation step to give the user a human-readable view of what changed. Include stats table and a sample of rows/items affected.',
+            description: 'Generate an HTML summary report for a completed task and open it in VS Code. Include a stats table and sample rows.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -512,7 +504,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'workspace_index',
-            description: 'Scan one or more file paths or globs and write a concise summary of each large file to .ollamaforge/index/<path>.summary.md. Use this BEFORE trying to read a large file -- check the index first (shell_read the summary) and only call workspace_index if no fresh summary exists. Summaries are skipped if < 7 days old unless force=true.',
+            description: 'Write a summary of large files to .ollamaforge/index/. Check the index before reading a large file. Summaries are reused if < 7 days old unless force=true.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -527,7 +519,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'schedule_task',
-            description: 'Persist a recurring task to .ollamaforge/schedules/<name>.json. The extension will automatically run the script when the interval elapses (checked on VS Code startup). Use this for validation scripts, data sync checks, or any task that should repeat on a regular basis.',
+            description: 'Persist a recurring script to .ollamaforge/schedules/. The extension runs it automatically when the interval elapses.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -544,7 +536,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'delegate_task',
-            description: 'Spawn a sub-agent to handle a self-contained subtask in the same workspace. Use this when you are acting as an orchestrator breaking a large task into independent or sequential steps. Each subagent runs its own tool loop and returns a structured result. BEFORE delegating: (1) ensure the prompt is fully self-contained -- no references to "the conversation" or placeholders, (2) include all file paths, URL patterns, and values the subagent will need, (3) state the expected output explicitly. Parallel delegation: emit multiple delegate_task calls in a single turn for independent tasks. Sequential delegation: wait for one result before delegating the next if it depends on the output.',
+            description: 'Spawn a sub-agent for a self-contained subtask. Prompt must be fully self-contained (no placeholders). Emit multiple calls in one turn for parallel tasks.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -574,7 +566,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'delegate_task_async',
-            description: 'Start a subagent in the background and return a handle immediately -- does NOT block. Use this when you want to do other work (tool calls, edits) while the subagent runs. Call delegate_task_await(handle) when you need the result. IMPORTANT: always call delegate_task_await before your final response -- never leave a handle uncollected. Same prompt rules as delegate_task: fully self-contained, no placeholders.',
+            description: 'Start a sub-agent in the background, returns a handle immediately. Call delegate_task_await(handle) before your final response to collect the result.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -604,7 +596,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'delegate_task_await',
-            description: 'Collect the result of a background subagent started with delegate_task_async. Blocks until the subagent completes. Returns the same STATUS/OUTPUT/FILES_CHANGED format as delegate_task. Call this before your final response.',
+            description: 'Collect the result of a delegate_task_async handle. Blocks until the sub-agent completes.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -621,7 +613,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'task_plan',
-            description: 'Maintain a structured plan ledger for a multi-step task. Call once with action="create" to declare the full step list, then action="advance" after each step completes (or action="skip"/"block" with a reason). The ledger persists to .ollamaforge/tasks/<task_id>/plan.json and is injected into your system prompt every turn so you never lose track of what is done vs. pending across context compactions. Use this for any task with 3+ steps. Prefer this over free-form task_log for the step checklist; use task_log for the narrative log.',
+            description: 'Maintain a step-ledger for multi-step tasks. create=declare steps, advance/skip/block=update current step, status=read ledger. Persists across context compactions.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -638,7 +630,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'propose_edit',
-            description: 'Stage an edit for review WITHOUT writing it to disk (diff-first mode, item 3.3). Opens a VS Code diff preview of old_string → new_string and queues the change. The user (or apply_staged_edits) decides whether to apply it. Use this for risky or multi-hunk edits to reduce blast radius. Non-destructive by default; set destructive=true only if the change deletes data or is hard to reverse.',
+            description: 'Stage an edit for review without writing to disk. Opens a VS Code diff preview. User approves via apply_staged_edits.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -655,7 +647,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'apply_staged_edits',
-            description: 'Apply previously staged edits (from propose_edit) to disk. mode="all" applies every staged edit (use in Trust/YOLO for one-click apply-all). mode="select" applies only the given edit_ids. mode="discard" drops the given edit_ids without applying. Returns a per-edit result. Reduces blast radius by letting the user accept/reject hunks individually.',
+            description: 'Apply staged edits from propose_edit. mode: "all"=apply all, "select"=apply edit_ids, "discard"=drop edit_ids.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -670,7 +662,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'rollback_last_refactor',
-            description: 'Roll back the most recent multi-file refactor (item 3.5). Restores every file touched since the last rollback to its pre-edit content (or removes files that were created). count=N rolls back the last N file operations from the undo stack (default 1 = the whole last batch). Use after a refactor that broke something, to restore the prior state before retrying.',
+            description: 'Roll back the last N file edits/creates to their pre-edit content. Default count=1 (the whole last batch).',
             parameters: {
                 type: 'object',
                 properties: {
@@ -683,7 +675,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'ask_user',
-            description: 'Ask the user a typed question with options (item 3.7). Renders buttons in the webview. Use when you need to disambiguate a request (e.g. "move X from A to B" — update code vs move files). options: list of 2-6 short choices. allowFreeText: true adds a free-text input below the buttons.',
+            description: 'Ask the user a question with clickable options. Use to disambiguate a request. options: 2-6 short choices.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -699,7 +691,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'task_log',
-            description: 'Write a structured log entry to the task scratchpad at .ollamaforge/tasks/<task_id>/log.md. Use this to track progress, record script paths, capture output summaries, and note validation results for long-running data tasks. Call at the start of a task (status=started), after each major step (status=step), after validation (status=validated or status=failed), and when done (status=done).',
+            description: 'Append a structured log entry to .ollamaforge/tasks/<task_id>/log.md. Statuses: started, step, validated, failed, done.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -716,7 +708,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'save_skill',
-            description: 'Save a reusable helper script to .ollamaforge/skills/ so it can be reused across future sessions. Use this when you write a script that solves a recurring problem (e.g. a CSV differ, a log parser, a code search utility). Skills persist permanently and are listed at the start of each dream cycle.',
+            description: 'Save a reusable helper script to .ollamaforge/skills/ for future sessions.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -732,7 +724,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'list_skills',
-            description: 'List all saved skills in .ollamaforge/skills/ with their descriptions. Call this before writing a new script to avoid duplicating an existing skill.',
+            description: 'List all saved skills in .ollamaforge/skills/. Call before writing a new script to avoid duplicates.',
             parameters: {
                 type: 'object',
                 properties: {},
@@ -744,7 +736,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'refactor_multi_file',
-            description: 'Propose coordinated changes across multiple files. Use this when a refactoring affects multiple files (e.g., renaming a function used in many places, restructuring modules). Shows a preview of all changes before applying.',
+            description: 'Propose coordinated changes across multiple files. Shows a preview of all changes before applying.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -773,7 +765,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'graph_index',
-            description: 'Index (or re-index) the workspace code graph. Parses TypeScript, JavaScript, and Python files to build a symbol graph (functions, classes, methods) in .ollamaforge/graph.db. Run this after major refactors or when graph_status shows stale data. Optionally restrict to a single file.',
+            description: 'Index or re-index the workspace code graph (TS, JS, Python). Run after major refactors or when graph_status shows stale data.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -787,7 +779,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'graph_query',
-            description: 'Query the code graph for symbols related to a topic or identifier. Returns matching functions, classes, and methods with file locations. Use this to find where something is defined or to understand call relationships.',
+            description: 'Query the code graph for symbols by name or keyword. Returns matching functions, classes, and methods with file locations and call relationships.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -801,7 +793,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'graph_status',
-            description: 'Show code graph statistics: total symbols indexed, number of files, when last indexed, and a drift summary (symbols that have changed since indexing).',
+            description: 'Show code graph statistics: symbol count, file count, last index time, and drift summary.',
             parameters: { type: 'object', properties: {}, required: [] },
         },
     },
@@ -809,7 +801,7 @@ Max 8 files/commands per call. Total output is capped at 24 000 chars.`,
         type: 'function',
         function: {
             name: 'impact_analysis',
-            description: 'Blast-radius analysis for a symbol. Given a function/class/method name, returns what calls it (callers), what it calls (callees), the distinct files touched, and any test files that reach it. Use this BEFORE editing a symbol to understand what your change will affect.',
+            description: 'Blast-radius analysis for a symbol: callers, callees, files touched, and test files. Use before editing to understand what your change affects.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -10155,7 +10147,12 @@ If the code looks correct, respond with exactly: OK`;
                 }
                 const summary = await buildWorkspaceSummary(root);
                 const env = detectShellEnvironment();
-                return `${summary}\n\nHost environment: ${env.label} (shell: ${env.shell}, os: ${env.os})`;
+                const wsSummaryFull = `${summary}\n\nHost environment: ${env.label} (shell: ${env.shell}, os: ${env.os})`;
+                const WS_SUMMARY_CAP = 6000;
+                if (wsSummaryFull.length > WS_SUMMARY_CAP) {
+                    return wsSummaryFull.slice(0, WS_SUMMARY_CAP) + `\n\n[Truncated — ${wsSummaryFull.length - WS_SUMMARY_CAP} chars omitted. Use find_files or shell_read for further exploration.]`;
+                }
+                return wsSummaryFull;
             }
 
             // â"€â"€ legacy removed tools â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -13066,7 +13063,12 @@ if errors:
             // â"€â"€ memory_list â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
             case 'memory_list': {
                 if (!this.memory) { return '(project memory not available in this session)'; }
-                return `Project memory notes:\n\n${this.memory.formatTiers([0, 1, 2, 3, 4, 5])}`;
+                const memListFull = `Project memory notes:\n\n${this.memory.formatTiers([0, 1, 2, 3, 4, 5])}`;
+                const MEM_LIST_CAP = 4000;
+                if (memListFull.length > MEM_LIST_CAP) {
+                    return memListFull.slice(0, MEM_LIST_CAP) + `\n\n[Truncated — ${memListFull.length - MEM_LIST_CAP} chars omitted. Use memory_search for targeted queries or memory_tier_list to view specific tiers.]`;
+                }
+                return memListFull;
             }
 
             // â"€â"€ memory_write (legacy -- delegates to memory_tier_write with auto-classification) â"€â"€
