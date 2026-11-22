@@ -1731,6 +1731,8 @@ export class Agent {
     /** Track repeated failing run_command invocations (same command failing even with other tools in between) */
     private _failedCommandSignatures = new Map<string, number>();
     private readonly MAX_SAME_COMMAND_FAILURES = 2;
+    /** Track successful sleep-poll commands (sleep N && cat log) that return the same output — detect stalled poll loops */
+    private _sleepPollSignatures = new Map<string, { count: number; lastOutput: string }>();
     /** Track repeated failing edit_file attempts on the same (path, old_string) -- not reset by read_file.
      *  Capped at 300 entries to prevent unbounded growth in long sessions. */
     private _failedEditSignatures = new Map<string, number>();
@@ -2906,6 +2908,7 @@ export class Agent {
         this._consecutiveEmptyPathReads = 0; // Reset empty-path read_file loop counter
         this.memoryWritesThisResponse = 0; // Reset rate limiter for this response
         this._emptyMemoryWriteCount = 0;   // Reset empty-content retry counter
+        this._forceStopAfterBatch = false; // Reset force-stop flag
         this._nativeRecoverySuppressCount = 0; // Reset native-recovery suppression counter
         this._webFetchImperative = false;      // Reset injection firewall flag — must not carry over across runs
         this._lastWebFetchTurn = -1;           // Reset web fetch turn tracker
@@ -2952,6 +2955,7 @@ export class Agent {
         }
 
         this._failedCommandSignatures.clear(); // Reset failed command tracking
+        this._sleepPollSignatures.clear();     // Reset sleep-poll loop tracking
         // NOTE: _failedEditByFile intentionally NOT cleared between runs -- persists across
         // user turns so repeated cross-turn edit failures on the same file accumulate toward
         // the hard-block threshold. This prevents the model from getting 3 new attempts per
@@ -6034,9 +6038,10 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     // This turn used only lookup tools (memory/read) + produced a substantive answer.
                     // Allow stop even in 'acting' phase — this is a Q&A response, not mid-task work.
                     || (thisTurnOnlyLookup && turnHasText && resp.trim().length > 80 && !isPlanningNarration)
-                    // This turn only called memory_tier_write (success or rejected).
+                    // This turn only called memory_tier_write (success, rejected, or empty-error).
                     // These writes are housekeeping — don't loop back for another LLM turn.
-                    || (thisTurnOnlyMemoryWrites && turnHasText && !isPlanningNarration)
+                    // Note: turnHasText NOT required — model may emit tool calls with no text.
+                    || (thisTurnOnlyMemoryWrites && !isPlanningNarration)
                     // (isAgentGreetingReset is handled below with a correction injection, not a stop)
                     // The entire run was lookup-only (memory_search, search_files, etc.) and this turn
                     // produced a text answer without tools. Classic Q&A: model looked up info then answered.
@@ -7819,13 +7824,37 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                     // but the shell_read itself succeeded with exit 0.
                     const isSoftFailure = (name === 'run_command' || name === 'shell_read')
                         && (/\(exited with code [1-9]\d*\)/.test(toolResult)
-                            || /^(?:bash|sh|zsh|cmd|python\d?):[^\n]*(?:command not found|No such file|Permission denied|not found)/m.test(toolResult))
+                            || /^(?:\/\S+\/)?(?:bash|sh|zsh|cmd|python\d?):[^\n]*(?:command not found|No such file|Permission denied|not found)/m.test(toolResult))
                         && !toolResult.includes('file(s) moved');
                     if (isSoftFailure) {
                         const { failClass: _failClass, failHint: _failHint } = this.classifySoftFailure(args, toolResult);
                         if (_failClass !== 'unknown') {
                             toolResult += `\n\n[FAILURE TAXONOMY: ${_failClass}] ${_failHint}`;
                             logInfo(`[agent] 4.2 failure classified as ${_failClass} for ${name}`);
+                        }
+
+                        // If a local command was not found, scan recent history for a prior which/find
+                        // result that located this binary — inject the known path so the agent uses it
+                        // directly instead of running find again or looping on the same bare command.
+                        if (_failClass === 'not-found' && !/^ssh\s/.test(String(args.command ?? '').trim())) {
+                            const _missingBin = toolResult.match(/(?:\/\S+\/)?(?:bash|sh|zsh): line \d*:? ?(\S+): command not found/)?.[1] ?? '';
+                            if (_missingBin) {
+                                // Scan last 20 history entries for tool results containing the binary path
+                                const _recentHistory = this.history.slice(-20);
+                                let _knownPath = '';
+                                for (const _hEntry of _recentHistory) {
+                                    const _hContent = typeof _hEntry.content === 'string' ? _hEntry.content
+                                        : Array.isArray(_hEntry.content) ? (_hEntry.content as Array<{type:string;text?:string;content?:string}>).map(c => c.text ?? c.content ?? '').join('\n')
+                                        : '';
+                                    // Look for a path ending with /binary or \binary in which/find output
+                                    const _pathMatch = _hContent.match(new RegExp(`(/[^\\s\\n]*(?:/bin/|/)${_missingBin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.exe)?)\\b`));
+                                    if (_pathMatch) { _knownPath = _pathMatch[1]; break; }
+                                }
+                                if (_knownPath) {
+                                    toolResult += `\n\n[KNOWN PATH] You already found "${_missingBin}" at: ${_knownPath}\nUse the full path directly: ${_knownPath} [args] — do NOT use the bare command name.`;
+                                    logInfo(`[agent] Injected known path for missing binary "${_missingBin}": ${_knownPath}`);
+                                }
+                            }
                         }
 
                         // SSH auth failure — inject confirmed user@host from this run if available,
@@ -7998,6 +8027,36 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                         }
 
                         this.handleFileNotFound(args, toolResult, isTextMode);
+
+                        // Sleep-poll loop detection: agent using `sleep N && cat logfile` to wait for a
+                        // background process emits the same output repeatedly — burns turns and blocks
+                        // the UI. After 3 consecutive polls with the same output, tell the agent to stop.
+                        if ((name === 'run_command' || name === 'shell_read') && !isToolErrorString) {
+                            const _pollCmd = String(args.command ?? '').toLowerCase();
+                            const _isSleepPoll = /\bsleep\s+\d+\b/.test(_pollCmd)
+                                && (/\bcat\s+\S+\.log\b/.test(_pollCmd) || /\btail\b/.test(_pollCmd) || /\bcat\s+\S+\.(log|txt|out)\b/.test(_pollCmd));
+                            if (_isSleepPoll) {
+                                const _pollSig = _pollCmd.replace(/\bsleep\s+\d+/g, 'sleep N').trim().slice(0, 150);
+                                const _pollOutput = toolResult.trim().slice(0, 300);
+                                const _existing = this._sleepPollSignatures.get(_pollSig);
+                                if (_existing && _existing.lastOutput === _pollOutput) {
+                                    const _pollCount = _existing.count + 1;
+                                    this._sleepPollSignatures.set(_pollSig, { count: _pollCount, lastOutput: _pollOutput });
+                                    if (_pollCount >= 3) {
+                                        const _pollNudge = `[SYSTEM] You have polled this background process ${_pollCount} times and the output is unchanged — it is still running. STOP polling. The process will complete on its own.\n\nTell the user: "The build is running in the background and will take several minutes. When it finishes, resume the task." Then STOP — do not call sleep or cat again.`;
+                                        if (isTextMode) {
+                                            this.history.push({ role: 'user', content: _pollNudge });
+                                        } else {
+                                            this.history.push({ role: 'tool', content: _pollNudge });
+                                        }
+                                        logWarn(`[agent] Sleep-poll loop detected (${_pollCount} identical results) — injected stop nudge`);
+                                        this._sleepPollSignatures.delete(_pollSig); // Reset so a later check can proceed
+                                    }
+                                } else {
+                                    this._sleepPollSignatures.set(_pollSig, { count: 1, lastOutput: _pollOutput });
+                                }
+                            }
+                        }
 
                         // SyntaxError detection: if output contains a Python SyntaxError pointing at a .py file,
                         // inject a direct instruction to use write_file instead of attempting edit_file.
@@ -8972,6 +9031,19 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
 
             // Sleep sentinel propagation: inner batch signaled a clean completion -- exit outer loop
             if (breakAfterBatch) { break; }
+            // Empty memory write retry limit hit — stop immediately, don't loop for another LLM turn
+            if (this._forceStopAfterBatch) {
+                logInfo('[agent] _forceStopAfterBatch: empty memory_tier_write retry limit hit — stopping loop');
+                loopExhausted = false;
+                // Emit a visible status so the agent doesn't silently disappear mid-task.
+                const lastCmd = [...this._toolCallsThisRun].reverse()
+                    .find(tc => tc.name === 'run_command' || tc.name === 'shell_read');
+                const doneMsg = lastCmd
+                    ? `Task paused — memory save failed (content lost from context). Last action: \`${String(lastCmd.path ?? '').slice(0, 120) || 'shell command'}\`. Resume to continue.`
+                    : `Task paused — memory save failed (content lost from context). Resume to continue.`;
+                post({ type: 'text', text: doneMsg });
+                break;
+            }
 
             // Update routing hint for next turn: was this turn purely read-only?
             prevTurnWasReadOnly = allReadOnly && READ_ONLY_TOOLS.has(callsToExecute[0]?.function?.name ?? '');
@@ -13082,8 +13154,9 @@ if errors:
                 if (!content.trim()) {
                     this._emptyMemoryWriteCount++;
                     if (this._emptyMemoryWriteCount >= 2) {
-                        // Model is stuck in a retry loop — hard-stop to prevent infinite spiral.
-                        return 'Error: memory_tier_write called with empty content multiple times. STOP retrying — the content you wanted to save is no longer in your context. Do not call memory_tier_write again this turn. Move on to the next task step.';
+                        // Model is stuck in a retry loop — set flag so outer loop stops after this batch.
+                        this._forceStopAfterBatch = true;
+                        return 'Error: memory_tier_write called with empty content multiple times. STOP — the content is gone from your context. Do not retry. Move on to the next task step.';
                     }
                     return 'Error: content is empty — nothing was saved. The "content" field must contain the actual text of the fact, finding, or decision — not an empty string. If you have lost track of what to write, skip this save and continue.';
                 }
@@ -15715,6 +15788,8 @@ ${sampleHtml}
 
     /** Track consecutive empty-content memory_tier_write calls to break retry loops */
     private _emptyMemoryWriteCount = 0;
+    /** Set to true by memory_tier_write when empty-content retry limit hit — outer loop stops after batch */
+    private _forceStopAfterBatch = false;
 
     /** Track how many times native tool call recovery was suppressed this turn (thinking/output mismatch loop) */
     private _nativeRecoverySuppressCount = 0;
@@ -18117,7 +18192,7 @@ if (/command not found|No such file|not found|ENOENT/i.test(_failText)) {
     // Detect this by checking if the failing command was run via SSH.
     const _cmdStr = String(args.command ?? '');
     const _isSshCmd = /^ssh\s/.test(_cmdStr.trim());
-    const _cmdNotFoundMatch = _failText.match(/(?:bash|sh|zsh): line \d+: (\S+): command not found/);
+    const _cmdNotFoundMatch = _failText.match(/(?:\/\S+\/)?(?:bash|sh|zsh): line \d+: (\S+): command not found/);
     const _missingCmd = _cmdNotFoundMatch?.[1] ?? '';
     if (_isSshCmd && _missingCmd) {
         const _dbClients: Record<string, string> = {
@@ -18142,7 +18217,31 @@ if (/command not found|No such file|not found|ENOENT/i.test(_failText)) {
                 `3. Use the full path directly once found (e.g. ~/.local/bin/${_missingCmd})`;
         }
     } else {
-        _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
+        // Local (non-SSH) command not found.
+        // Detect shell env var statelessness: if the failing command uses $VAR syntax
+        // or if the missing tool is typically set via export (JAVA_HOME, ANDROID_HOME, etc.),
+        // the agent likely ran `export VAR=...` in a prior run_command that is now gone.
+        const _localCmdStr = String(args.command ?? '');
+        const _localMissingMatch = _failText.match(/(?:\/\S+\/)?(?:bash|sh|zsh): line \d*:? ?(\S+): (?:command not found|No such file)/);
+        const _localMissingCmd = _localMissingMatch?.[1] ?? '';
+        // Check if command references an unexpanded env var (e.g. $JAVA_HOME/bin/java or ${ANDROID_HOME}/...)
+        const _hasEnvVarRef = /\$\{?\w+\}?[\/\\]/.test(_localCmdStr);
+        // Check if the missing command itself is a bare binary commonly gated behind export
+        const _envGatedBinaries = /^(java|javac|keytool|apksigner|zipalign|adb|gradle|gradlew|mvn|ant|kotlin|kotlinc|node|npm|npx|python3?|pip3?|ruby|gem|go|cargo|rustc)$/i;
+        const _isSdkBin = _localMissingCmd && _envGatedBinaries.test(_localMissingCmd);
+        if (_hasEnvVarRef || _isSdkBin) {
+            const _varName = _hasEnvVarRef
+                ? (_localCmdStr.match(/\$\{?(\w+)\}?[\/\\]/)?.[1] ?? 'SDK_HOME')
+                : (_localMissingCmd.match(/^(java|javac|keytool)/i) ? 'JAVA_HOME' : _localMissingCmd.match(/^(adb|apksigner|zipalign)/i) ? 'ANDROID_HOME' : 'SDK_HOME');
+            _failHint = `⚠ Shell env vars from a previous run_command DO NOT persist — each call is a fresh shell.\n` +
+                `"${_localMissingCmd || 'command'}" failed because $${_varName} (set with export in an earlier call) is gone.\n` +
+                `Fix: combine the export and the command on ONE line, or use the full absolute path:\n` +
+                `  Option A (inline):  ${_varName}="/full/path/to/sdk" /full/path/to/sdk/bin/${_localMissingCmd || 'tool'} [args]\n` +
+                `  Option B (single line):  export ${_varName}="/full/path/to/sdk" && /full/path/to/sdk/bin/${_localMissingCmd || 'tool'} [args]\n` +
+                `First run: find / -name "${_localMissingCmd || 'tool'}" 2>/dev/null | head -5  to get the full path.`;
+        } else {
+            _failHint = 'The path or command does not exist. Use find_files or shell_read (ls) to locate the correct path first.';
+        }
     }
 } else if (/Operation not permitted|Permission denied|EACCES|EPERM/i.test(_failText)) {
     _failClass = 'permission';
