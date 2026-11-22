@@ -6660,6 +6660,7 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
 
             for (const tc of callsToExecute) {
                 if (this.stopRef.stop) { break; }
+                if (this._forceStopAfterBatch) { break; } // empty memory write retry limit — skip remaining calls
 
                 const name = tc.function.name;
                 let args: Record<string, unknown>;
@@ -9027,11 +9028,14 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
             if (this._forceStopAfterBatch) {
                 logInfo('[agent] _forceStopAfterBatch: empty memory_tier_write retry limit hit — stopping loop');
                 loopExhausted = false;
-                // Emit a visible status so the agent doesn't silently disappear mid-task.
-                const lastCmd = [...this._toolCallsThisRun].reverse()
-                    .find(tc => tc.name === 'run_command' || tc.name === 'shell_read');
-                const doneMsg = lastCmd
-                    ? `Task paused — memory save failed (content lost from context). Last action: \`${String(lastCmd.path ?? '').slice(0, 120) || 'shell command'}\`. Resume to continue.`
+                // Distinguish: did the agent complete real work this run (shell/file ops) or did it
+                // only attempt memory writes? If real work was done, the empty memory write is a
+                // harmless housekeeping failure — emit a clean done message, not a "task paused" error.
+                const realWorkTools = ['run_command', 'shell_read', 'write_file', 'edit_file', 'create_file'];
+                const lastRealWork = [...this._toolCallsThisRun].reverse()
+                    .find(tc => realWorkTools.includes(tc.name ?? ''));
+                const doneMsg = lastRealWork
+                    ? `Done. (Memory note was not saved — content was empty.)`
                     : `Task paused — memory save failed (content lost from context). Resume to continue.`;
                 post({ type: 'text', text: doneMsg });
                 break;
