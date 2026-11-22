@@ -2030,6 +2030,8 @@ export class Agent {
     private _runOutcome: 'done' | 'error' | 'stopped' = 'done';
     /** True when the agent broke the loop via isLegitimateStop — provider uses this to discard stale pendingMessage */
     private _legitimateStopFired: boolean = false;
+    /** Build/test verification gate: true once the gate has fired this run (caps re-verify to 1 pass) */
+    private _buildGateFired: boolean = false;
     /** Critic model for the current run (resolved from routing config at run start) */
     private _routedCriticModel: string = '';
     /** Base model for the current run (passed into run()) */
@@ -3106,6 +3108,7 @@ export class Agent {
         this._idleTurns = 0;
         this._idleNudgeFired = false;
         this._legitimateStopFired = false;
+        this._buildGateFired = false;
         this._confirmTimedOut = false;
         this._currentRunModel = model;
         { const rc = getConfig(); this._routedCriticModel = rc.modelRoutingEnabled ? (rc.criticModel || model) : model; }
@@ -6152,6 +6155,30 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                             // plan file missing or unreadable — allow stop
                         }
                     }
+
+                    // ── Build/test verification gate ──────────────────────────────────
+                    // On a clean stop after real work, run the project's test suite ONCE.
+                    // If it's red, hand the failure tail back so the model fixes the
+                    // regression instead of stopping on a broken build. Capped to 1 pass
+                    // via _buildGateFired. Skipped for pure Q&A (no tool calls this run).
+                    if (!this._buildGateFired && this._toolCallsThisRun.length > 0) {
+                        this._buildGateFired = true; // cap: only one verification pass per run
+                        try {
+                            const { runBuildGate } = await import('./buildGate');
+                            const gate = runBuildGate(this.workspaceRoot);
+                            if (gate.ran && !gate.passed && gate.feedback) {
+                                logInfo(`[buildGate] Test suite failed ("${gate.command}") — feeding failure back`);
+                                this.history.push({ role: 'user', content: gate.feedback });
+                                continue;
+                            }
+                            if (gate.ran && gate.passed) {
+                                logInfo(`[buildGate] Test suite passed ("${gate.command}")`);
+                            }
+                        } catch {
+                            // gate is best-effort — never block a legitimate stop on a gate error
+                        }
+                    }
+
                     logInfo(`[agent] isLegitimateStop (toolCalls=${toolCalls.length}) — breaking loop`);
                     loopExhausted = false;           // clean stop — do not show turn-limit card
                     legitimateStopFired = true;      // block multi-task auto-advance
