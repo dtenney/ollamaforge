@@ -37,7 +37,7 @@ jobs:
         run: npm run self-check
 
       - name: Run unit tests
-        run: npm run test:unit
+        run: npm run test:unit:all
 
   build:
     name: Build VSIX

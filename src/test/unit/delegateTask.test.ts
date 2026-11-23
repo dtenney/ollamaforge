@@ -102,15 +102,25 @@ async function runAgent(
 describe('delegate_task — budget enforcement & summary distillation', () => {
     let sandbox: sinon.SinonSandbox;
     let tmpDir: string;
+    // Single Agent instance shared across tests to avoid repeated heavy allocations.
+    // State is effectively reset each test because streamChatRequest is re-stubbed.
+    let agent: InstanceType<typeof Agent>;
+
+    before(() => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-delegate-'));
+        agent = new Agent(tmpDir, null, null);
+    });
+
+    after(() => {
+        rmTemp(tmpDir);
+    });
 
     beforeEach(() => {
         sandbox = sinon.createSandbox();
-        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-delegate-'));
     });
 
     afterEach(() => {
         sandbox.restore();
-        rmTemp(tmpDir);
     });
 
     it('posts subagentStart and subagentEnd lifecycle messages', async () => {
@@ -122,7 +132,7 @@ describe('delegate_task — budget enforcement & summary distillation', () => {
             'The project is a VS Code extension for local AI coding.',
         ]);
 
-        const agent = new Agent(tmpDir, null, null);
+
         const posted = await runAgent(agent, 'Summarize this project for me');
 
         const starts = posted.filter(m => m.type === 'subagentStart');
@@ -142,7 +152,6 @@ describe('delegate_task — budget enforcement & summary distillation', () => {
             longOutput,
         ]);
 
-        const agent = new Agent(tmpDir, null, null);
         const posted = await runAgent(agent, 'Write a long report');
 
         // The toolResult posted back should have the structured format
@@ -162,7 +171,6 @@ describe('delegate_task — budget enforcement & summary distillation', () => {
             'Done quickly.',
         ]);
 
-        const agent = new Agent(tmpDir, null, null);
         const posted = await runAgent(agent, 'Do a quick task');
 
         const ends = posted.filter(m => m.type === 'subagentEnd');
@@ -181,7 +189,6 @@ describe('delegate_task — budget enforcement & summary distillation', () => {
             'I can only use read_file.',
         ]);
 
-        const agent = new Agent(tmpDir, null, null);
         const posted = await runAgent(agent, 'Read the file for me');
 
         // Subagent's toolResults are consumed by dtPost (turn counting), not forwarded
@@ -206,7 +213,6 @@ describe('delegate_task — budget enforcement & summary distillation', () => {
             'Created output.txt successfully.',
         ]);
 
-        const agent = new Agent(tmpDir, null, null);
         const posted = await runAgent(agent, 'Create output.txt with hello');
 
         const toolResults = posted.filter(m => m.type === 'toolResult');
@@ -223,7 +229,6 @@ describe('delegate_task — budget enforcement & summary distillation', () => {
             '<tool>{"name":"delegate_task","arguments":{"prompt":"Do something","max_turns":3}}</tool>',
         ]);
         // Override: make the subagent's run() throw
-        const agent = new Agent(tmpDir, null, null);
         // We can't easily make the subagent throw without mocking Agent.run,
         // so we test that the lifecycle messages are still posted
         const posted = await runAgent(agent, 'Do something that might fail');
