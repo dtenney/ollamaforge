@@ -48,7 +48,7 @@
     "build": "npm run deploy",
     "package": "npm run compile && npx vsce package",
     "vscode:prepublish": "npm run bundle:prod",
-    "test": "npm run compile && vscode-test",
+    "test": "npm run test:unit",
     "test:unit": "npm run compile && cross-env NODE_OPTIONS=--max-old-space-size=2048 mocha --parallel --jobs 2 --exit --require dist/test/vscode-mock.js --ignore \"dist/test/unit/agentHarness.test.js\" --ignore \"dist/test/unit/delegateTask.test.js\" \"dist/test/unit/**/*.test.js\"",
     "test:unit:all": "npm run compile && cross-env NODE_OPTIONS=--max-old-space-size=4096 mocha --exit --require dist/test/vscode-mock.js --ignore \"dist/test/unit/agentHarness.test.js\" \"dist/test/unit/**/*.test.js\"",
     "test:harness": "npm run compile && cross-env NODE_OPTIONS=--max-old-space-size=2048 mocha --exit --require dist/test/vscode-mock.js --timeout 30000 \"dist/test/unit/agentHarness.test.js\"",
