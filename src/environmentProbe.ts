@@ -16,7 +16,14 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { logInfo, logError } from './logger';
 
-const execAsync = promisify(exec);
+// Always pass windowsHide:true so no blank cmd.exe window appears on Windows.
+function execAsync(cmd: string, options?: { timeout?: number; cwd?: string }): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+        exec(cmd, { windowsHide: true, encoding: 'utf8', ...options }, (err, stdout, stderr) => {
+            if (err) { reject(err); } else { resolve({ stdout: String(stdout), stderr: String(stderr) }); }
+        });
+    });
+}
 
 const STALE_DAYS = 7;
 const CONTEXT_SECTION_MARKER = '<!-- ollamaforge:env-probe -->';
