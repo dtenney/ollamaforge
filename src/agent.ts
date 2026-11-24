@@ -14599,10 +14599,11 @@ ${sampleHtml}
             const timeoutMs = isSshCmd ? 120_000 : 60_000;
             const timer = setTimeout(() => {
                 if (!finished) {
-                    // Resolve the promise first so a throw from kill() cannot leave the caller hanging.
-                    finish(-1);
-                    try { child.kill(); } catch { /* already gone */ }
+                    // Emit the timeout chunk BEFORE commandEnd so finalizeCommandBlock
+                    // has the full output (including the timeout line) when it wires the toggle.
                     post({ type: 'commandChunk', id: cmdId, text: `\n(timed out after ${timeoutMs / 1000}s)`, stream: 'stderr' });
+                    try { child.kill(); } catch { /* already gone */ }
+                    finish(-1);
                 }
             }, timeoutMs);
         });
