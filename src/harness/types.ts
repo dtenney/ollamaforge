@@ -66,7 +66,7 @@ export interface LoopState {
     currentModel: string;
     detectedFakeToolCalls: boolean;
     toolMode: 'native' | 'text';
-    trustLevel: number;
+    trustLevel: 'normal' | 'trust' | 'yolo';
     memoryWritesThisResponse: number;
     totalEditsThisSession: number;
     // Per-run counters
@@ -253,7 +253,7 @@ export interface ToolDispatchContext {
     diffViewManager: DiffViewManager;
     refactorManager: MultiFileRefactoringManager;
     activeSkill: SkillManifest | undefined;
-    trustLevel: number;
+    trustLevel: 'normal' | 'trust' | 'yolo';
     toolMode: 'native' | 'text';
     currentRunModel: string;
     routedCriticModel: string;

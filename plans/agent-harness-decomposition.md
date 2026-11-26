@@ -17,26 +17,29 @@ swappable model, swappable tools, swappable context strategy — each testable i
 
 ## Phase 0 — Inventory & Contracts
 
-- [ ] **0.1** Map every `this.` reference in `run()` to a named category:
+- [x] **0.1** Map every `this.` reference in `run()` to a named category:
       (a) config/limits constants, (b) mutable loop state, (c) service deps (memory, codeIndex, ollama),
       (d) UI/post callbacks, (e) static helpers
-- [ ] **0.2** Map every `this.` reference in `executeTool()` the same way
-- [ ] **0.3** Define the `TurnContext` interface — the bag of state the turn loop needs
+- [x] **0.2** Map every `this.` reference in `executeTool()` the same way
+- [x] **0.3** Define the `TurnContext` interface — the bag of state the turn loop needs
       (history, stopRef, postFn, model, toolMode, loop counters, service refs, config limits)
-- [ ] **0.4** Define the `ToolDispatchContext` interface — what `executeTool` needs
+- [x] **0.4** Define the `ToolDispatchContext` interface — what `executeTool` needs
       (args, toolName, workspaceRoot, memory, codeIndex, pathPolicy, commandPolicy, etc.)
-- [ ] **0.5** Write the interfaces in `src/harness/types.ts` (no logic, just types)
-- [ ] **0.6** Identify all fields mutated by **both** `run()` and `executeTool()` in the same turn
+- [x] **0.5** Write the interfaces in `src/harness/types.ts` (no logic, just types)
+- [x] **0.6** Identify all fields mutated by **both** `run()` and `executeTool()` in the same turn
       (e.g. `_mergeEditedSinceLastDelete`, `_failedCommandSignatures`, `_toolCallsThisRun`).
       Assign explicit ownership to either `TurnContext` or `ToolDispatchContext` — fields with
       split ownership are the highest-risk extractions and must be resolved before Phase 1 starts.
-- [ ] **0.7** Identify the ~25 counters/flags reset at the top of `run()` and decide where
+      → All shared fields live in `LoopState` (types.ts), owned by `TurnContext.loop`.
+- [x] **0.7** Identify the ~25 counters/flags reset at the top of `run()` and decide where
       state-reset logic lives post-refactor (likely `TurnContext` constructor or a `reset()` method)
+      → `LoopState` is re-created each `run()` call; `TurnContext` constructor sets it.
 
 ## Phase 1 — Extract Context Assembly
 
-- [ ] **1.1** Extract the "build system prompt + context" block from `run()` into
+- [x] **1.1** Extract the "build system prompt + context" block from `run()` into
       `src/harness/contextAssembler.ts` — takes `TurnContext`, returns `OllamaMessage[]`
+      → Done: `assembleContext(ctx: TurnContext): Promise<AssembledContext>` in `src/harness/contextAssembler.ts`
 - [ ] **1.2** Extract the "compact / trim history" logic into the same module or
       `src/harness/historyManager.ts`
 - [ ] **1.3** Unit-test: given a fixed history + workspace, assert the assembled message array
