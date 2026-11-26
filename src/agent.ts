@@ -8356,6 +8356,24 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             // for a prompt or connection. DO NOT re-run -- diagnose first.
                             const isTimeout = toolResult.includes('timed out after');
                             if (isTimeout) {
+                                // Test runner timeout: pytest/npm test/mocha timed out — tests are
+                                // just slow, not hung. Don't retry. Use the circuit breaker to hard-stop
+                                // so the model can't loop back and run the same test command again.
+                                const isTestRunner = /\bpytest\b|\bmocha\b|\bnpm\s+(run\s+)?test\b|\bpy\.test\b/.test(cmdStr);
+                                if (isTestRunner) {
+                                    const cmdSigTest = cmdStr.toLowerCase().trim().slice(0, 200);
+                                    const failCountTest = (this._failedCommandSignatures.get(cmdSigTest) ?? 0) + 1;
+                                    this._failedCommandSignatures.set(cmdSigTest, failCountTest);
+                                    if (failCountTest >= this.MAX_SAME_COMMAND_FAILURES) {
+                                        this._failedCommandSignatures.delete(cmdSigTest);
+                                        post({ type: 'error', text: `**Tests timed out** — the test suite exceeded the time limit twice.\n\nThe tests are likely too slow to run via the agent. Run them manually:\n\`\`\`\n${cmdStr.trim()}\n\`\`\`` });
+                                        loopExhausted = false;
+                                        breakAfterBatch = true;
+                                    } else {
+                                        nudge = `The test runner timed out. The tests are likely just slow — they are probably passing. Do NOT re-run the tests. Tell the user the tests timed out and suggest running manually: \`${cmdStr.trim()}\``;
+                                        breakAfterBatch = true;
+                                    }
+                                }
                                 const isPythonScript = /^\s*python3?\s+\S+\.py\b/.test(cmdStr);
                                 // Try to read the script to distinguish a long-running data script
                                 // (os.walk, pd.read_csv, DB cursor, network loop) from a hung subprocess.
