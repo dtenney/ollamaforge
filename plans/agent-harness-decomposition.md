@@ -40,8 +40,9 @@ swappable model, swappable tools, swappable context strategy — each testable i
 - [x] **1.1** Extract the "build system prompt + context" block from `run()` into
       `src/harness/contextAssembler.ts` — takes `TurnContext`, returns `OllamaMessage[]`
       → Done: `assembleContext(ctx: TurnContext): Promise<AssembledContext>` in `src/harness/contextAssembler.ts`
-- [ ] **1.2** Extract the "compact / trim history" logic into the same module or
+- [x] **1.2** Extract the "compact / trim history" logic into the same module or
       `src/harness/historyManager.ts`
+      → Done: `HistoryManager.handleAutoCompact()` in `src/harness/historyManager.ts`, unit-tested in `src/test/unit/historyManager.test.ts` (6 tests passing)
 - [ ] **1.3** Unit-test: given a fixed history + workspace, assert the assembled message array
 - [ ] **1.4** Wire `run()` to call the new module; verify build + harness tests pass
 
