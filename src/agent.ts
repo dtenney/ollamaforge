@@ -8052,14 +8052,27 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
 
                         this.handleFileNotFound(args, toolResult, isTextMode);
 
-                        // Sleep-poll loop detection: agent using `sleep N && cat logfile` to wait for a
-                        // background process emits the same output repeatedly — burns turns and blocks
-                        // the UI. After 3 consecutive polls with the same output, tell the agent to stop.
+                        // Sleep-poll loop detection: agent using `sleep N && <check>` to wait for a
+                        // background process — burns turns and blocks the UI.
+                        // Two variants:
+                        //   A) Same output repeatedly (e.g. sleep+cat log): stop after 3 identical results
+                        //   B) sleep+ls/find/tasklist that always fails (output file not yet there):
+                        //      stop after 3 attempts regardless of output — the process isn't done yet
                         if ((name === 'run_command' || name === 'shell_read') && !isToolErrorString) {
                             const _pollCmd = String(args.command ?? '').toLowerCase();
-                            const _isSleepPoll = /\bsleep\s+\d+\b/.test(_pollCmd)
+                            const _hasSleep = /\bsleep\s+\d+\b/.test(_pollCmd);
+                            // Variant A: sleep + read-log (cat/tail *.log)
+                            const _isSleepLogPoll = _hasSleep
                                 && (/\bcat\s+\S+\.log\b/.test(_pollCmd) || /\btail\b/.test(_pollCmd) || /\bcat\s+\S+\.(log|txt|out)\b/.test(_pollCmd));
-                            if (_isSleepPoll) {
+                            // Variant B: sleep + existence-check (ls/find/wc) waiting for a build artifact
+                            const _isSleepExistPoll = _hasSleep
+                                && /\b(ls|find|wc|test\s+-[fe])\b/.test(_pollCmd);
+                            // Variant C: no sleep but repeated tasklist+ls pattern (background build polling)
+                            const _isBuildStatusPoll = !_hasSleep
+                                && /\btasklist\b/.test(_pollCmd) && /\b(ls|find|dir)\b/.test(_pollCmd);
+
+                            if (_isSleepLogPoll) {
+                                // Variant A: dedup on output content
                                 const _pollSig = _pollCmd.replace(/\bsleep\s+\d+/g, 'sleep N').trim().slice(0, 150);
                                 const _pollOutput = toolResult.trim().slice(0, 300);
                                 const _existing = this._sleepPollSignatures.get(_pollSig);
@@ -8074,10 +8087,29 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                                             this.history.push({ role: 'tool', content: _pollNudge });
                                         }
                                         logWarn(`[agent] Sleep-poll loop detected (${_pollCount} identical results) — injected stop nudge`);
-                                        this._sleepPollSignatures.delete(_pollSig); // Reset so a later check can proceed
+                                        this._sleepPollSignatures.delete(_pollSig);
                                     }
                                 } else {
                                     this._sleepPollSignatures.set(_pollSig, { count: 1, lastOutput: _pollOutput });
+                                }
+                            } else if (_isSleepExistPoll || _isBuildStatusPoll) {
+                                // Variant B/C: count attempts regardless of output — the artifact isn't there yet
+                                const _pollSig = _pollCmd
+                                    .replace(/\bsleep\s+\d+\s*&&\s*/g, '')  // strip sleep prefix
+                                    .replace(/\d{4,}/g, 'N')                 // normalize PIDs/sizes
+                                    .trim().slice(0, 150);
+                                const _existing = this._sleepPollSignatures.get(_pollSig);
+                                const _pollCount = (_existing?.count ?? 0) + 1;
+                                this._sleepPollSignatures.set(_pollSig, { count: _pollCount, lastOutput: toolResult.trim().slice(0, 300) });
+                                if (_pollCount >= 3) {
+                                    const _pollNudge = `[SYSTEM] You have checked ${_pollCount} times — the background process is still running and the output artifact does not exist yet. STOP polling with sleep/ls/tasklist loops. Tell the user: "The build is still running in the background. Please let me know when it finishes and I will continue." Then STOP completely — do not sleep, do not check tasklist, do not ls again.`;
+                                    if (isTextMode) {
+                                        this.history.push({ role: 'user', content: _pollNudge });
+                                    } else {
+                                        this.history.push({ role: 'tool', content: _pollNudge });
+                                    }
+                                    logWarn(`[agent] Background-build poll loop detected (${_pollCount} attempts) — injected stop nudge`);
+                                    this._sleepPollSignatures.delete(_pollSig);
                                 }
                             }
                         }
