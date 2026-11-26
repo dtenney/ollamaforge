@@ -8101,7 +8101,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                                 const _existing = this._sleepPollSignatures.get(_pollSig);
                                 const _pollCount = (_existing?.count ?? 0) + 1;
                                 this._sleepPollSignatures.set(_pollSig, { count: _pollCount, lastOutput: toolResult.trim().slice(0, 300) });
-                                if (_pollCount >= 3) {
+                                if (_pollCount >= 2) {
                                     const _pollNudge = `[SYSTEM] You have checked ${_pollCount} times — the background process is still running and the output artifact does not exist yet. STOP polling with sleep/ls/tasklist loops. Tell the user: "The build is still running in the background. Please let me know when it finishes and I will continue." Then STOP completely — do not sleep, do not check tasklist, do not ls again.`;
                                     if (isTextMode) {
                                         this.history.push({ role: 'user', content: _pollNudge });
@@ -8354,11 +8354,16 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             // already supplies recovery paths; retrying the same command is always futile.
                             const tmIsNotFoundSsh = /^ssh\s/.test(cmdStr.trim())
                                 && /command not found|No such file or directory/i.test(toolResult);
+                            // Skip circuit breaker for build-poll patterns (tasklist+ls, sleep+ls) --
+                            // these are handled by the sleep-poll detector which fires first and gives
+                            // a clearer "build still running" message rather than a generic "stuck" error.
+                            const tmIsBuildPoll = /\btasklist\b/i.test(cmdStr) && /\b(ls|find|dir)\b/.test(cmdStr)
+                                || /\bsleep\s+\d+\b/.test(cmdStr) && /\b(ls|find|wc|test\s+-[fe])\b/.test(cmdStr);
                             // Track general command failures for circuit breaker
                             const cmdSig = cmdStr.toLowerCase().trim().slice(0, 200);
                             const failCount = (this._failedCommandSignatures.get(cmdSig) ?? 0) + 1;
-                            if (!tmIsNotFoundSsh) { this._failedCommandSignatures.set(cmdSig, failCount); }
-                            if (!tmIsNotFoundSsh && failCount >= this.MAX_SAME_COMMAND_FAILURES) {
+                            if (!tmIsNotFoundSsh && !tmIsBuildPoll) { this._failedCommandSignatures.set(cmdSig, failCount); }
+                            if (!tmIsNotFoundSsh && !tmIsBuildPoll && failCount >= this.MAX_SAME_COMMAND_FAILURES) {
                                 // Circuit breaker: same failing command tried twice -- escalate to user.
                                 // Show head+tail so the user sees both start of output and the failure reason.
                                 const errFull2 = toolResult;
