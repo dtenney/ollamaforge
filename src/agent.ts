@@ -42,6 +42,8 @@ import { findProjectFile as _findProjectFile, readProjectOpenItems as _readProje
 import { readTerminal as _readTerminal, getDiagnostics as _getDiagnostics, syntaxCheck as _syntaxCheck, findTestFile as _findTestFile } from './verification';
 import { buildMemoryNudge as _buildMemoryNudge, buildOrientationAnchor as _buildOrientationAnchor } from './memoryNudge';
 import { findFileByName as _findFileByName, findEditCandidates as _findEditCandidates } from './preEdit';
+import { assembleContext, AssembledContext } from './harness/contextAssembler';
+import type { TurnContext, AgentLimits, LoopState, ServiceDeps } from './harness/types';
 
 // â"€â"€ Tool definitions
 
