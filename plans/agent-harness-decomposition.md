@@ -43,7 +43,8 @@ swappable model, swappable tools, swappable context strategy — each testable i
 - [x] **1.2** Extract the "compact / trim history" logic into the same module or
       `src/harness/historyManager.ts`
       → Done: `HistoryManager.handleAutoCompact()` in `src/harness/historyManager.ts`, unit-tested in `src/test/unit/historyManager.test.ts` (6 tests passing)
-- [ ] **1.3** Unit-test: given a fixed history + workspace, assert the assembled message array
+- [x] **1.3** Unit-test: given a fixed history + workspace, assert the assembled message array
+      → Done: `src/test/unit/contextAssembler.test.ts` (11 tests passing)
 - [ ] **1.4** Wire `run()` to call the new module; verify build + harness tests pass
 
 ## Phase 2 — Extract the Turn Loop
