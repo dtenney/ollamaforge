@@ -6024,7 +6024,7 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // "Ready to help with X" or "What would you like to work on?" after having
                 // done work this run. This means it lost task context mid-session.
                 // Instead of stopping silently, inject a correction so it snaps back.
-                const isAgentGreetingReset = /\b(ready to help(?: with)?|what would you like(?: me)? to(?: work on| do|help)|how can i (?:help|assist) (?:you )?(?:today|now)?[.?]?\s*$|what would you like(?: to do)? next[.?]?\s*$)\b/i.test(resp.trim())
+                const isAgentGreetingReset = /\b(ready to help(?: with)?|what would you like(?: me)? to(?: work on| do|help)|how can i (?:help|assist)(?: you)?(?:\s+(?:today|now))?[.?]?|what would you like(?: to do)? next[.?]?)\b/i.test(resp.trim())
                     && this._toolCallsThisRun.length > 2; // Only trigger if substantial work was done
                 const isLegitimateStop =
                     (isUserDismissal && turnHasText && resp.trim().length < 300)
@@ -6078,7 +6078,7 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // Context-budget self-stop: model decides to stop because it thinks context is too low.
                 // This is never correct — the agent should write progress notes and continue.
                 // Intercept before isLegitimateStop so we redirect rather than stopping.
-                const isContextBudgetSelfStop = /\b(needs?\s+a\s+(fresh|new)\s+session|not\s+enough\s+context|context\s+(budget|remaining|is\s+low|too\s+small|exhausted)|start\s+a\s+new\s+session\s+to|fresh\s+session\s+(needed|required|prompt)|next.session\s+prompt)\b/i.test(resp)
+                const isContextBudgetSelfStop = /\b(needs?\s+a\s+(fresh|new)\s+session|not\s+enough\s+context|context\s+(budget|remaining)\s+is\s+(low|exhausted|too\s+small)|context\s+(is\s+)?(too\s+small|exhausted|running\s+low)|start\s+a\s+new\s+session\s+to|fresh\s+session\s+(needed|required|prompt)|next.session\s+prompt)\b/i.test(resp)
                     && this._toolCallsThisRun.length > 0; // Only if real work was done this run
                 if (isContextBudgetSelfStop) {
                     const planFile = this._currentTaskMessage?.match(/plans?\/[\w.-]+\.md/i)?.[0] ?? '';
