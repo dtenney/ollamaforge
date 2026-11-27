@@ -1845,6 +1845,27 @@ function appendCommandChunk(id, text, stream) {
     if (!block.dataset.userCollapsed) {
         output.style.display = 'block';
     }
+    // Race-condition fix: commandEnd before commandChunk (fast-failing SSH).
+    // finalizeCommandBlock hides the arrow when output is empty; re-show it now.
+    if (block.classList.contains('success') || block.classList.contains('error')) {
+        const header = block.querySelector('.cmd-header');
+        const arrow = header && header.querySelector('.cmd-toggle');
+        if (arrow && arrow.style.display === 'none') {
+            arrow.style.cssText = 'margin-left:auto;font-size:0.75em;opacity:0.6;flex-shrink:0';
+            arrow.textContent = '▼';
+            if (header) { header.style.cursor = 'pointer'; }
+        }
+        if (!block._toggleOutput && header) {
+            block._toggleOutput = () => {
+                const hidden = output.style.display === 'none';
+                output.style.display = hidden ? 'block' : 'none';
+                const tog = header.querySelector('.cmd-toggle');
+                if (tog) { tog.textContent = hidden ? '▼' : '▶'; }
+                block.dataset.userCollapsed = hidden ? '' : '1';
+            };
+            header.onclick = block._toggleOutput;
+        }
+    }
     output.scrollTop = output.scrollHeight;
     scrollBottom();
 }
