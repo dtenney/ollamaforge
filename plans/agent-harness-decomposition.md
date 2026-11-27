@@ -45,7 +45,7 @@ swappable model, swappable tools, swappable context strategy — each testable i
       → Done: `HistoryManager.handleAutoCompact()` in `src/harness/historyManager.ts`, unit-tested in `src/test/unit/historyManager.test.ts` (6 tests passing)
 - [x] **1.3** Unit-test: given a fixed history + workspace, assert the assembled message array
       → Done: `src/test/unit/contextAssembler.test.ts` (11 tests passing)
-- [ ] **1.4** Wire `run()` to call the new module; verify build + harness tests pass
+- [x] **1.4** Wire `run()` to call the new module; verify build + harness tests pass
       **Revised scope (after audit of actual agent.ts lines 4269–4784):**
       The inline block is significantly richer than `contextAssembler.ts` currently implements.
       The assembler must absorb the following before wiring is safe:
@@ -154,4 +154,4 @@ swappable model, swappable tools, swappable context strategy — each testable i
   document it in the plan, and proceed. Do not stop to ask.
 
 ## Next action:
-Phase 1.4 — wire `assembleContext()` into `run()`. See scope note above.
+Phase 2.1 — extract the core turn loop into `src/harness/turnExecutor.ts`.
