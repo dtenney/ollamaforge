@@ -218,9 +218,167 @@ Keep working on this task. Do not drift to unrelated work.`;
             memoryContext = await memory.buildRelevantContext(userMessage, maxTokens);
             if (memoryContext) {
                 logInfo(`[agent] Loaded relevant memory context: ${Math.ceil(memoryContext.length / 4)} tokens`);
+                // Annotate file refs with [VERIFY] so the model reads source before answering.
+                // Skip if the last assistant turn was a memory write (freshly saved, no contradiction possible).
+                const fileRefRx = /\b([\w./-]+\.(?:db|sqlite|sqlite3|json|py|ts|js|yaml|yml|conf|cfg|env|log|txt|csv|sh))\b/gi;
+                const lastAssistantMsg = [...history].reverse().find(m => m.role === 'assistant');
+                const lastWasMemoryWrite = lastAssistantMsg?.tool_calls?.some((tc: any) => tc.function.name === 'memory_tier_write') ?? false;
+                if (!lastWasMemoryWrite && fileRefRx.test(memoryContext)) {
+                    memoryContext = memoryContext.replace(
+                        /\b([\w./-]+\.(?:db|sqlite|sqlite3|json|py|ts|js|yaml|yml|conf|cfg|env|log|txt|csv|sh))\b/gi,
+                        '$1[VERIFY]'
+                    );
+                    memoryContext += '\n\n[VERIFY] = read the source code that defines this path before using this value — do NOT answer from memory alone.';
+                }
             }
         } catch (e) {
             logWarn(`[agent] Memory context build failed: ${e}`);
+        }
+    }
+
+    // ── 10b. Qdrant offline notice ───────────────────────────────────────────
+    if (memory && !(memory as any).isQdrantAvailable) {
+        baseSystemContent += `\n\n[MEMORY STATUS] Semantic memory (Tiers 4-5) is OFFLINE — Qdrant/embedding service is unavailable. memory_search will only return local Tier 0-3 results. Do NOT expect past-session solutions or semantic lookups to be available this session.`;
+    }
+
+    // ── 10c. Recent-work briefing ────────────────────────────────────────────
+    if (memory && !loop.isSmallModel) {
+        try {
+            const tier3 = memory.getTier(3)
+                .filter((e: any) => e.tags?.includes('session-end') || e.tags?.includes('completed'))
+                .slice(-2);
+            const tier2disc = memory.getTier(2)
+                .filter((e: any) => e.tags?.includes('auto-discovery') || e.tags?.includes('stub') || e.tags?.includes('template'))
+                .slice(0, 3);
+            const tier4recent = memory.getTier(4).slice(-2);
+            const recentEntries = [...tier3, ...tier2disc, ...tier4recent].slice(0, 5);
+            if (recentEntries.length > 0) {
+                const briefing = recentEntries.map((e: any) => `- ${e.content.slice(0, 200)}`).join('\n');
+                baseSystemContent += `\n\n## Recent work (from memory)\n${briefing}\nUse this to avoid re-discovering facts already known.`;
+                logInfo(`[memory] Injected recent-work briefing: ${recentEntries.length} entries`);
+            }
+        } catch { /* skip if memory unavailable */ }
+    }
+
+    // ── 10d. Resume detection ────────────────────────────────────────────────
+    const isResumeIntent = history.length <= 1
+        && /\b(continue|resume|pick\s+up|where\s+(were|was|did)\s+we|what\s+(were|was|are)\s+we|carry\s+on|keep\s+going|what('s|\s+is)\s+(left|next|pending|remaining)|still\s+(working|need)|finish(ing|ed)?|where\s+did\s+we|last\s+time)\b/i.test(userMessage);
+    if (isResumeIntent && memory) {
+        try {
+            const sweepEntries = memory.getTier(2)
+                .filter((e: any) => e.tags?.includes('sweep-progress') || e.tags?.includes('wip-sync'))
+                .slice(-2);
+            const sessionEntries = memory.getTier(3)
+                .filter((e: any) => e.tags?.includes('session-end') || e.tags?.includes('completed'))
+                .slice(-1);
+            const resumeEntries = [...sweepEntries, ...sessionEntries];
+            if (resumeEntries.length > 0) {
+                const resumeLines = resumeEntries.map((e: any) => e.content).join('\n\n---\n');
+                baseSystemContent += `\n\n## [RESUME REQUESTED]\nThe user wants to pick up where the last session left off. Here is the persisted state from memory:\n\n${resumeLines}\n\nYour job:\n1. Summarize what was done and what remains in 2-3 sentences\n2. Ask the user if they want to continue with the pending work\n3. If they confirm, proceed with the next pending step immediately — do not re-explain the whole plan`;
+                logInfo(`[resume] Injected resume context: ${resumeEntries.length} entries`);
+            } else {
+                baseSystemContent += `\n\n## [RESUME REQUESTED]\nThe user wants to pick up where the last session left off, but no persisted task state was found in memory. Let the user know you don't have a record of unfinished work, and ask them to describe what they'd like to do.`;
+            }
+        } catch { /* non-fatal */ }
+    }
+
+    // ── 10e. Prior-work existence check ─────────────────────────────────────
+    const isImplementTask = /\b(implement|create|add|build|make|set up|write)\b/i.test(userMessage)
+        && !/\b(plan|discuss|design|proposal)\b/i.test(userMessage);
+    if (memory && isImplementTask) {
+        try {
+            const kwMatch = userMessage.match(/\b([a-z][a-z0-9_]{3,})\b/gi) ?? [];
+            const stopWords = new Set(['the','this','that','with','from','into','for','and','create','make','build','add','implement','write','should','would','could','please','just','need','want']);
+            const searchKws = kwMatch.filter(w => !stopWords.has(w.toLowerCase())).slice(0, 5);
+            if (searchKws.length >= 2) {
+                const priorHits = await memory.searchMemory(searchKws.join(' '), undefined, 5);
+                const completedHits = priorHits.filter((h: any) =>
+                    h.tags?.includes('completed-feature') || h.tags?.includes('session-end') || h.tags?.includes('completed')
+                );
+                if (completedHits.length > 0) {
+                    const hitLines = completedHits.map((h: any) => `  - ${h.content.slice(0, 150)}`).join('\n');
+                    baseSystemContent += `\n\n## [PRIOR WORK DETECTED]\nMemory contains entries suggesting this feature may already be implemented:\n${hitLines}\n\nBEFORE writing any code:\n1. Call memory_search("${searchKws.slice(0,3).join(' ')}") to review the full details\n2. Check the relevant file(s) to confirm whether the feature exists\n3. If it already exists, tell the user what was found and ask if they want changes\n4. Only proceed with new code if the feature is genuinely missing`;
+                    logInfo(`[prior-work] Injected existence check: ${completedHits.length} hit(s)`);
+                }
+            }
+        } catch { /* non-fatal */ }
+    }
+
+    // ── 10f. Flask/Python filesystem scan ───────────────────────────────────
+    if (isImplementTask && workspaceRoot) {
+        try {
+            const hasPyFs = fs.existsSync(path.join(workspaceRoot, 'requirements.txt'))
+                || fs.existsSync(path.join(workspaceRoot, 'pyproject.toml'))
+                || fs.existsSync(path.join(workspaceRoot, 'setup.py'));
+            const STOP_FS = new Set(['add','insert','fix','update','change','modify','implement',
+                'the','a','an','to','in','on','of','for','that','this','and','or','with',
+                'from','into','should','would','could','will','can','all','returns',
+                'return','json','please','just','need']);
+            const fsKws = userMessage.toLowerCase().split(/\W+/)
+                .filter(w => w.length > 3 && !STOP_FS.has(w)).slice(0, 6);
+            if (hasPyFs && fsKws.length >= 1) {
+                const scanDirs = ['app/routes', 'app/services', 'app/views', 'app/blueprints']
+                    .map(d => path.join(workspaceRoot, d))
+                    .filter(d => fs.existsSync(d));
+                interface FsScanHit { relPath: string; matchedRoutes: string[]; matchedFunctions: string[] }
+                const fsHits: FsScanHit[] = [];
+                for (const scanDir of scanDirs) {
+                    let pyFiles: string[];
+                    try { pyFiles = fs.readdirSync(scanDir).filter(f => f.endsWith('.py') && f !== '__init__.py'); }
+                    catch { continue; }
+                    for (const pf of pyFiles) {
+                        const pfAbs = path.join(scanDir, pf);
+                        let pfContent: string;
+                        try { pfContent = fs.readFileSync(pfAbs, 'utf8'); } catch { continue; }
+                        const pfLower = pfContent.toLowerCase();
+                        if (fsKws.filter(kw => pfLower.includes(kw)).length < 2) { continue; }
+                        const matchedRoutes: string[] = [];
+                        const matchedFunctions: string[] = [];
+                        for (const line of pfContent.split('\n')) {
+                            const rm = line.match(/^\s*@\w+\.route\(['"]([^'"]+)['"]/);
+                            if (rm) { matchedRoutes.push(rm[1]); }
+                            const fm = line.match(/^\s*(?:async\s+)?def\s+(\w+)\s*\(/);
+                            if (fm && !fm[1].startsWith('_')) { matchedFunctions.push(fm[1]); }
+                        }
+                        const relevantRoutes = matchedRoutes.filter(r => fsKws.some(kw => r.toLowerCase().includes(kw)));
+                        const relevantFns = matchedFunctions.filter(fn => fsKws.some(kw => fn.toLowerCase().includes(kw)));
+                        if (relevantRoutes.length > 0 || relevantFns.length > 0) {
+                            const rel = path.relative(workspaceRoot, pfAbs).replace(/\\/g, '/');
+                            fsHits.push({ relPath: rel, matchedRoutes: relevantRoutes, matchedFunctions: relevantFns });
+                        }
+                    }
+                }
+                if (fsHits.length > 0) {
+                    const hitLines = fsHits.map(h => {
+                        const parts = [`  File: \`${h.relPath}\``];
+                        if (h.matchedRoutes.length > 0) { parts.push(`  Routes: ${h.matchedRoutes.map(r => `\`${r}\``).join(', ')}`); }
+                        if (h.matchedFunctions.length > 0) { parts.push(`  Functions: ${h.matchedFunctions.map(f => `\`${f}\``).join(', ')}`); }
+                        return parts.join('\n');
+                    }).join('\n\n');
+                    baseSystemContent += `\n\n## [FEATURE ALREADY EXISTS — FILE SYSTEM SCAN]\n\nBefore writing any code, a scan found existing code matching this task:\n\n${hitLines}\n\nYou MUST:\n1. Read the file(s) listed above\n2. Tell the user exactly what already exists\n3. Only write NEW code if the requested feature is genuinely absent`;
+                    logInfo(`[fs-scan] Injected existence warning: ${fsHits.length} hit(s)`);
+                }
+            }
+        } catch { /* non-fatal */ }
+    }
+
+    // ── 10g. Session recon ───────────────────────────────────────────────────
+    if (ctx.sessionRecon) {
+        baseSystemContent += `\n\n${ctx.sessionRecon}`;
+    }
+
+    // ── 10h. Task-type-specific suffix ──────────────────────────────────────
+    if (loop.isEditTask && loop.editContextInjected) {
+        const isFormTaskMsg = /\b(form|template|inline|frontend|html)\b/i.test(userMessage)
+            || /\badd\b.{0,40}\b(field|column|input)\b/i.test(userMessage);
+        const isBugFixMsg = /\bfix\b/i.test(userMessage) && !/\ball\b|\bevery\b/.test(userMessage);
+        const isAddRouteMsg = /\badd\b.{0,30}\broute\b/i.test(userMessage);
+        if (isFormTaskMsg) {
+            baseSystemContent += `\n\n## TASK TYPE: Add field to form\nThis task requires changes to MULTIPLE files — the HTML template, the JS submit handler, and possibly the backend route. You MUST edit all of them. Do not stop after one file.`;
+        } else if (isBugFixMsg) {
+            baseSystemContent += `\n\n## TASK TYPE: Bug fix\nRead the error, find the exact line, fix it with edit_file. Do not describe the fix — apply it. One sentence response after the fix: what was wrong and what was changed.`;
+        } else if (isAddRouteMsg) {
+            baseSystemContent += `\n\n## TASK TYPE: Add route\nCopy the pattern shown in the pre-loaded context exactly. Do not invent a different structure. Call edit_file_at_line once.`;
         }
     }
 
@@ -343,31 +501,21 @@ Keep working on this task. Do not drift to unrelated work.`;
         }
     }
 
-    // ── 14. Resume context ───────────────────────────────────────────────────
+    // ── 14. Merge memory + graph into final system string ───────────────────
+    // All addenda to baseSystemContent above (10b–10h, sections 2–9) are already
+    // appended. Now attach the memory context block and graph context.
     let baseSystemWithMemory = baseSystemContent;
     if (memoryContext) {
-        baseSystemWithMemory += `\n\n## Your Persistent Memory\n${memoryContext}`;
-    }
+        baseSystemWithMemory += `\n\n## Your Persistent Memory\n${memoryContext}
 
-    // Check for resume request
-    const isResumeRequest = /\b(resume|continue\s+(where|from)|pick\s+up|where\s+(did|were)\s+we\s+(leave|stop)|last\s+session|unfinished|pending\s+work)\b/i.test(userMessage);
-    if (isResumeRequest && memory) {
-        try {
-            const sweepEntries = memory.getTier(5)
-                .filter((e: any) => e.tags?.includes('sweep') || e.tags?.includes('wip'))
-                .slice(-3);
-            const sessionEntries = memory.getTier(5)
-                .filter((e: any) => e.tags?.includes('session-end') || e.tags?.includes('completed'))
-                .slice(-1);
-            const resumeEntries = [...sweepEntries, ...sessionEntries];
-            if (resumeEntries.length > 0) {
-                const resumeLines = resumeEntries.map((e: any) => e.content).join('\n\n---\n');
-                baseSystemWithMemory += `\n\n## [RESUME REQUESTED]\nThe user wants to pick up where the last session left off. Here is the persisted state from memory:\n\n${resumeLines}\n\nYour job:\n1. Summarize what was done and what remains in 2-3 sentences\n2. Ask the user if they want to continue with the pending work\n3. If they confirm, proceed with the next pending step immediately -- do not re-explain the whole plan`;
-                logInfo(`[resume] Injected resume context: ${resumeEntries.length} entries`);
-            } else {
-                baseSystemWithMemory += `\n\n## [RESUME REQUESTED]\nThe user wants to pick up where the last session left off, but no persisted task state was found in memory. Let the user know you don't have a record of unfinished work, and ask them to describe what they'd like to do.`;
-            }
-        } catch { /* non-fatal */ }
+IMPORTANT: Only critical infrastructure is shown above. You have MORE memories stored across tiers 1-5.
+- Before answering questions about project setup, conventions, frameworks, past decisions, or known issues -> call memory_search("<topic>")
+- Before implementing ANY feature request or code change -> call memory_search("<feature area>") to check existing patterns
+Do NOT assume you have no memory — check first.
+
+STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentioned in "## Your Persistent Memory" above — compare them. If they contradict, correct the stale memory entry immediately.
+
+PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you should not need to look up again — save them immediately without being asked.`;
     }
 
     // ── 15. Graph context appended to system ─────────────────────────────────

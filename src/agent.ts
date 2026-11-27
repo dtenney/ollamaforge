@@ -4008,361 +4008,85 @@ export class Agent {
         }
 
         const cfg = getConfig();
-        // When the context window is already full before any work can start (early-compaction
-        // stall), fall back to the compact small-model prompt so the plan ledger + task
-        // description can actually fit. Skip all verbose addendums below.
-        const _useSlimPrompt = this._earlyCompactionStalls >= 1;
-        let baseSystemContent = cfg.systemPrompt.trim()
-            || (_useSlimPrompt || this._isSmallModel
-                ? buildSmallModelSystemPrompt(this.workspaceRoot)
-                : await buildSystemPromptAsync(cfg.autoSaveMemory, this.workspaceRoot));
-        if (_useSlimPrompt) {
-            logInfo(`[context] Early-compaction stall #${this._earlyCompactionStalls} — using slim system prompt`);
-        }
 
-        // ── Intent-based context strategy ─────────────────────────────────────
-        const intentResult: IntentResult = classifyIntent(userMessage);
-        if (!_useSlimPrompt && intentResult.intent !== 'general') {
-            logInfo(`[intent] ${intentResult.intent} (confidence=${intentResult.confidence}) — prioritize: ${intentResult.contextPriorities.join(', ')} | skip: ${intentResult.contextSkips.join(', ') || 'none'}`);
-            baseSystemContent += `\n\n## CONTEXT STRATEGY (intent: ${intentResult.intent})
-Prioritize these context sources: ${intentResult.contextPriorities.join(', ')}.
-Skip or de-prioritize: ${intentResult.contextSkips.join(', ') || 'none'}.
-Adapt your tool calls accordingly — e.g. if git_diff is skipped, do not call shell_read for git log/diff unless the user explicitly asks.`;
-        }
-
-        // Snapshot context file mtimes for drift detection (checked every 5 turns)
-        if (this.workspaceRoot) {
-            this._contextFileMtimes = snapshotContextFileMtimes(this.workspaceRoot);
-        }
-
-        // â"€â"€ Security scan addendum â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        if (!_useSlimPrompt && isSecurityScan) {
-            baseSystemContent += `\n\n## SECURITY AUDIT MODE
-You are performing a security vulnerability scan. Your job is to systematically read source files and identify real, exploitable security issues. Follow this process:
-
-**Step 1 -- Enumerate files**: Use shell_read to list all relevant source files (routes, services, models, config).
-**Step 2 -- Read each file**: Read files one at a time. For each file, look for:
-  - Command injection: user input passed to exec/spawn/shell without sanitization
-  - SQL injection: string interpolation in queries instead of parameterized queries
-  - Path traversal: unsanitized file paths from user input
-  - Hardcoded secrets: API keys, passwords, tokens in source code
-  - Insecure deserialization: loading untrusted data with pickle, yaml.load, eval
-  - Authentication bypass: missing auth decorators on sensitive routes
-  - XSS: user input rendered as HTML without escaping (render_template_string, Markup())
-  - SSRF: user-controlled URLs passed to requests.get/http calls
-  - Mass assignment: accepting arbitrary fields from request.json/form without filtering
-  - Exposed debug endpoints: debug=True, /debug routes, stack traces to users
-**Step 3 -- Report findings**: For each finding output:
-  - File and line number
-  - Vulnerability type and severity (Critical/High/Medium/Low)
-  - The exact vulnerable code snippet
-  - Why it is exploitable
-  - A concrete fix
-
-**Rules**:
-- Read the actual code -- do NOT guess or hallucinate findings
-- Report ONLY real issues you can see in the code you read
-- Skip informational notes -- only report exploitable vulnerabilities
-- After reading all files, produce a final summary table: File | Line | Type | Severity
-- Use shell_read to read files -- do not ask the user to paste code`;
-        }
-
-        // â"€â"€ Autonomy level addendum â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        if (!_useSlimPrompt && this.trustLevel === 'yolo') {
-            baseSystemContent += `\n\n## AUTONOMY MODE: YOLO -- Full autonomous execution
-The user has set trust level to YOLO. This means:
-- **Never ask "Want me to proceed--, "Should I continue--, "Would you like me to X--** -- just do it.
-- **Never stop between steps to confirm** -- complete the entire task end-to-end in one run.
-- **Never propose and wait** -- if you have a clear next action, take it immediately.
-- **Keep going through a plan until every step is done.** If you wrote a plan with multiple steps, execute ALL of them sequentially without pausing. Only stop when the entire plan is complete or you hit an unrecoverable error.
-- **Think about the next step and act on it immediately.** Do not output your reasoning about what to do next -- just call the tool.
-- After completing ALL steps, give a concise summary of what was done. No follow-up questions unless you hit a genuine blocker (missing credentials, ambiguous destructive action).
-- Treat every user message as full authorization to complete the entire implied task autonomously.
-- **When the user's message contains a numbered list or checklist of tasks, work through them in order without pausing.** Complete ALL items before stopping. Do NOT ask which item to work on -- just start with item 1.
-- **NEVER end a response with a prompt like "Say 'next' and I'll...", "Let me know when to continue", "Which section should I tackle first?", or any variant.** These are forbidden. If there are remaining items **within the current request**, pick the next one and start working on it immediately.
-- **When the current task is fully complete, stop.** Do NOT scan plan files, task logs, memory, or the codebase looking for adjacent or unrelated work to start on your own. "Remaining items" means items the user explicitly asked for in this message — not anything else you find in the workspace. If you notice something related that might be worth doing, say it in one sentence ("I also noticed X — want me to address that?") then stop. The user decides what comes next.`;
-        } else if (this.trustLevel === 'trust') {
-            baseSystemContent += `\n\n## AUTONOMY MODE: Trust -- Reduced confirmation
-The user has set trust level to Trust. This means:
-- Complete multi-step tasks without asking for confirmation between steps.
-- Only pause if you hit a genuinely ambiguous or destructive action (deleting data, overwriting things the user may not have intended).
-- **NEVER end a response with any permission-seeking or choice-offering question.** This includes: "Want me to check X?", "Want me to proceed?", "Should I continue?", "Want me to try X?", "Say 'next' and I'll...", "Want me to take [item] next?", "Which should I tackle first?", "Shall I do X or Y?" — all forbidden.
-- After each tool result, call the next tool immediately -- do not pause to ask or summarize between steps.
-- When working through a plan, execute steps sequentially until done. Only stop at major completion points (all steps finished, or a genuine blocker).
-- **If you've completed one section of a multi-section task, immediately start the next section** — but only within the scope of the task the user actually requested. Do not list remaining sections and ask which to tackle -- just pick the first unchecked item and start it.
-- **If multiple open items remain within the requested task and you are unsure which to do next, pick the topmost/first one and start immediately.** Never ask the user to choose.
-- **CRITICAL: When the originally requested task is fully complete, STOP. Do not scan the codebase for unrelated issues, do not start new work that was not part of the request.** Summarize what was done and ask if there is anything else the user would like to work on.`;
-        }
-
-        // ── Multi-step task planning nudge ────────────────────────────────────────
-        // For tasks that clearly involve multiple steps (audit, review+fix, sweep,
-        // migrate, refactor across files), nudge the model to log its plan upfront
-        // using task_log. This seeds stepsCompleted/stepsPending from turn 1, which
-        // flows into the WIP snapshot, turn-limit summary, and resume context.
-        // Only fires on the FIRST turn of a new task (not continuations/confirmations).
-        const _isMultiStepTask = !isConfirmation && (
-            isPlanTask
-            || isReviewTask
-            || /\b(audit|migrate|refactor|rework|overhaul|clean\s*up|go\s+(one\s+by\s+one|through\s+(each|all|them))|one\s+at\s+a\s+time|step\s+by\s+step|systematically|work\s+(through|on)\s+(each|all)|let'?s\s+start\s+from\s+the\s+top|start\s+from\s+the\s+top)\b/i.test(userMessage)
-            || /\b(all|every|each)\b.{0,40}\b(file|script|route|function|endpoint)\b/i.test(userMessage)
-            || /(\band\s+(then\s+)?fix|\band\s+(then\s+)?update|\band\s+(then\s+)?deploy|\bthen\s+(commit|push|deploy|test|verify))/i.test(userMessage)
-        );
-        // Fire nudge when task looks multi-step AND task_log hasn't been called yet this session.
-        // _activeTask.taskId is set on the first task_log call — if absent, the model hasn't planned yet.
-        // Don't gate on first-turn: the multi-step request often arrives as a follow-up message
-        // (e.g. "morning" → "review workspace" → "let's go through each item").
-        const _taskLogNotYetCalled = !this._activeTask?.taskId;
-        if (!_useSlimPrompt && _isMultiStepTask && _taskLogNotYetCalled && !isConfirmation) {
-            baseSystemContent += `\n\n## MULTI-STEP TASK — LOG YOUR PLAN FIRST
-Before executing anything, call task_plan with action="create" and a "steps" array listing the steps you plan to take (e.g. ["Review X", "Fix Y", "Deploy Z"]). Then call task_plan action="advance" after each step completes. The ledger persists to disk and is re-injected every turn, so you never lose track of what is done vs. pending across context compactions and turn-limit resets.`;
-        }
-
-        // ── Plan-first gate ───────────────────────────────────────────────────────
-        // User said "tell me what you're going to do before proceeding" (or equivalent).
-        // The agent must explain its plan and then STOP — no edits or writes until the
-        // user sends a confirmation ("go ahead", "looks good", "do it", etc.).
-        if (isPlanFirstRequest) {
-            this._planFirstMode = true;
-            baseSystemContent += `\n\n## ⛔ PLAN-FIRST MODE — DO NOT MAKE ANY CHANGES YET
-The user has explicitly asked you to explain what you are going to do BEFORE making any changes.
-
-Your job this turn:
-1. Read whatever files you need to understand the task (read_file / search_files are allowed).
-2. Write a clear, numbered plan describing exactly what you will change and why.
-3. End your response with: "Shall I proceed?" — then STOP. Do not call edit_file or write_file.
-
-The edit_file and write_file tools are BLOCKED until the user replies with a confirmation ("go ahead", "yes", "do it", "proceed", "looks good", or similar). If you call them now, they will be rejected. Present your plan and wait.`;
-        } else if (this._planFirstMode && (isConfirmation || this._planConfirmed)) {
-            // Gate was previously active but is now cleared — user explicitly confirmed.
-            // Inject an explicit cancellation so the model doesn't carry over the old block
-            // from a prior turn's system prompt still visible in its context window.
-            this._planFirstMode = false;
-            baseSystemContent += `\n\n## ✅ PLAN-FIRST MODE CLEARED
-The plan-first hold from an earlier turn is now lifted. write_file, edit_file, and all other tools are available. Proceed with the task immediately — do not ask for permission again.`;
-        } else if (this._planFirstMode) {
-            // Gate still active — user has not confirmed yet. Re-inject the block so
-            // the model remembers it persists even if it asks a clarifying question.
-            baseSystemContent += `\n\n## ⛔ PLAN-FIRST MODE — STILL WAITING FOR CONFIRMATION
-You already presented your plan. The user has NOT yet confirmed. Do NOT call edit_file or write_file. Answer any questions, then remind the user to say "go ahead" when ready.`;
-        }
-
-        // ── Plan ledger injection ─────────────────────────────────────────────────
-        // If a task_plan ledger exists for the active task, re-inject its current
-        // state every turn so the model always knows exactly which step it is on.
-        // This is the durable backbone of the plan-then-execute loop (item 3.2).
-        const _planTaskId = this._activeTask?.taskId;
-        if (_planTaskId) {
-            try {
-                const _planPath = path.join(this.workspaceRoot, '.ollamaforge', 'tasks', _planTaskId, 'plan.json');
-                if (fs.existsSync(_planPath)) {
-                    const _ledger = JSON.parse(fs.readFileSync(_planPath, 'utf8'));
-                    if (Array.isArray(_ledger.steps) && _ledger.steps.length > 0) {
-                        const _done = _ledger.steps.filter((s: any) => s.status === 'done').length;
-                        const _pending = _ledger.steps.filter((s: any) => s.status === 'pending').length;
-                        const _nextIdx = _ledger.steps.findIndex((s: any) => s.status === 'pending');
-                        const _lines = _ledger.steps.map((s: any, i: number) => {
-                            const mark = s.status === 'done' ? '[x]' : s.status === 'pending' ? '[ ]' : `[${s.status}]`;
-                            return `  ${i + 1}. ${mark} ${s.text}${s.note ? ` — ${s.note}` : ''}`;
-                        }).join('\n');
-                        baseSystemContent += `\n\n## ACTIVE PLAN LEDGER — "${_planTaskId}" (${_done}/${_ledger.steps.length} done, ${_pending} pending)
-${_lines}
-${_nextIdx !== -1 ? `NEXT STEP: ${_ledger.steps[_nextIdx].text}. Work on it now, then call task_plan action="advance".` : 'All steps resolved. Call task_log status="done" to close out.'}`;
-                    }
-                }
-            } catch { /* ledger read failure is non-fatal */ }
-        }
-
-        // ── Active task anchor ────────────────────────────────────────────────────
-        // Inject the current task into the system prompt so the model never loses it
-        // after compaction drops old history messages. This is a system-level directive
-        // so it survives any amount of history trimming.
-        // Skip on first-ever user turn (userTurnCount === 1) to avoid redundancy when
-        // the task is already visible as the top history message.
-        const _anchorTask = this._currentTaskMessage || this._originalTaskMessage;
-        if (_anchorTask) {
-            // When running a [TASK N/M] item from a multi-task list, add a hard scope boundary
-            // so the model doesn't expand into unrelated tasks after completing the current one.
-            const _taskNofM = _anchorTask.match(/^\[TASK (\d+)\/(\d+)\]/);
-            const _taskScopeNote = _taskNofM
-                ? ` This is task ${_taskNofM[1]} of ${_taskNofM[2]}. Complete ONLY this task, then stop. Do NOT start or mention other tasks from other lists.`
-                : '';
-            baseSystemContent += `\n\n## ACTIVE TASK\n${_anchorTask.slice(0, 300)}\nDo NOT ask what to work on — continue until this task is complete.${_taskScopeNote}`;
-        }
-
-        // ── Project-level task detection ──────────────────────────────────────────
-        // When the user describes work spanning multiple phases, streams, or sessions
-        // (weeks/months of effort, multiple tracks), auto-create PROJECT.md to anchor
-        // the agent's awareness across compactions and sessions.
-        // Fires on any user turn (phased plans often emerge mid-conversation) and only if no PROJECT.md exists yet.
-        const _isProjectLevelTask = !isConfirmation && !this._activeProjectFile && (
-            /\b(phase[s]?|stream[s]?|milestone[s]?|sprint[s]?|initiative|roadmap|multi[- ]?phase|multi[- ]?stream|long[- ]?term|over\s+the\s+(next|coming)\s+(week|month|quarter))\b/i.test(userMessage)
-            || /\b(track\s+\d|track\s+(a|b|one|two)|parallel\s+(work|effort|stream)|two\s+tracks|three\s+tracks)\b/i.test(userMessage)
-            || /\b(project\s+(plan|tracker|tracking)|keep\s+track\s+of|tracking\s+doc|tracking\s+document)\b/i.test(userMessage)
-        );
-        if (_isProjectLevelTask) {
-            // Create a minimal PROJECT.md skeleton — agent will fill in the real phases/streams
-            this.writeProjectFile(userMessage, ['(agent will fill in phases after planning)'], []);
-            baseSystemContent += `\n\n## PROJECT-LEVEL TASK — CREATE PROJECT.md
-This task spans multiple phases or streams. A PROJECT.md skeleton has been created at the workspace root. Before starting any work:
-1. Read PROJECT.md with read_file
-2. Replace the placeholder phases/streams with real ones based on the user's description
-3. Use PROJECT.md as your master checklist — tick items off with edit_file as you complete them
-4. Before stopping each session, update the "Next action" line in PROJECT.md so the next session can resume instantly`;
-        }
-
-        // If a PROJECT.md is already active, surface its "next action" to orient this session
-        if (this._activeProjectFile && !_isProjectLevelTask && this.userTurnCount === 1) {
-            try {
-                const pfContent = fs.readFileSync(this._activeProjectFile, 'utf8');
-                const nextActionMatch = pfContent.match(/\*\*Next action\*\*:\s*(.+)/);
-                const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
-                if (nextActionMatch) {
-                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nLast recorded next action: **${nextActionMatch[1].trim()}**\nThis is background context — handle the user's current request first, then consult ${relPf} for next steps if no other task is active.`;
-                } else {
-                    baseSystemContent += `\n\n## ACTIVE PROJECT (${relPf})\nA project tracking file exists. This is background context — handle the user's current request first, then consult it if no other task is active.`;
-                }
-            } catch { /* non-fatal */ }
-        }
-
-        // Inject peer-tab context so this agent knows what other open tabs are working on.
-        // This prevents PROJECT.md nudges from causing a tab to abandon its own task for
-        // an item another tab is already handling.
-        if (this.peerTabContext) {
-            baseSystemContent += `\n\n## OTHER OPEN TABS\n${this.peerTabContext}\nStay focused on YOUR current task. Do not start work on tasks listed above — those belong to other tabs.`;
-        }
-
-        // Inject active skill prompt into system content (skip when using slim prompt to save space)
-        if (!_useSlimPrompt && this.activeSkill) {
-            baseSystemContent += `
-
-## ACTIVE SKILL: ${this.activeSkill.name}
-${this.activeSkill.prompt}`;
-            logInfo(`[agent] Skill prompt injected: ${this.activeSkill.name}`);
-        }
-
-        // Trigger hints: nudge the agent toward skills whose triggers match the current query
-        if (_useSlimPrompt) { /* skip skill trigger hints to save context */ }
-        else try {
-            const { loadSkills, matchesSkillTriggers, formatTriggerHint } = await import('./skillLibrary');
-            const wsRoot = this.workspaceRoot ?? process.cwd();
-            const allSkills = loadSkills(wsRoot);
-            const hints: string[] = [];
-            for (const skill of allSkills.values()) {
-                if (skill === this.activeSkill) { continue; } // already active
-                const triggers = skill.triggers ?? (skill.trigger ? [skill.trigger] : []);
-                if (triggers.length === 0) { continue; }       // no triggers = no hint
-                if (matchesSkillTriggers(skill, userMessage)) {
-                    hints.push(`- **${skill.name}** — ${skill.description}${formatTriggerHint(skill)}`);
-                }
-            }
-            if (hints.length > 0) {
-                baseSystemContent += `
-
-## AVAILABLE SKILLS (match current query)
-The following skills are available and their triggers match your current request. Consider calling \`use_skill\` with the skill name to activate one:
-${hints.join('\n')}`;
-                logInfo(`[agent] Skill trigger hints: ${hints.length} skill(s) matched`);
-            }
-        } catch { /* non-fatal */ }
-
-        // Inject periodic memory nudge as a separate system message (not mutating user message)
-        let memoryNudgeMsg: OllamaMessage | null = null;
-        if (cfg.autoSaveMemory) {
-            const nudge = this.buildMemoryNudge();
-            if (nudge) {
-                // Use role:'user' not 'system' — some models (qwen3.8) reject system messages
-                // that appear anywhere other than position 0.
-                memoryNudgeMsg = { role: 'user', content: `[SYSTEM: ${nudge.trim()}]` };
-                logInfo(`[agent] Memory nudge prepared at turn ${this.userTurnCount}`);
+        // ── Context assembly (Phase 1.4b) ──────────────────────────────────────────────────
+        // Build the full system prompt + memory + graph context via the extracted assembler.
+        // Shell env auto-save stays here (side effect with static guard, not part of assembly).
+        if (this.memory && !Agent.shellEnvSaved) {
+            Agent.shellEnvSaved = true;
+            const env = detectShellEnvironment();
+            const envContent = `Host: ${env.label}, shell=${env.shell}, os=${env.os}`;
+            const existing = this.memory.buildContext([0, 1], 4000).toLowerCase();
+            if (!existing.includes(env.os) || !existing.includes(env.shell)) {
+                this.memory.addEntry(0, envContent, ['environment', 'shell']).then(() => {
+                    logInfo(`[shell-env] Saved to memory: ${envContent}`);
+                }).catch(err => {
+                    logWarn(`[shell-env] Failed to save to memory: ${toErrorMessage(err)}`);
+                });
             }
         }
 
-        // Inject periodic project context nudge — re-surfaces open items from PROJECT.md every 6 turns
-        // so compaction never causes the agent to lose track of the larger plan.
-        let projectNudgeMsg: OllamaMessage | null = null;
-        if (this._activeProjectFile) {
-            const PROJECT_NUDGE_INTERVAL = 6;
-            const turnsSinceLastNudge = this.userTurnCount - this._projectNudgeLastTurn;
-            if (turnsSinceLastNudge >= PROJECT_NUDGE_INTERVAL || this._projectNudgeLastTurn < 0) {
-                const openItems = this.readProjectOpenItems();
-                if (openItems) {
-                    const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
-                    const nudgeText = `[SYSTEM: PROJECT CONTEXT REMINDER — You are working on an extended project tracked in ${relPf}. Current open items:\n\n${openItems}\n\nIMPORTANT: This is background context only. If the user has given you a specific task in this conversation, finish THAT task first — do not switch to a PROJECT.md item mid-task. After completing any item, tick it off in ${relPf} with edit_file. Do not declare the overall project done until all items are checked. Do not mention this reminder to the user.]`;
-                    projectNudgeMsg = { role: 'user', content: nudgeText };
-                    this._projectNudgeLastTurn = this.userTurnCount;
-                    logInfo(`[project] Project nudge injected at turn ${this.userTurnCount} (${openItems.split('\n').filter(l => l.startsWith('- [ ]')).length} open items)`);
-                }
-            }
+        if (!Agent._reconResult) {
+            Agent._reconResult = Agent.buildSessionRecon();
         }
 
-        // Build memory context -- use relevance-based loading when possible
-        let memoryContext = '';
-        if (this.memory) {
-            try {
-                const maxTokens = this.memory.config.maxContextTokens || 4000;
-                memoryContext = await this.memory.buildRelevantContext(userMessage, maxTokens);
-                if (memoryContext) {
-                    logInfo(`[agent] Loaded relevant memory context: ${Math.ceil(memoryContext.length / 4)} tokens`);
+        // Build minimal TurnContext for the assembler (full TurnContext is Phase 2).
+        const _assemblerCtx = {
+            workspaceRoot: this.workspaceRoot,
+            lastUserMessage: userMessage,
+            history: this.history,
+            sessionRecon: Agent._reconResult ?? undefined,
+            loop: {
+                earlyCompactionStalls:  this._earlyCompactionStalls,
+                isSmallModel:           this._isSmallModel,
+                trustLevel:             this.trustLevel,
+                completionSignaled:     this._completionSignaled,
+                activeTask:             this._activeTask ?? '',
+                currentTaskMessage:     this._currentTaskMessage ?? '',
+                originalTaskMessage:    this._originalTaskMessage ?? '',
+                planFirstMode:          this._planFirstMode,
+                planConfirmed:          this._planConfirmed,
+                isEditTask:             this._isEditTask,
+                editContextInjected:    this._editContextInjected,
+                userTurnCount:          this.userTurnCount,
+                currentModel:           model,
+            } as any,
+            services: {
+                memory:    this.memory,
+                codeGraph: this._codeGraph,
+                codeIndex: this.codeIndex,
+            } as any,
+            limits: {
+                memoryNudgeInterval: (this as any).MEMORY_NUDGE_INTERVAL ?? 5,
+            } as any,
+            stopRef: this.stopRef,
+            postFn: post,
+            effectiveMaxRetries: 0,
+            requestConfirmation: async () => false,
+            askUser: async () => '',
+            resolveConfirmationAll: () => {},
+            dispatchTool: async () => '',
+            callModel: async () => ({ text: '', tool_calls: [], done_reason: '' } as any),
+        };
+        const _assembled = await assembleContext(_assemblerCtx as any);
+        let baseSystemWithMemory = _assembled.systemContent;
+        let memoryContext = _assembled.memoryContext;
+        this._contextFileMtimes = _assembled.contextFileMtimes;
 
-                    // Annotate Tier 0 entries that contain file paths with a [VERIFY] marker.
-                    // This forces the model to call shell_read before answering questions about
-                    // file locations, so the contradiction check in shell_read dispatch can fire.
-                    // Without this, the model answers purely from memory without reading any files.
-                    // Annotate each file reference inline so multi-file lines each get their own marker.
-                    //
-                    // Skip annotation if the last assistant turn was a memory write -- the model just
-                    // saved the entry and the new content should not immediately be second-guessed,
-                    // as the referenced files may not exist in the current workspace.
-                    const lastAssistantMsg = [...this.history].reverse().find(m => m.role === 'assistant');
-                    const lastWasMemoryWrite = lastAssistantMsg?.tool_calls?.some(tc => tc.function.name === 'memory_tier_write') ?? false;
-
-                    const fileRefRx = /\b([\w./-]+\.(?:db|sqlite|sqlite3|json|py|ts|js|yaml|yml|conf|cfg|env|log|txt|csv|sh))\b/gi;
-                    if (!lastWasMemoryWrite && fileRefRx.test(memoryContext)) {
-                        memoryContext = memoryContext.replace(
-                            /\b([\w./-]+\.(?:db|sqlite|sqlite3|json|py|ts|js|yaml|yml|conf|cfg|env|log|txt|csv|sh))\b/gi,
-                            '$1[VERIFY]'
-                        );
-                        // Append a single legend line so the model knows what [VERIFY] means
-                        memoryContext += '\n\n[VERIFY] = read the source code that defines this path (e.g. db.py, config.py) with shell_read before using this value -- do NOT answer from memory alone.';
-                    }
-                }
-                this._lastMemoryContext = memoryContext;
-            } catch (error) {
-                logError(`[agent] Failed to load memory context: ${toErrorMessage(error)}`);
-            }
-
-            // Auto-save shell environment to memory once per workspace
-            if (!Agent.shellEnvSaved) {
-                Agent.shellEnvSaved = true;
-                const env = detectShellEnvironment();
-                const envContent = `Host: ${env.label}, shell=${env.shell}, os=${env.os}`;
-                const existing = this.memory.buildContext([0, 1], 4000).toLowerCase();
-                if (!existing.includes(env.os) || !existing.includes(env.shell)) {
-                    this.memory.addEntry(0, envContent, ['environment', 'shell']).then(() => {
-                        logInfo(`[shell-env] Saved to memory: ${envContent}`);
-                    }).catch(err => {
-                        logWarn(`[shell-env] Failed to save to memory: ${toErrorMessage(err)}`);
-                    });
-                }
-            }
-        }
-
-        const isSweepTask =/\b(all|every|each|any)\b.{0,40}\b(route|function|endpoint|def)\b/i.test(userMessage)
-            || /\b(missing|without|lacks?)\b.{0,50}\b(error|exception|try|handl)/i.test(userMessage)
-            || /\b(no\s+error|no\s+try)\b/i.test(userMessage)
-            || /\b(add|fix).{0,30}\b(all|every|each|any)\b/i.test(userMessage)
-            // Documentation sweep: "create doc for each", "document every folder", "review each one and create docs"
-            || /\b(review|document|create\s+(doc|readme|documentation)).{0,60}\b(each|every|all|sub[._-]?folder|sub[._-]?project)\b/i.test(userMessage)
-            || /\b(each|every).{0,40}\b(folder|directory|sub[._-]?folder|sub[._-]?project)\b.{0,40}\b(doc|readme|documentation)\b/i.test(userMessage)
-            // Checklist/multi-item tasks: "work on one at a time", "let's go" after a checklist, "keep going"
-            || /\b(work\s+on|go\s+through|work\s+through).{0,30}\b(one\s+at\s+a\s+time|checklist|list|items?|recommendations?)\b/i.test(userMessage)
-            || /\b(let'?s\s+go|keep\s+going|continue|next\s+item|move\s+on)\b/i.test(userMessage)
+        // ── Variables from the replaced inline block ─────────────────────────────
+        // isSweepTask, MAX_TURNS, loopExhausted, legitimateStopFired, memoryNudgeMsg, projectNudgeMsg
+        // were previously computed inline. Restored here post-extraction.
+        const isSweepTask = /(all|every|each|any).{0,40}(route|function|endpoint|def)/i.test(userMessage)
+            || /(missing|without|lacks?).{0,50}(error|exception|try|handl)/i.test(userMessage)
+            || /(no\s+error|no\s+try)/i.test(userMessage)
+            || /(add|fix).{0,30}(all|every|each|any)/i.test(userMessage)
+            || /(review|document|create\s+(doc|readme|documentation)).{0,60}(each|every|all|sub[._-]?folder|sub[._-]?project)/i.test(userMessage)
+            || /(each|every).{0,40}(folder|directory|sub[._-]?folder|sub[._-]?project).{0,40}(doc|readme|documentation)/i.test(userMessage)
+            || /(work\s+on|go\s+through|work\s+through).{0,30}(one\s+at\s+a\s+time|checklist|list|items?|recommendations?)/i.test(userMessage)
+            || /(let'?s\s+go|keep\s+going|continue|next\s+item|move\s+on)/i.test(userMessage)
             || isSecurityScan;
         this._isSweepTask = isSweepTask;
-        // Sweep tasks need a clean slate -- prior history from failed/partial sweeps confuses the model
-        // into thinking the work is already done (hallucinating completion) or repeating bad strategies.
-        // Exception: if prior history already contains this task message, this is a retry -- keep history
-        // so the model can see what it already did and not start over from scratch.
+        // Sweep tasks need a clean slate -- prior history from failed/partial sweeps confuses the model.
         const isRetryOfSameTask = this.history.some(
             m => m.role === 'user' && typeof m.content === 'string' && (m.content as string).includes(userMessage.slice(0, 60))
         );
@@ -4371,417 +4095,49 @@ ${hints.join('\n')}`;
             this.history = [];
         }
         const configuredMax = getConfig().maxTurnsPerSession;
-        // "yes, add all of those" / "keep going" after a multi-file task gets sweep budget (50).
-        // These are authorized continuation tasks that legitimately need more turns.
         const isAuthorizedContinuation = isConfirmation && this._filesChangedThisRun.length === 0
-            && this.history.filter(m => m.role === 'tool').length > 5; // prior run had real work
-        // Small models get 8 turns for simple tasks, but multi-file refactors and sweep tasks
-        // legitimately need more — raise their ceiling so they don't hit the limit mid-task.
+            && this.history.filter(m => m.role === 'tool').length > 5;
         const _smallModelTurns = (isSweepTask || isAuthorizedContinuation || isMultiFileRestructure || isMultiFeatureRequest) ? 40 : 8;
         const MAX_TURNS = configuredMax > 0 ? configuredMax
             : (isSweepTask || isAuthorizedContinuation || isMultiFileRestructure || isMultiFeatureRequest) ? 80 : this._mergeMode ? 80 : (this._isSmallModel ? _smallModelTurns : (isPlanTask || isCreativeTask) ? 80 : 60);
         this.modeSwitchRetries = 0;
         let loopExhausted = true;
-        let legitimateStopFired = false; // set when isLegitimateStop breaks the loop — suppresses multi-task auto-advance
+        let legitimateStopFired = false;
+
+        // Inject periodic memory nudge as a separate system message
+        let memoryNudgeMsg: OllamaMessage | null = null;
+        if (cfg.autoSaveMemory) {
+            const nudge = this.buildMemoryNudge();
+            if (nudge) {
+                memoryNudgeMsg = { role: 'user', content: `[SYSTEM: ${nudge.trim()}]` };
+                logInfo(`[agent] Memory nudge prepared at turn ${this.userTurnCount}`);
+            }
+        }
+
+        // Inject periodic project context nudge
+        let projectNudgeMsg: OllamaMessage | null = null;
+        if (this._activeProjectFile) {
+            const PROJECT_NUDGE_INTERVAL = 6;
+            const turnsSinceLastNudge = this.userTurnCount - this._projectNudgeLastTurn;
+            if (turnsSinceLastNudge >= PROJECT_NUDGE_INTERVAL || this._projectNudgeLastTurn < 0) {
+                const openItems = this.readProjectOpenItems();
+                if (openItems) {
+                    const relPf = path.relative(this.workspaceRoot, this._activeProjectFile).replace(/\\/g, '/');
+                    const nudgeText = `[SYSTEM: PROJECT CONTEXT REMINDER — You are working on an extended project tracked in ${relPf}. Current open items:
+
+${openItems}
+
+IMPORTANT: This is background context only. If the user has given you a specific task in this conversation, finish THAT task first — do not switch to a PROJECT.md item mid-task. After completing any item, tick it off in ${relPf} with edit_file. Do not declare the overall project done until all items are checked. Do not mention this reminder to the user.]`;
+                    projectNudgeMsg = { role: 'user', content: nudgeText };
+                    this._projectNudgeLastTurn = this.userTurnCount;
+                    logInfo(`[project] Project nudge injected at turn ${this.userTurnCount}`);
+                }
+            }
+        }
 
         // Pre-compute values that don't change within a single run()
         const memoryTokens = memoryContext ? Math.ceil(memoryContext.length / 4) : 0;
-
-        // ── Code Graph: ROUTER.md + scope context ────────────────────────────
-        let graphContext = '';
-        if (this.workspaceRoot) {
-            // ROUTER.md (≤300 tokens) — regenerate in background if stale
-            if (isRouterMdStale(this.workspaceRoot, this._codeGraph ?? undefined)) {
-                logInfo('[codeGraph] ROUTER.md is stale (graph re-indexed since last write) — regenerating');
-                generateRouterMd(this.workspaceRoot).catch(() => {/* ignore */});
-            }
-            const routerMd = loadRouterMd(this.workspaceRoot);
-            if (routerMd) {
-                graphContext += routerMd + '\n\n';
-            }
-
-            // Scope context (≤1500 tokens) — only if graph is ready and context not near full
-            const cg = this._codeGraph;
-            if (cg && cg.isReady()) {
-                // Memory/graph cross-reference runs FIRST so conflict symbol names can
-                // seed the scope query, giving more targeted FTS results.
-                let conflictSymbols: string[] = [];
-                if (this.memory) {
-                    try {
-                        const allEntries: Array<{ content: string }> = [];
-                        for (let t = 0; t <= 3; t++) {
-                            for (const e of this.memory.getTier(t as 0|1|2|3)) {
-                                allEntries.push({ content: e.content });
-                            }
-                        }
-                        if (allEntries.length > 0) {
-                            const conflicts = cg.crossReferenceMemory(allEntries);
-                            conflictSymbols = conflicts.map(c => c.symbolName);
-                            const conflictBlock = cg.formatMemoryConflicts(conflicts);
-                            if (conflictBlock) {
-                                graphContext += conflictBlock + '\n\n';
-                                logInfo(`[codeGraph] Memory/graph conflicts injected: ${conflicts.length} symbols`);
-                            }
-                        }
-                    } catch (e) { /* skip if memory or graph unavailable */ }
-                }
-
-                // Seed scope query with conflict symbol names so FTS returns the most
-                // relevant code when memory and graph are out of sync.
-                const scopeQuery = conflictSymbols.length > 0
-                    ? `${userMessage} ${conflictSymbols.slice(0, 6).join(' ')}`
-                    : userMessage;
-                const scope = cg.buildScopeContext(scopeQuery, 1500);
-                if (scope && scope.nodeCount > 0) {
-                    graphContext += scope.text + '\n\n';
-                    logInfo(`[codeGraph] Scope context injected: ${scope.nodeCount} nodes, ~${scope.tokenEstimate} tokens${conflictSymbols.length ? ` (seeded with ${conflictSymbols.length} conflict symbols)` : ''}`);
-                }
-
-                // Drift report (≤200 tokens) — check only once per run
-                const drift = cg.checkDrift(100);
-                const driftReport = cg.formatDriftReport(drift);
-                if (driftReport) {
-                    graphContext += driftReport + '\n\n';
-                    logInfo(`[codeGraph] Drift report injected: ${drift.gone.length} gone, ${drift.ambiguous.length} ambiguous`);
-                }
-            }
-
-            // ── Fan-out: codeIndex semantic hits + memory search (unified via contextFanout) ──
-            // codeGraph covers structural symbols (handled above with ROUTER.md, cross-ref, drift).
-            // contextFanout.findRelevant() handles codeIndex (Qdrant semantic) + tiered memory
-            // in parallel with token budgets and dedup. Passing codeGraph=null avoids duplicating
-            // the scope context already injected above.
-            try {
-                const { findRelevant } = await import('./contextFanout');
-                const fanout = await findRelevant(userMessage, null, this.codeIndex, this.memory);
-                if (fanout.text) {
-                    graphContext += fanout.text + '\n\n';
-                    logInfo(`[fanout] Unified context injected: ~${fanout.tokenEstimate} tokens (index=${fanout.sources.index}, memory=${fanout.sources.memory})`);
-                }
-            } catch (e) { logWarn('[fanout] Unified context query failed: ' + String(e)); }
-
-            // ── Adaptive context allocation: pre-load graph-scored symbol bodies ──────
-            // When the code graph has indexed this workspace, query top-scored nodes and
-            // inject their actual source lines (not just names). This gives the model
-            // precise, task-relevant code on turn 1 — reducing read_file round-trips.
-            // Only fires when: graph is ready, this is not a subagent (has own context),
-            // and the model hasn't been given pre-edit injection already.
-            const cgAdaptive = this._codeGraph;
-            if (cgAdaptive?.isReady() && !this._isSubagent && !this._editContextInjected && userMessage.length > 20) {
-                try {
-                    const topNodes = cgAdaptive.getTopScoredNodes(userMessage, 5);
-                    // Group by file; only pre-load if top nodes score well (score > 1 means keyword hit)
-                    const highScoreNodes = topNodes.filter(n => n.score > 1);
-                    if (highScoreNodes.length > 0) {
-                        // Deduplicate by file — one entry per file, union of line ranges
-                        const fileRanges = new Map<string, { start: number; end: number; names: string[] }>();
-                        for (const n of highScoreNodes) {
-                            const existing = fileRanges.get(n.file);
-                            if (existing) {
-                                existing.start = Math.min(existing.start, n.startLine);
-                                existing.end   = Math.max(existing.end,   n.endLine);
-                                existing.names.push(n.name);
-                            } else {
-                                fileRanges.set(n.file, { start: n.startLine, end: n.endLine, names: [n.name] });
-                            }
-                        }
-
-                        const adaptiveParts: string[] = [];
-                        let adaptiveTokens = 0;
-                        const ADAPTIVE_TOKEN_CAP = 600; // keep it tight so we don't crowd the prompt
-
-                        // Max lines per file to prevent a single huge symbol range from blowing the cap
-                        const MAX_LINES_PER_FILE = 120;
-
-                        for (const [filePath, range] of fileRanges) {
-                            if (adaptiveTokens >= ADAPTIVE_TOKEN_CAP) break;
-                            try {
-                                const fileContent = fs.readFileSync(filePath, 'utf8').split('\n');
-                                const startIdx = Math.max(0, range.start - 1);
-                                // Clamp the range to MAX_LINES_PER_FILE lines
-                                const endIdx   = Math.min(fileContent.length, startIdx + MAX_LINES_PER_FILE, range.end);
-                                const slice    = fileContent.slice(startIdx, endIdx);
-                                const numbered = slice.map((l, i) => `${String(startIdx + i + 1).padStart(4, ' ')}\t${l}`).join('\n');
-                                const relPath  = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
-                                const block    = `// Adaptive pre-load: ${relPath} (lines ${range.start}–${range.end}, symbols: ${range.names.join(', ')})\n${numbered}`;
-                                const blockTokens = Math.ceil(block.length / 4);
-                                // Skip this file if it alone would blow past the cap
-                                if (adaptiveTokens + blockTokens > ADAPTIVE_TOKEN_CAP) break;
-                                adaptiveParts.push(block);
-                                adaptiveTokens += blockTokens;
-                            } catch { /* skip unreadable file */ }
-                        }
-
-                        if (adaptiveParts.length > 0) {
-                            graphContext += `## Adaptive Context (graph-scored pre-load)\n${adaptiveParts.join('\n\n')}\n\n`;
-                            logInfo(`[adaptive] Pre-loaded ${adaptiveParts.length} file range(s), ~${adaptiveTokens} tokens`);
-                        }
-                    }
-                } catch (e) { logWarn('[adaptive] Context allocation failed: ' + String(e)); }
-            }
-        }
-
-        // Build system content once (only text-mode suffix varies per iteration)
-        let baseSystemWithMemory = graphContext
-            ? baseSystemContent + '\n\n' + graphContext.trimEnd()
-            : baseSystemContent;
-        if (memoryContext) {
-            const graphSuffix = graphContext ? '\n\n' + graphContext.trimEnd() : '';
-            baseSystemWithMemory = `${baseSystemContent}${graphSuffix}
-
-## Your Persistent Memory
-${memoryContext}
-
-IMPORTANT: Only critical infrastructure is shown above. You have MORE memories stored across tiers 1-5.
-- Before answering questions about project setup, conventions, frameworks, past decisions, or known issues -> call memory_search("<topic>")
-- Before implementing ANY feature request or code change -> call memory_search("<feature area>") to check existing patterns
-- When given a vague business requirement (e.g. "allow decimals for X on the Y page") -> call memory_search("<X>") and memory_search("<Y page>") FIRST before looking at files
-Do NOT assume you have no memory -- check first.
-
-STALE MEMORY PROTOCOL: After reading any file that contains a fact also mentioned in "## Your Persistent Memory" above -- compare them. If they contradict (e.g. memory says path X but file says path Y), you MUST correct it in the same response: call memory_list, find the stale id, call memory_delete, then call memory_tier_write with the correct value. Do this silently without telling the user.
-
-PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you should not need to look up again -- save them immediately without being asked. This includes: the correct template/file path for a live page (e.g. "transaction page renders cashier_pos/_main_layout.html"), the working directory a deploy script must run from, the exact deploy command (e.g. "cd /path && TARGET=dev ./deploy.sh"), or any structural fact about the project you discovered by reading files. Tier 0 for paths/servers, Tier 1 for commands/deploy steps.`;
-        }
-
-        // If Qdrant is offline, tell the model so it doesn't waste turns calling memory_search
-        // expecting semantic results that won't come back.
-        if (this.memory && !this.memory.isQdrantAvailable) {
-            baseSystemWithMemory += `\n\n[MEMORY STATUS] Semantic memory (Tiers 4-5) is OFFLINE -- Qdrant/embedding service is unavailable. memory_search will only return local Tier 0-3 results. Do NOT expect past-session solutions or semantic lookups to be available this session.`;
-        }
-
-        // Fix M5: Recent-work briefing on session start
-        // Inject the last 3 Tier 2+3 entries so the model knows what was done recently
-        // without having to search memory first.
-        // Skip for subagents -- the briefing contains parent-conversation context that
-        // sends subagents off-task (e.g. "recently worked on AGENTS.md").
-        if (this.memory && !this._isSubagent) {
-            try {
-                const tier3 = this.memory.getTier(3)
-                    .filter(e => e.tags?.includes('session-end') || e.tags?.includes('completed'))
-                    .slice(-2);
-                const tier2disc = this.memory.getTier(2)
-                    .filter(e => e.tags?.includes('auto-discovery') || e.tags?.includes('stub') || e.tags?.includes('template'))
-                    .slice(0, 3);
-                // Also include the most recent Tier 4 entries -- these are written by the
-                // agent at session end (e.g. memory_tier_write Tier 4 "Consistency gate integrated...")
-                // and would otherwise be invisible to the briefing since they carry no session-end tag.
-                const tier4recent = this.memory.getTier(4).slice(-2);
-                const recentEntries = [...tier3, ...tier2disc, ...tier4recent].slice(0, 5);
-                if (recentEntries.length > 0) {
-                    const briefing = recentEntries.map(e => `- ${e.content.slice(0, 200)}`).join('\n');
-                    baseSystemWithMemory += `\n\n## Recent work (from memory)\n${briefing}\nUse this to avoid re-discovering facts already known.`;
-                    logInfo(`[memory] Injected recent-work briefing: ${recentEntries.length} entries`);
-                }
-            } catch { /* skip if memory unavailable */ }
-        }
-
-        // â"€â"€ Resume detection â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        // If the user's first message signals intent to resume ("continue", "where were we",
-        // "resume", etc.), pull the most recent sweep-progress + session-end entries from
-        // memory and inject a full [RESUME] block so the model can recap and pick up exactly
-        // where it left off -- without the user having to re-explain the task.
-        const isResumeIntent = this.history.length <= 1
-            && /\b(continue|resume|pick\s+up|where\s+(were|was|did)\s+we|what\s+(were|was|are)\s+we|carry\s+on|keep\s+going|what('s|\s+is)\s+(left|next|pending|remaining)|still\s+(working|need)|finish(ing|ed)?|where\s+did\s+we|last\s+time)\b/i.test(userMessage);
-        if (isResumeIntent && this.memory) {
-            try {
-                // Grab the most recent sweep-progress entry (could be mid-sweep)
-                const sweepEntries = this.memory.getTier(2)
-                    .filter(e => e.tags?.includes('sweep-progress') || e.tags?.includes('wip-sync'))
-                    .slice(-2); // most recent 2
-                // Grab the most recent session-end entry
-                const sessionEntries = this.memory.getTier(3)
-                    .filter(e => e.tags?.includes('session-end') || e.tags?.includes('completed'))
-                    .slice(-1);
-                const resumeEntries = [...sweepEntries, ...sessionEntries];
-                if (resumeEntries.length > 0) {
-                    const resumeLines = resumeEntries.map(e => e.content).join('\n\n---\n');
-                    baseSystemWithMemory += `\n\n## [RESUME REQUESTED]\nThe user wants to pick up where the last session left off. Here is the persisted state from memory:\n\n${resumeLines}\n\nYour job:\n1. Summarize what was done and what remains in 2-3 sentences\n2. Ask the user if they want to continue with the pending work\n3. If they confirm, proceed with the next pending step immediately -- do not re-explain the whole plan`;
-                    logInfo(`[resume] Injected resume context: ${resumeEntries.length} entries`);
-                } else {
-                    baseSystemWithMemory += `\n\n## [RESUME REQUESTED]\nThe user wants to pick up where the last session left off, but no persisted task state was found in memory. Let the user know you don't have a record of unfinished work, and ask them to describe what they'd like to do.`;
-                    logInfo(`[resume] Resume intent detected but no prior state found in memory`);
-                }
-            } catch { /* skip if memory unavailable */ }
-        }
-
-        // â"€â"€ Prior-work existence check â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        // For implement/create/add tasks: search memory for matching completed-feature
-        // entries BEFORE the model starts exploring. If found, inject a prominent
-        // [PRIOR WORK DETECTED] block so the model verifies first instead of re-doing.
-        const isImplementTask = /\b(implement|create|add|build|make|set up|write)\b/i.test(userMessage)
-            && !/\b(plan|discuss|design|proposal)\b/i.test(userMessage);
-        if (this.memory && isImplementTask) {
-            try {
-                // Extract 2-4 keywords from the task to drive the search
-                const kwMatch = userMessage.match(/\b([a-z][a-z0-9_]{3,})\b/gi) ?? [];
-                const stopWords = new Set(['the','this','that','with','from','into','for','and','create','make','build','add','implement','write','should','would','could','please','just','need','want']);
-                const searchKws = kwMatch.filter(w => !stopWords.has(w.toLowerCase())).slice(0, 5);
-                if (searchKws.length >= 2) {
-                    const searchQuery = searchKws.join(' ');
-                    const priorHits = await this.memory.searchMemory(searchQuery, undefined, 5);
-                    const completedHits = priorHits.filter(h =>
-                        h.tags?.includes('completed-feature') || h.tags?.includes('session-end') || h.tags?.includes('completed')
-                    );
-                    if (completedHits.length > 0) {
-                        const hitLines = completedHits.map(h => `  - ${h.content.slice(0, 150)}`).join('\n');
-                        baseSystemWithMemory += `\n\n## [PRIOR WORK DETECTED]\nMemory contains entries suggesting this feature may already be implemented:\n${hitLines}\n\nBEFORE writing any code:\n1. Call memory_search("${searchKws.slice(0,3).join(' ')}") to review the full details\n2. Check the relevant file(s) to confirm whether the feature exists\n3. If it already exists, tell the user what was found and ask if they want changes\n4. Only proceed with new code if the feature is genuinely missing`;
-                        logInfo(`[prior-work] Injected existence check: ${completedHits.length} hit(s) for "${searchQuery}"`);
-                    }
-                }
-            } catch { /* skip if memory unavailable */ }
-        }
-
-        // â"€â"€ File-system existence scan (all models) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        // For add/implement/create tasks: scan app/routes, app/services, app/views
-        // programmatically for routes and functions matching the task keywords.
-        // Runs BEFORE the model is called so it never wastes turns discovering this.
-        // This is the same logic as preProcessEditTask's fs-scan but runs for ALL models.
-        if (isImplementTask) {
-            try {
-                const hasPyFs = fs.existsSync(path.join(this.workspaceRoot, 'requirements.txt'))
-                    || fs.existsSync(path.join(this.workspaceRoot, 'pyproject.toml'))
-                    || fs.existsSync(path.join(this.workspaceRoot, 'setup.py'));
-                const STOP_FS = new Set(['add','insert','fix','update','change','modify','implement',
-                    'the','a','an','to','in','on','of','for','that','this','and','or','with',
-                    'from','into','should','would','could','will','can','all','returns',
-                    'return','json','please','just','need']);
-                const fsKws = userMessage.toLowerCase().split(/\W+/)
-                    .filter(w => w.length > 3 && !STOP_FS.has(w)).slice(0, 6);
-
-                logInfo(`[fs-scan] hasPyFs=${hasPyFs} fsKws=${JSON.stringify(fsKws)} isImplementTask=${isImplementTask}`);
-                if (hasPyFs && fsKws.length >= 1) {
-                    const scanDirs = ['app/routes', 'app/services', 'app/views', 'app/blueprints']
-                        .map(d => path.join(this.workspaceRoot, d))
-                        .filter(d => fs.existsSync(d));
-
-                    interface FsScanHit { relPath: string; matchedRoutes: string[]; matchedFunctions: string[] }
-                    const fsHits: FsScanHit[] = [];
-
-                    for (const scanDir of scanDirs) {
-                        let pyFiles: string[];
-                        try { pyFiles = fs.readdirSync(scanDir).filter(f => f.endsWith('.py') && f !== '__init__.py'); }
-                        catch { continue; }
-
-                        for (const pf of pyFiles) {
-                            const pfAbs = path.join(scanDir, pf);
-                            let pfContent: string;
-                            try { pfContent = fs.readFileSync(pfAbs, 'utf8'); }
-                            catch { continue; }
-
-                            const pfLower = pfContent.toLowerCase();
-                            if (fsKws.filter(kw => pfLower.includes(kw)).length < 2) { continue; }
-
-                            const matchedRoutes: string[] = [];
-                            const matchedFunctions: string[] = [];
-                            for (const line of pfContent.split('\n')) {
-                                const rm = line.match(/^\s*@\w+\.route\(['"]([^'"]+)['"]/);
-                                if (rm) { matchedRoutes.push(rm[1]); }
-                                const fm = line.match(/^\s*(?:async\s+)?def\s+(\w+)\s*\(/);
-                                if (fm && !fm[1].startsWith('_')) { matchedFunctions.push(fm[1]); }
-                            }
-
-                            const relevantRoutes = matchedRoutes.filter(r => fsKws.some(kw => r.toLowerCase().includes(kw)));
-                            const relevantFns = matchedFunctions.filter(fn => fsKws.some(kw => fn.toLowerCase().includes(kw)));
-
-                            if (relevantRoutes.length > 0 || relevantFns.length > 0) {
-                                const rel = path.relative(this.workspaceRoot, pfAbs).replace(/\\/g, '/');
-                                fsHits.push({ relPath: rel, matchedRoutes: relevantRoutes, matchedFunctions: relevantFns });
-                                logInfo(`[fs-scan] Hit: ${rel} (routes: ${relevantRoutes.join(', ')}, fns: ${relevantFns.join(', ')})`);
-                            }
-                        }
-                    }
-
-                    // If the user named an explicit target file that doesn't exist on disk,
-                    // hits in OTHER files are not "already done" -- they're related code elsewhere.
-                    // Only warn when hits are in the same file the user targeted (or no explicit target).
-                    const explicitFileMatch = userMessage.match(/\b([\w./\\-]+\.(?:py|ts|js|go|java|rs|rb|php))\b/i);
-                    const explicitRelPath = explicitFileMatch ? explicitFileMatch[1].replace(/\\/g, '/') : null;
-                    const explicitAbsPath = explicitRelPath ? path.resolve(this.workspaceRoot, explicitRelPath) : null;
-                    const explicitFileIsMissing = explicitAbsPath ? !fs.existsSync(explicitAbsPath) : false;
-                    const filteredHits = explicitFileIsMissing
-                        ? fsHits.filter(h => h.relPath.replace(/\\/g, '/') === explicitRelPath)
-                        : fsHits;
-
-                    if (filteredHits.length > 0) {
-                        const hitLines = filteredHits.map(h => {
-                            const parts = [`  File: \`${h.relPath}\``];
-                            if (h.matchedRoutes.length > 0) { parts.push(`  Routes: ${h.matchedRoutes.map(r => `\`${r}\``).join(', ')}`); }
-                            if (h.matchedFunctions.length > 0) { parts.push(`  Functions: ${h.matchedFunctions.map(f => `\`${f}\``).join(', ')}`); }
-                            return parts.join('\n');
-                        }).join('\n\n');
-                        baseSystemWithMemory += `\n\n## [FEATURE ALREADY EXISTS -- FILE SYSTEM SCAN]\n\nBefore writing any code, a programmatic scan of the project found existing code matching this task:\n\n${hitLines}\n\nYou MUST:\n1. Read the file(s) listed above\n2. Tell the user exactly what already exists\n3. Only write NEW code if the requested feature is genuinely absent from those files\n4. Do NOT re-implement anything that already exists`;
-                        logInfo(`[fs-scan] Injected existence warning: ${filteredHits.length} hit(s) for [${fsKws.join(', ')}]`);
-                    } else if (explicitFileIsMissing && fsHits.length > 0) {
-                        // Hits exist in other files -- inform the model but don't block creation.
-                        // Also inject a sibling file as a structural template so the model
-                        // writes correct imports on the first try instead of guessing.
-                        const targetDirAbs = explicitAbsPath ? path.dirname(explicitAbsPath) : null;
-                        let siblingTemplate = '';
-                        if (targetDirAbs && fs.existsSync(targetDirAbs)) {
-                            try {
-                                const siblingEntry = fs.readdirSync(targetDirAbs)
-                                    .filter(e => e.endsWith('.py') && !e.startsWith('__'))
-                                    .map(e => path.join(targetDirAbs, e))
-                                    .find(f => { try { return fs.statSync(f).size < 30_000; } catch { return false; } });
-                                if (siblingEntry) {
-                                    const sibContent = fs.readFileSync(siblingEntry, 'utf8').slice(0, 3000);
-                                    const sibRel = path.relative(this.workspaceRoot, siblingEntry).replace(/\\/g, '/');
-                                    siblingTemplate = `\n\n[SIBLING TEMPLATE -- copy these imports/structure for the new file]\nFile: ${sibRel}\n\`\`\`python\n${sibContent}\n\`\`\``;
-                                    logInfo(`[fs-scan] Injected sibling template from ${sibRel}`);
-                                }
-                            } catch { /* non-fatal */ }
-                        }
-                        baseSystemWithMemory += `\n\n## [NEW FILE REQUIRED]\n\nThe target file \`${explicitRelPath}\` does not exist yet -- CREATE it.\n\nRelated routes in other files (reference only -- do not modify them):\n${fsHits.map(h => `  \`${h.relPath}\`: ${h.matchedRoutes.join(', ')}`).join('\n')}${siblingTemplate}\n\nUse edit_file with:\n- path="${explicitRelPath}"\n- old_string="" (empty -- creates new file)\n- new_string=<complete Python module content>\n\nCopy the import style from the sibling template above. Do NOT use run_command or New-Item.`;
-                        logInfo(`[fs-scan] New-file task: suppressed existence block, ${fsHits.length} related hit(s) noted as reference`);
-                    } else if (explicitFileIsMissing) {
-                        // No related hits at all -- pure new file
-                        const targetDirAbs2 = explicitAbsPath ? path.dirname(explicitAbsPath) : null;
-                        let siblingTemplate2 = '';
-                        if (targetDirAbs2 && fs.existsSync(targetDirAbs2)) {
-                            try {
-                                const siblingEntry2 = fs.readdirSync(targetDirAbs2)
-                                    .filter(e => e.endsWith('.py') && !e.startsWith('__'))
-                                    .map(e => path.join(targetDirAbs2, e))
-                                    .find(f => { try { return fs.statSync(f).size < 30_000; } catch { return false; } });
-                                if (siblingEntry2) {
-                                    const sibContent2 = fs.readFileSync(siblingEntry2, 'utf8').slice(0, 3000);
-                                    const sibRel2 = path.relative(this.workspaceRoot, siblingEntry2).replace(/\\/g, '/');
-                                    siblingTemplate2 = `\n\n[SIBLING TEMPLATE]\nFile: ${sibRel2}\n\`\`\`python\n${sibContent2}\n\`\`\``;
-                                    logInfo(`[fs-scan] Injected sibling template (no hits) from ${sibRel2}`);
-                                }
-                            } catch { /* non-fatal */ }
-                        }
-                        if (siblingTemplate2) {
-                            baseSystemWithMemory += `\n\n## [NEW FILE REQUIRED]\n\nThe target file \`${explicitRelPath}\` does not exist yet -- CREATE it.${siblingTemplate2}\n\nUse edit_file with old_string="" (empty) and new_string=<complete file content based on sibling template>.`;
-                        }
-                    }
-                }
-            } catch { /* non-fatal */ }
-        }
-
-        // Session recon -- run once per agent instance, inject into every run's system prompt
-        // so the model knows the exact Python/git/node versions available without guessing.
-        if (!Agent._reconResult) {
-            Agent._reconResult = Agent.buildSessionRecon();
-        }
-        baseSystemWithMemory += `\n\n${Agent._reconResult}`;
-
-        // Fix 6a: Task-type-specific system prompt suffix
-        // Small, focused instructions beat long generic ones for 7B models.
-        // Only appended when we know the task type (edit task with pre-loaded context).
-        if (this._isEditTask && this._editContextInjected) {
-            const isFormTaskMsg = /\b(form|template|inline|frontend|html)\b/i.test(userMessage)
-                || /\badd\b.{0,40}\b(field|column|input)\b/i.test(userMessage);
-            const isBugFixMsg = /\bfix\b/i.test(userMessage) && !/\ball\b|\bevery\b/.test(userMessage);
-            const isAddRouteMsg = /\badd\b.{0,30}\broute\b/i.test(userMessage);
-            if (isFormTaskMsg) {
-                baseSystemWithMemory += `\n\n## TASK TYPE: Add field to form\nThis task requires changes to MULTIPLE files -- the HTML template, the JS submit handler, and possibly the backend route. The pre-loaded context above identifies all three. You MUST edit all of them. Do not stop after one file. The task is complete only when every file in the "TASK COMPLETE WHEN" checklist above has been edited.`;
-            } else if (isBugFixMsg) {
-                baseSystemWithMemory += `\n\n## TASK TYPE: Bug fix\nRead the error, find the exact line, fix it with edit_file. Do not describe the fix -- apply it. Do not suggest the user verify anything -- you verify by reading the file after the edit. One sentence response after the fix: what was wrong and what was changed.`;
-            } else if (isAddRouteMsg) {
-                baseSystemWithMemory += `\n\n## TASK TYPE: Add route\nCopy the pattern shown in the pre-loaded context exactly -- same blueprint variable, same decorator style, same return format. Do not invent a different structure. Call edit_file_at_line once. If the route already exists in "Already defined", stop immediately.`;
-            }
-        }
+        void memoryTokens; // suppress unused-var warning (used by handleAutoCompact/logging)
 
         // Cache system content per toolMode to avoid rebuilding every turn
         let lastToolMode: 'native' | 'text' | null = null;

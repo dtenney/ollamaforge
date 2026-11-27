@@ -217,6 +217,8 @@ export interface TurnContext {
     lastUserMessage: string;
     stopRef: { stop: boolean; destroy?: () => void };
     postFn: PostFn;
+    /** Session recon string (Python/git/node versions). Built once per Agent instance. */
+    sessionRecon?: string;
 
     // Config
     limits: AgentLimits;

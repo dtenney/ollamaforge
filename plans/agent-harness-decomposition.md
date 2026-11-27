@@ -46,19 +46,31 @@ swappable model, swappable tools, swappable context strategy — each testable i
 - [x] **1.3** Unit-test: given a fixed history + workspace, assert the assembled message array
       → Done: `src/test/unit/contextAssembler.test.ts` (11 tests passing)
 - [ ] **1.4** Wire `run()` to call the new module; verify build + harness tests pass
-      **Scope:** `assembleContext()` replaces only the system-prompt + memory + nudge + context-budget
-      assembly (approx lines 4269–4900 in current agent.ts). The following blocks stay in `run()`:
-      - Sweep detection (lines ~4350–4372) — mutates `this._isSweepTask`, must stay in Agent
-      - Max-turns calculation (lines ~4373–4380) — reads config + loop state, stays in Agent
-      - Context fanout / adaptive graph context (lines ~4440–4461+) — stays in Agent for now
-        (will move to `TurnExecutor` in Phase 2)
-      **How to wire:** Build a `TurnContext` from `this.*` fields, call `assembleContext(ctx)`,
-      destructure `{ messages, systemContent, memoryContext, contextFileMtimes }` and assign
-      to the locals that the existing code downstream already uses. Do not change downstream code.
-      **Do not stop if context is running low** — write progress to `plans/agent-harness-decomposition.md`
-      checkboxes and a one-line status note at the bottom, then continue in the same session.
-      If a single edit is too large, split it: replace the top half of the block first, verify tsc,
-      then the bottom half.
+      **Revised scope (after audit of actual agent.ts lines 4269–4784):**
+      The inline block is significantly richer than `contextAssembler.ts` currently implements.
+      The assembler must absorb the following before wiring is safe:
+        (a) `[VERIFY]` annotation on memory file refs (lines 4319–4327)
+        (b) Shell env auto-save to memory (lines 4335–4348) — side-effect, stays in Agent
+        (c) Qdrant offline status injection (lines 4548–4550)
+        (d) Recent-work briefing from Tier 2/3/4 memory (lines 4557–4576)
+        (e) Resume detection + inject (lines 4583–4605)
+        (f) Prior-work existence check via memory search (lines 4611–4632)
+        (g) Flask/Python fs-scan for implement tasks (lines 4639–4759)
+        (h) Session recon injection (lines 4764–4767)
+        (i) Task-type suffix (edit/bug/route tasks, lines 4769–4784)
+        (j) Project nudge (lines 4282–4296)
+        (k) Memory nudge (lines 4269–4278)
+      **Strategy:** Split into 1.4a (complete assembler) and 1.4b (wire into run()):
+      - 1.4a: Move items (c)(d)(e)(f)(g)(h)(i) into contextAssembler.ts; (b) stays in Agent; (j)(k) stay in Agent (project/memory nudge are separate messages)
+      - 1.4b: Call assembleContext(ctx), destructure result, patch the streamChatRequest call at line 5114 to use the returned messages
+      **Items that stay in Agent.run() and are NOT part of assembleContext():**
+      - Sweep detection + history clear (lines 4350–4372) — mutates state
+      - Max-turns calculation (lines 4373–4382) — reads config + isSweepTask
+      - Shell env save (line 4335–4348) — side effect with static guard
+      - Project nudge + memory nudge messages (they're injected at the call site)
+      - Context drift check (lines 4821–4838) — per-turn, inside the loop
+      - System content per-toolMode rebuild (lines 4860–4873) — per-turn, inside loop
+      **Do not stop if context is running low** — write progress to this file and continue.
 
 ## Phase 2 — Extract the Turn Loop
 
