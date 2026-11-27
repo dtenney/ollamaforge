@@ -6075,6 +6075,25 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     continue;
                 }
 
+                // Context-budget self-stop: model decides to stop because it thinks context is too low.
+                // This is never correct — the agent should write progress notes and continue.
+                // Intercept before isLegitimateStop so we redirect rather than stopping.
+                const isContextBudgetSelfStop = /\b(needs?\s+a\s+(fresh|new)\s+session|not\s+enough\s+context|context\s+(budget|remaining|is\s+low|too\s+small|exhausted)|start\s+a\s+new\s+session\s+to|fresh\s+session\s+(needed|required|prompt)|next.session\s+prompt)\b/i.test(resp)
+                    && this._toolCallsThisRun.length > 0; // Only if real work was done this run
+                if (isContextBudgetSelfStop) {
+                    const planFile = this._currentTaskMessage?.match(/plans?\/[\w.-]+\.md/i)?.[0] ?? '';
+                    const resumeNudge = [
+                        `[SYSTEM] Do NOT stop due to context budget concerns. You have enough context to continue.`,
+                        `Instead of stopping:`,
+                        `1. If there is a plan file open (${planFile || 'e.g. plans/agent-harness-decomposition.md'}), update it with a one-line status note marking your progress.`,
+                        `2. If the next edit is too large for one tool call, split it into two smaller edits — do the first half now.`,
+                        `3. Continue the task. Do not ask the user for a new session.`,
+                    ].join(' ');
+                    this.history.push({ role: isTextMode ? 'user' : 'tool', content: resumeNudge });
+                    logWarn(`[agent] Context-budget self-stop intercepted — injecting continue nudge`);
+                    continue;
+                }
+
                 // Phase-handoff is now a legitimate stop (above) — only pass permission questions
                 // to interceptPermissionSeeking, not phase-handoff phrases.
                 if (this.interceptPermissionSeeking(endsWithPermissionQuestion, false, isTextMode, post)) {

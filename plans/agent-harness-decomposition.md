@@ -46,6 +46,19 @@ swappable model, swappable tools, swappable context strategy — each testable i
 - [x] **1.3** Unit-test: given a fixed history + workspace, assert the assembled message array
       → Done: `src/test/unit/contextAssembler.test.ts` (11 tests passing)
 - [ ] **1.4** Wire `run()` to call the new module; verify build + harness tests pass
+      **Scope:** `assembleContext()` replaces only the system-prompt + memory + nudge + context-budget
+      assembly (approx lines 4269–4900 in current agent.ts). The following blocks stay in `run()`:
+      - Sweep detection (lines ~4350–4372) — mutates `this._isSweepTask`, must stay in Agent
+      - Max-turns calculation (lines ~4373–4380) — reads config + loop state, stays in Agent
+      - Context fanout / adaptive graph context (lines ~4440–4461+) — stays in Agent for now
+        (will move to `TurnExecutor` in Phase 2)
+      **How to wire:** Build a `TurnContext` from `this.*` fields, call `assembleContext(ctx)`,
+      destructure `{ messages, systemContent, memoryContext, contextFileMtimes }` and assign
+      to the locals that the existing code downstream already uses. Do not change downstream code.
+      **Do not stop if context is running low** — write progress to `plans/agent-harness-decomposition.md`
+      checkboxes and a one-line status note at the bottom, then continue in the same session.
+      If a single edit is too large, split it: replace the top half of the block first, verify tsc,
+      then the bottom half.
 
 ## Phase 2 — Extract the Turn Loop
 
@@ -120,5 +133,13 @@ swappable model, swappable tools, swappable context strategy — each testable i
 - **Order matters:** Phase 1 → 2 → 3 must be sequential (each depends on the previous
   interfaces). Phase 4 can start once Phase 3 is wired. Phases 5 and 6 can overlap.
 
+## Working rules for the agent
+- **Never stop due to context budget.** Write a one-line status note at the bottom of this file
+  and continue. If an edit is too large for one shot, split it into two smaller edits.
+- **Track progress here.** Check off items as they complete. Add a `→ status:` note to any
+  item that is partially done so the next turn knows where to pick up.
+- **Ask one clarifying question max.** If scope is unclear, make a reasonable assumption,
+  document it in the plan, and proceed. Do not stop to ask.
+
 ## Next action:
-Review this plan. Once approved, start with Phase 0.1 (inventory `this.` refs in `run()`).
+Phase 1.4 — wire `assembleContext()` into `run()`. See scope note above.
