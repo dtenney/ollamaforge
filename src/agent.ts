@@ -6020,6 +6020,24 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                 // These are housekeeping-only — don't require a follow-up LLM turn.
                 const thisTurnOnlyMemoryWrites = toolCalls.length > 0
                     && toolCalls.every(tc => tc.function?.name === 'memory_tier_write');
+                // Context-budget self-stop: intercept BEFORE isLegitimateStop is evaluated
+                // so the continue fires before autoRetryCount is reset or any stop logic runs.
+                const _isContextBudgetSelfStop = /\b(needs?\s+a\s+(fresh|new)\s+session|not\s+enough\s+context|context\s+(budget|remaining)\s+is\s+(low|exhausted|too\s+small)|context\s+(is\s+)?(too\s+small|exhausted|running\s+low)|start\s+a\s+new\s+session\s+to|fresh\s+session\s+(needed|required|prompt)|next[.\-]session\s+prompt)\b/i.test(resp)
+                    && this._toolCallsThisRun.length > 0;
+                if (_isContextBudgetSelfStop) {
+                    const _planFile = this._currentTaskMessage?.match(/plans?\/[\w.-]+\.md/i)?.[0] ?? '';
+                    const _resumeNudge = [
+                        `[SYSTEM] Do NOT stop due to context budget concerns. You have enough context to continue.`,
+                        `Instead of stopping:`,
+                        `1. If there is a plan file open (${_planFile || 'e.g. plans/agent-harness-decomposition.md'}), update it with a one-line status note marking your progress.`,
+                        `2. If the next edit is too large for one tool call, split it into two smaller edits — do the first half now.`,
+                        `3. Continue the task. Do not ask the user for a new session.`,
+                    ].join(' ');
+                    this.history.push({ role: isTextMode ? 'user' : 'tool', content: _resumeNudge });
+                    logWarn(`[agent] Context-budget self-stop intercepted (early) — injecting continue nudge`);
+                    continue;
+                }
+
                 // Detect agent "greeting reset": model outputs a task-reset greeting like
                 // "Ready to help with X" or "What would you like to work on?" after having
                 // done work this run. This means it lost task context mid-session.
@@ -6072,25 +6090,6 @@ PROACTIVE MEMORY SAVES: When you discover facts you had to look up that you shou
                     const resetCorrection = `[SYSTEM] You appear to have lost track of the current task. You were in the middle of work this session (recent tool calls: ${lastTools}). Do NOT greet the user or ask what they want to work on — you already know. Resume the task from where you left off. Check any open plan file or task notes, review recent tool results in context, and continue.`;
                     this.history.push({ role: isTextMode ? 'user' : 'tool', content: resetCorrection });
                     logWarn(`[agent] Greeting-reset detected — injecting task-resume correction`);
-                    continue;
-                }
-
-                // Context-budget self-stop: model decides to stop because it thinks context is too low.
-                // This is never correct — the agent should write progress notes and continue.
-                // Intercept before isLegitimateStop so we redirect rather than stopping.
-                const isContextBudgetSelfStop = /\b(needs?\s+a\s+(fresh|new)\s+session|not\s+enough\s+context|context\s+(budget|remaining)\s+is\s+(low|exhausted|too\s+small)|context\s+(is\s+)?(too\s+small|exhausted|running\s+low)|start\s+a\s+new\s+session\s+to|fresh\s+session\s+(needed|required|prompt)|next.session\s+prompt)\b/i.test(resp)
-                    && this._toolCallsThisRun.length > 0; // Only if real work was done this run
-                if (isContextBudgetSelfStop) {
-                    const planFile = this._currentTaskMessage?.match(/plans?\/[\w.-]+\.md/i)?.[0] ?? '';
-                    const resumeNudge = [
-                        `[SYSTEM] Do NOT stop due to context budget concerns. You have enough context to continue.`,
-                        `Instead of stopping:`,
-                        `1. If there is a plan file open (${planFile || 'e.g. plans/agent-harness-decomposition.md'}), update it with a one-line status note marking your progress.`,
-                        `2. If the next edit is too large for one tool call, split it into two smaller edits — do the first half now.`,
-                        `3. Continue the task. Do not ask the user for a new session.`,
-                    ].join(' ');
-                    this.history.push({ role: isTextMode ? 'user' : 'tool', content: resumeNudge });
-                    logWarn(`[agent] Context-budget self-stop intercepted — injecting continue nudge`);
                     continue;
                 }
 
@@ -8376,8 +8375,8 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                             // Skip circuit breaker for build-poll patterns (tasklist+ls, sleep+ls) --
                             // these are handled by the sleep-poll detector which fires first and gives
                             // a clearer "build still running" message rather than a generic "stuck" error.
-                            const tmIsBuildPoll = /\btasklist\b/i.test(cmdStr) && /\b(ls|find|dir)\b/.test(cmdStr)
-                                || /\bsleep\s+\d+\b/.test(cmdStr) && /\b(ls|find|wc|test\s+-[fe])\b/.test(cmdStr);
+                            const tmIsBuildPoll = (/\btasklist\b/i.test(cmdStr) && /\b(ls|find|dir)\b/i.test(cmdStr))
+                                || (/\bsleep\s+\d+\b/i.test(cmdStr) && /\b(ls|find|wc|test\s+-[fe])\b/i.test(cmdStr));
                             // Track general command failures for circuit breaker
                             const cmdSig = cmdStr.toLowerCase().trim().slice(0, 200);
                             const failCount = (this._failedCommandSignatures.get(cmdSig) ?? 0) + 1;
@@ -9136,7 +9135,7 @@ This is 2 tool calls and always works. Do NOT retry the python3 -c command. Call
                 // Distinguish: did the agent complete real work this run (shell/file ops) or did it
                 // only attempt memory writes? If real work was done, the empty memory write is a
                 // harmless housekeeping failure — emit a clean done message, not a "task paused" error.
-                const realWorkTools = ['run_command', 'shell_read', 'write_file', 'edit_file', 'create_file'];
+                const realWorkTools = ['run_command', 'shell_read', 'write_file', 'edit_file', 'edit_file_at_line', 'create_file'];
                 const lastRealWork = [...this._toolCallsThisRun].reverse()
                     .find(tc => realWorkTools.includes(tc.name ?? ''));
                 const doneMsg = lastRealWork
