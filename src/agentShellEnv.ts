@@ -118,7 +118,7 @@ export function detectShellEnvironment(): ShellEnvironment {
         ];
         for (const candidate of bashCandidates) {
             try {
-                execSync(`"${candidate}" -c "echo ok"`, { stdio: 'pipe', timeout: 3000 });
+                execSync(`"${candidate}" -c "echo ok"`, { stdio: 'pipe', timeout: 3000, windowsHide: true });
                 bashPath = candidate;
                 break;
             } catch { /* not at this path */ }
@@ -126,9 +126,9 @@ export function detectShellEnvironment(): ShellEnvironment {
         if (!bashPath) {
             // Try PATH lookup as last resort
             try {
-                const found = execSync('where bash', { stdio: 'pipe', timeout: 3000 }).toString().trim().split('\n')[0].trim();
+                const found = execSync('where bash', { stdio: 'pipe', timeout: 3000, windowsHide: true }).toString().trim().split('\n')[0].trim();
                 if (found && found.toLowerCase().endsWith('.exe')) {
-                    execSync(`"${found}" -c "echo ok"`, { stdio: 'pipe', timeout: 3000 });
+                    execSync(`"${found}" -c "echo ok"`, { stdio: 'pipe', timeout: 3000, windowsHide: true });
                     bashPath = found;
                 }
             } catch { /* bash not in PATH */ }
@@ -156,7 +156,7 @@ export function detectShellEnvironment(): ShellEnvironment {
         : ['python3', 'python'];
     for (const candidate of candidates) {
         try {
-            const out = execSync(`"${candidate}" --version`, { stdio: 'pipe', timeout: 3000 }).toString().trim();
+            const out = execSync(`"${candidate}" --version`, { stdio: 'pipe', timeout: 3000, windowsHide: true }).toString().trim();
             if (/python\s+3\./i.test(out)) { pythonCmd = candidate; break; }
         } catch { /* not found */ }
     }

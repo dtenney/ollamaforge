@@ -3,7 +3,14 @@ import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+// Always pass windowsHide:true so no blank cmd.exe window appears on Windows.
+function execAsync(cmd: string, options: { cwd?: string; timeout?: number } = {}): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+        exec(cmd, { windowsHide: true, encoding: 'utf8', ...options }, (err, stdout, stderr) => {
+            if (err) { reject(err); } else { resolve({ stdout: String(stdout), stderr: String(stderr) }); }
+        });
+    });
+}
 
 // Directories to ignore during all workspace scans
 export const SKIP_DIRS = new Set([

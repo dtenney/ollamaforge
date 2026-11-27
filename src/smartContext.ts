@@ -4,7 +4,14 @@ import * as fs from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+// Always pass windowsHide:true so no blank cmd.exe window appears on Windows.
+function execAsync(cmd: string, options: { cwd?: string; timeout?: number } = {}): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+        exec(cmd, { windowsHide: true, encoding: 'utf8', ...options }, (err, stdout, stderr) => {
+            if (err) { reject(err); } else { resolve({ stdout: String(stdout), stderr: String(stderr) }); }
+        });
+    });
+}
 
 // ── Smart Context Manager ─────────────────────────────────────────────────────
 
@@ -214,7 +221,6 @@ export class SmartContextManager {
         try {
             const { stdout } = await execAsync('git diff --name-only HEAD~5..HEAD', {
                 cwd: workspaceRoot,
-                encoding: 'utf8',
                 timeout: 2000
             });
 

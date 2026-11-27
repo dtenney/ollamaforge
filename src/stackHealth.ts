@@ -77,6 +77,7 @@ function ssh(host: string, cmd: string): { stdout: string; stderr: string; ok: b
     const result = spawnSync(SSH_BIN, args, {
         timeout: (SSH_TIMEOUT + 2) * 1000,
         encoding: 'utf8',
+        windowsHide: true,
         env: { ...process.env, PATH: `/usr/bin:/bin:/usr/local/bin:${process.env.PATH ?? ''}` },
     });
 
